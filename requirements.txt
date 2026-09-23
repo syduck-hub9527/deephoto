@@ -1,0 +1,9 @@
+# 首次安装后建议用 `pip freeze > requirements.lock.txt` 锁定实际版本(见开发文档§8)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pymupdf>=1.24
+pillow>=10.0
+numpy>=1.26
+deepagents>=0.0.5
+langchain-openai>=0.2

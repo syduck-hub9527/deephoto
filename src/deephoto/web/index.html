@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>deephoto · 图文知识库问答</title>
+<style>
+  :root {
+    --bg: #f7f6f2; --side: #efece6; --card: #ffffff; --text: #23211c; --muted: #6f6a5e;
+    --accent: #c4603f; --accent-soft: #f6e5dd; --bubble: #e9e5dc; --border: #e3ded2;
+    --code-bg: #efede6; --shadow: 0 1px 3px rgba(60,50,35,.08);
+  }
+  :root[data-theme="dark"] {
+    --bg: #1b1c20; --side: #141518; --card: #24262b; --text: #e9e7e1; --muted: #9b968a;
+    --accent: #d4754e; --accent-soft: #39271f; --bubble: #2d3036; --border: #33363d;
+    --code-bg: #2a2d33; --shadow: 0 1px 3px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; display: flex; background: var(--bg); color: var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  button { font: inherit; cursor: pointer; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  /* ---- 侧栏 ---- */
+  #sidebar { width: 288px; flex-shrink: 0; background: var(--side); border-right: 1px solid var(--border);
+             display: flex; flex-direction: column; height: 100vh; }
+  .brand { padding: 18px 18px 10px; font-size: 17px; font-weight: 700; letter-spacing: .3px; }
+  .brand span { color: var(--accent); }
+  .side-actions { padding: 0 14px 12px; }
+  #newChatBtn { width: 100%; padding: 9px; border: 1px solid var(--border); border-radius: 10px;
+                background: var(--card); color: var(--text); text-align: left; }
+  #newChatBtn:hover { border-color: var(--accent); color: var(--accent); }
+  .side-label { padding: 8px 18px 6px; font-size: 12px; color: var(--muted); letter-spacing: 1px; }
+  #docList { flex: 1; overflow-y: auto; padding: 0 10px; }
+  .doc-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 4px;
+              border-radius: 8px; font-size: 13px; cursor: pointer; border: 1px solid transparent; }
+  .doc-item:hover { background: var(--card); }
+  .doc-item.active { background: var(--card); border-color: var(--accent); }
+  .doc-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .dot.ready { background: #4caf7d; }
+  .dot.pending { background: #d9a441; animation: pulse 1.2s infinite; }
+  .dot.failed { background: #d05858; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .doc-del { border: none; background: none; color: var(--muted); padding: 0 2px; font-size: 14px;
+             visibility: hidden; }
+  .doc-item:hover .doc-del { visibility: visible; }
+  .doc-del:hover { color: #d05858; }
+  .doc-err { font-size: 11px; color: #d05858; padding: 0 10px 4px; }
+  #uploadLabel { display: block; margin: 4px 10px 8px; padding: 9px; text-align: center; font-size: 13px;
+                 border: 1px dashed var(--border); border-radius: 8px; color: var(--muted); cursor: pointer; }
+  #uploadLabel:hover { border-color: var(--accent); color: var(--accent); }
+  .side-foot { padding: 12px 14px; border-top: 1px solid var(--border); display: flex; gap: 6px; }
+  .side-foot input { flex: 1; min-width: 0; padding: 7px 10px; border: 1px solid var(--border);
+                     border-radius: 8px; background: var(--card); color: var(--text); font-size: 12px; }
+  .icon-btn { border: 1px solid var(--border); background: var(--card); color: var(--text);
+              border-radius: 8px; padding: 7px 10px; }
+
+  /* ---- 主区 ---- */
+  #main { flex: 1; display: flex; flex-direction: column; height: 100vh; min-width: 0; }
+  #topbar { display: flex; align-items: center; gap: 10px; padding: 12px 24px;
+            border-bottom: 1px solid var(--border); }
+  #menuBtn { display: none; }
+  #topbar .title { font-weight: 600; font-size: 15px; }
+  #scope { margin-left: auto; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px;
+           background: var(--card); color: var(--text); font-size: 13px; max-width: 260px; }
+
+  #thread { flex: 1; overflow-y: auto; padding: 24px 16px 8px; }
+  .thread-inner { max-width: 800px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+  .empty { margin: auto; text-align: center; color: var(--muted); }
+  .empty .logo { font-size: 42px; }
+  .empty h2 { color: var(--text); font-weight: 600; margin: 10px 0 6px; }
+  .empty p { font-size: 13px; line-height: 1.8; }
+
+  .msg { display: flex; gap: 12px; }
+  .msg .avatar { width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0; display: flex;
+                 align-items: center; justify-content: center; font-size: 13px; font-weight: 700; }
+  .msg.user { flex-direction: row-reverse; }
+  .msg.user .avatar { background: var(--bubble); color: var(--muted); }
+  .msg.assistant .avatar { background: var(--accent); color: #fff; }
+  .msg .body { max-width: 78%; min-width: 0; }
+  .msg.user .body { background: var(--bubble); border-radius: 14px 14px 4px 14px; padding: 10px 14px; }
+  .msg.assistant .body { background: transparent; }
+  .msg .text { font-size: 15px; line-height: 1.8; white-space: pre-wrap; word-break: break-word; }
+  .msg .text code { background: var(--code-bg); border-radius: 4px; padding: 1px 5px; font-size: 13px; }
+  .msg .text strong { font-weight: 650; }
+  .msg.user .text { font-size: 14.5px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { font-size: 12px; color: var(--muted); background: var(--card); border: 1px solid var(--border);
+          border-radius: 999px; padding: 3px 10px; }
+  .chip.fig { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+  .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+              gap: 12px; margin-top: 12px; }
+  .img-card { border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+              background: var(--card); box-shadow: var(--shadow); }
+  .img-card img { width: 100%; display: block; background: #fff; cursor: zoom-in; }
+  .img-card figcaption { padding: 9px 12px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .img-card figcaption b { color: var(--text); font-weight: 600; }
+  .img-card figcaption a { color: var(--accent); text-decoration: none; margin-left: 6px; white-space: nowrap; }
+
+  .typing { display: inline-flex; gap: 4px; padding: 10px 0; }
+  .typing i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted);
+              animation: bounce 1.2s infinite; }
+  .typing i:nth-child(2) { animation-delay: .15s; } .typing i:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 30% { transform: translateY(-5px); opacity: .5; } }
+  .cursor { display: inline-block; width: 8px; height: 16px; background: var(--accent);
+            vertical-align: -2px; animation: blink 1s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .thinking { margin: 0 0 8px; font-size: 12.5px; color: var(--muted); }
+  .thinking summary { cursor: pointer; opacity: .8; }
+  .thinking .think-body { border-left: 2px solid var(--border); padding: 4px 10px; margin-top: 6px;
+                          white-space: pre-wrap; max-height: 180px; overflow-y: auto; line-height: 1.6; }
+
+  /* ---- 输入区 ---- */
+  #composer { padding: 12px 16px 18px; }
+  .composer-inner { max-width: 800px; margin: 0 auto; display: flex; align-items: flex-end; gap: 10px;
+                    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+                    padding: 10px 12px; box-shadow: var(--shadow); }
+  .composer-inner:focus-within { border-color: var(--accent); }
+  #input { flex: 1; border: none; outline: none; resize: none; background: none; color: var(--text);
+           font: inherit; font-size: 15px; line-height: 1.6; max-height: 160px; }
+  #sendBtn { width: 38px; height: 38px; border: none; border-radius: 50%; background: var(--accent);
+             color: #fff; font-size: 17px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+  #sendBtn:disabled { opacity: .45; cursor: default; }
+  .hint { text-align: center; font-size: 11px; color: var(--muted); margin-top: 8px; }
+
+  /* ---- 大图查看 ---- */
+  #lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.82); display: flex; z-index: 50;
+              align-items: center; justify-content: center; cursor: zoom-out; }
+  #lightbox[hidden] { display: none !important; }   /* 显式 display:flex 会顶掉 hidden 属性 */
+  #lightbox img { max-width: 94vw; max-height: 94vh; }
+
+  @media (max-width: 760px) {
+    #sidebar { position: fixed; z-index: 40; left: 0; top: 0; transform: translateX(-100%);
+               transition: transform .2s; }
+    #sidebar.open { transform: none; }
+    #menuBtn { display: inline-flex; }
+    .msg .body { max-width: 88%; }
+  }
+</style>
+</head>
+<body>
+<aside id="sidebar">
+  <div class="brand">deep<span>photo</span></div>
+  <div class="side-actions"><button id="newChatBtn" onclick="newChat()">＋ 新会话</button></div>
+  <div class="side-label">文档库</div>
+  <label id="uploadLabel">上传 PDF…<input type="file" id="file" accept="application/pdf" hidden></label>
+  <div id="docList"></div>
+  <div class="side-foot">
+    <input id="token" placeholder="访问令牌" title="Bearer token">
+    <button class="icon-btn" onclick="saveToken()" title="保存令牌">✓</button>
+    <button class="icon-btn" onclick="toggleTheme()" title="切换主题" id="themeBtn">🌙</button>
+  </div>
+</aside>
+
+<main id="main">
+  <div id="topbar">
+    <button class="icon-btn" id="menuBtn" onclick="$('sidebar').classList.toggle('open')">☰</button>
+    <span class="title">图文知识库问答</span>
+    <select id="scope" onchange="saveScope()"><option value="">全部文档</option></select>
+  </div>
+  <div id="thread"><div class="thread-inner" id="threadInner"></div></div>
+  <div id="composer">
+    <div class="composer-inner">
+      <textarea id="input" rows="1" placeholder="提问文档内容,Enter 发送,Shift+Enter 换行"></textarea>
+      <button id="sendBtn" onclick="send()" title="发送">↑</button>
+    </div>
+    <div class="hint">回答附出处页码;涉及图形细节时会查看原图。试试“把相关图也给我看”</div>
+  </div>
+</main>
+
+<div id="lightbox" hidden onclick="this.hidden = true"><img id="lightboxImg"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const STATUS_LABEL = { queued: "排队中", parsing: "解析中", describing: "描述图片", indexing: "索引中", ready: "就绪", failed: "失败" };
+let messages = [];      // {role, content, citations?, images?}
+let sending = false;
+
+// ---- 初始化 ----
+initTheme();
+$("token").value = localStorage.getItem("deephoto_token") || "";
+messages = JSON.parse(localStorage.getItem("deephoto_chat") || "[]");
+renderThread();
+loadDocs();
+
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("input").addEventListener("input", autoGrow);
+$("file").addEventListener("change", upload);
+
+function autoGrow() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 160) + "px"; }
+
+// ---- 主题 ----
+function initTheme() {
+  const saved = localStorage.getItem("deephoto_theme");
+  const dark = saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  $("themeBtn").textContent = dark ? "☀️" : "🌙";
+}
+function toggleTheme() {
+  const dark = document.documentElement.dataset.theme !== "dark";
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  localStorage.setItem("deephoto_theme", dark ? "dark" : "light");
+  $("themeBtn").textContent = dark ? "☀️" : "🌙";
+}
+
+// ---- 令牌 ----
+function saveToken() { localStorage.setItem("deephoto_token", $("token").value.trim()); loadDocs(); toast("令牌已保存"); }
+function auth() { return { "Authorization": "Bearer " + ($("token").value.trim() || "dev-token") }; }
+
+// ---- 文档库 ----
+async function loadDocs() {
+  try {
+    const r = await fetch("/api/documents", { headers: auth() });
+    if (!r.ok) { $("docList").innerHTML = '<div class="doc-err">令牌无效或未设置</div>'; return; }
+    const docs = (await r.json()).documents;
+    renderDocs(docs);
+    if (docs.some(d => !["ready", "failed"].includes(d.status))) setTimeout(loadDocs, 3000);
+  } catch { /* 服务未就绪时静默 */ }
+}
+
+function renderDocs(docs) {
+  const scope = localStorage.getItem("deephoto_scope") || "";
+  $("docList").innerHTML = docs.map(d => {
+    const cls = d.status === "ready" ? "ready" : d.status === "failed" ? "failed" : "pending";
+    return `<div class="doc-item ${scope === d.id ? "active" : ""}" onclick="setScope('${d.id}')" title="${esc(d.filename)} · ${STATUS_LABEL[d.status] || d.status}">
+        <span class="dot ${cls}"></span><span class="doc-name">${esc(d.filename)}</span>
+        <button class="doc-del" onclick="event.stopPropagation(); delDoc('${d.id}')" title="删除">×</button>
+      </div>${d.error ? `<div class="doc-err">${esc(d.error)}</div>` : ""}`;
+  }).join("") || '<div class="doc-err" style="color:var(--muted)">暂无文档,先上传一份 PDF</div>';
+  const ready = docs.filter(d => d.status === "ready");
+  $("scope").innerHTML = '<option value="">全部文档</option>' +
+    ready.map(d => `<option value="${d.id}" ${scope === d.id ? "selected" : ""}>${esc(d.filename)}</option>`).join("");
+}
+
+function setScope(id) {
+  const cur = localStorage.getItem("deephoto_scope") || "";
+  localStorage.setItem("deephoto_scope", cur === id ? "" : id);
+  loadDocs();
+}
+function saveScope() { localStorage.setItem("deephoto_scope", $("scope").value); loadDocs(); }
+
+async function upload() {
+  const f = $("file").files[0];
+  if (!f) return;
+  const fd = new FormData(); fd.append("file", f);
+  toast("上传中…");
+  const r = await fetch("/api/documents", { method: "POST", headers: auth(), body: fd });
+  const j = await r.json().catch(() => ({}));
+  toast(r.ok ? "已上传,后台处理中" : "上传失败:" + (j.detail || r.status));
+  $("file").value = "";
+  loadDocs();
+}
+
+async function delDoc(id) {
+  if (!confirm("删除该文档及其索引与图片?")) return;
+  const r = await fetch("/api/documents/" + id, { method: "DELETE", headers: auth() });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); toast("删除失败:" + (j.detail || r.status)); }
+  if ((localStorage.getItem("deephoto_scope") || "") === id) localStorage.removeItem("deephoto_scope");
+  loadDocs();
+}
+
+// ---- 会话 ----
+function newChat() {
+  messages = [];
+  localStorage.removeItem("deephoto_chat");
+  renderThread();
+  $("input").focus();
+}
+
+async function send() {
+  const question = $("input").value.trim();
+  if (!question || sending) return;
+  sending = true; $("sendBtn").disabled = true;
+  const history = messages.map(m => ({ role: m.role, content: m.content }));
+  messages.push({ role: "user", content: question });
+  const msg = { role: "assistant", content: "", thinking: "", citations: [], images: [], streaming: true };
+  messages.push(msg);
+  $("input").value = ""; autoGrow();
+  renderThread();
+  try {
+    const r = await fetch("/api/qa/stream", {
+      method: "POST", headers: { ...auth(), "Content-Type": "application/json" },
+      body: JSON.stringify({ question,
+        document_id: localStorage.getItem("deephoto_scope") || null, history }),
+    });
+    if (!r.ok || !r.body) {
+      const j = await r.json().catch(() => ({}));
+      msg.content = "⚠️ 请求失败:" + (j.detail || r.status);
+    } else {
+      await consumeSSE(r.body, msg);
+    }
+  } catch (e) {
+    msg.content = "⚠️ 网络错误:" + e.message;
+  }
+  msg.streaming = false;
+  localStorage.setItem("deephoto_chat", JSON.stringify(messages.slice(-60)));
+  sending = false; $("sendBtn").disabled = false;
+  renderThread();
+}
+
+async function consumeSSE(body, msg) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      const line = raw.split("\n").find(l => l.startsWith("data:"));
+      if (!line) continue;
+      let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+      if (ev.type === "token") msg.content += ev.text;
+      else if (ev.type === "thinking") msg.thinking += ev.text;
+      else if (ev.type === "done") {
+        msg.content = ev.answer || msg.content;
+        msg.citations = ev.citations || [];
+        msg.images = ev.images || [];
+      }
+      else if (ev.type === "warning") msg.content += "\n\n⚠️ " + ev.detail;
+      // 出错时保留已流出的部分内容,不整体替换
+      else if (ev.type === "error") msg.content += (msg.content ? "\n\n" : "") + "⚠️ " + ev.detail;
+      renderThread();   // token 级刷新;量不大,直接重渲染
+    }
+  }
+}
+
+function renderThread() {
+  const box = $("threadInner");
+  if (!messages.length) {
+    box.innerHTML = `<div class="empty"><div class="logo">📚</div>
+      <h2>向你的 PDF 提问</h2>
+      <p>先在左侧上传图文 PDF,等待状态变为“就绪”<br>
+      回答会附上出处页码,命中配图时返回完整原图</p></div>`;
+    return;
+  }
+  box.innerHTML = messages.map(m => {
+    if (m.role === "user")
+      return `<div class="msg user"><div class="avatar">我</div>
+        <div class="body"><div class="text">${esc(m.content)}</div></div></div>`;
+    const thinking = m.thinking
+      ? `<details class="thinking" ${m.streaming ? "open" : ""}><summary>思考过程</summary>
+         <div class="think-body">${esc(m.thinking)}</div></details>` : "";
+    const cursor = m.streaming && !m.content && !m.thinking
+      ? `<div class="typing"><i></i><i></i><i></i></div>` : "";
+    return `<div class="msg assistant"><div class="avatar">D</div>
+      <div class="body">${thinking}
+        <div class="text">${renderText(m)}${m.streaming && m.content ? '<span class="cursor"></span>' : ''}${cursor}</div>
+        ${m.streaming ? "" : renderChips(m) + renderImages(m)}
+      </div></div>`;
+  }).join("");
+  requestAnimationFrame(() => { $("thread").scrollTop = $("thread").scrollHeight; });
+}
+
+// 渲染正文:转义 -> 极简 markdown -> 把 [chunk:..]/[image:..] 标记换成可读徽标
+// 流式期间保持原文,结束后(done 事件带校验结果)再替换为徽标
+function renderText(m) {
+  let html = esc(m.content)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
+  if (m.streaming) return html;
+  const citeMap = {};
+  (m.citations || []).forEach(c => { citeMap[c.chunk_id] = "出处 p." + c.page; });
+  const imgMap = {};
+  (m.images || []).forEach(im => { imgMap[im.image_occurrence_id] = (im.figure_number ? "图 " + im.figure_number : "图片") + " · p." + im.page; });
+  html = html.replace(/\[image:([A-Za-z0-9_]+)\]/g, (_, id) =>
+    imgMap[id] ? `<span class="chip fig" style="margin:0 2px">🖼 ${esc(imgMap[id])}</span>` : "");
+  html = html.replace(/\[chunk:([A-Za-z0-9_]+)\]/g, (_, id) =>
+    citeMap[id] ? `<span class="chip" style="margin:0 2px">📄 ${esc(citeMap[id])}</span>` : "");
+  return html;
+}
+
+function renderChips(m) {
+  const cites = (m.citations || []).map(c => `<span class="chip">📄 出处 p.${c.page}</span>`);
+  if (!cites.length) return "";
+  return `<div class="chips">${cites.join("")}</div>`;
+}
+
+function renderImages(m) {
+  if (!m.images || !m.images.length) return "";
+  return `<div class="img-grid">` + m.images.map(im => `
+    <figure class="img-card">
+      <img src="${im.image_url}" alt="${esc(im.caption || "文档配图")}" loading="lazy"
+           onclick="zoom('${im.image_url}')">
+      <figcaption>
+        <b>${im.figure_number ? "图 " + esc(im.figure_number) : "图片"}</b> · 第 ${im.page} 页
+        ${im.caption ? "<br>" + esc(im.caption) : ""}
+        <a href="${im.source_page_url}" target="_blank">查看 PDF 第 ${im.page} 页 ↗</a>
+      </figcaption>
+    </figure>`).join("") + `</div>`;
+}
+
+function zoom(url) { $("lightboxImg").src = url; $("lightbox").hidden = false; }
+
+function toast(text) {
+  const el = document.createElement("div");
+  el.textContent = text;
+  el.style.cssText = "position:fixed;left:50%;bottom:96px;transform:translateX(-50%);" +
+    "background:var(--text);color:var(--bg);padding:8px 16px;border-radius:999px;font-size:13px;z-index:60";
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 2400);
+}
+
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+</script>
+</body>
+</html>

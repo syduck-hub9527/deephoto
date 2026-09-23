@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deephoto"
+version = "0.1.0"
+description = "图文 PDF RAG 智能体:上传图文交错 PDF,按知识点问答并返回原图与出处"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "pymupdf>=1.24",
+    "pillow>=10.0",
+    "numpy>=1.26",
+    "deepagents>=0.0.5",
+    "langchain-openai>=0.2",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+deephoto = ["web/*.html"]
