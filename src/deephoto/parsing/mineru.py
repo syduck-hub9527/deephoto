@@ -1,4 +1,4 @@
-"""MineU 整 PDF 异步解析客户端。
+"""MinerU PDF 异步解析客户端。
 
 流程(对应 https://mineru.net/apiManage/docs 的 v4 接口):
   1) POST /file-urls/batch  申请上传地址,得到 batch_id 与预签名 URL;
@@ -28,10 +28,11 @@ MINERU_DEFAULT_BASE_URL = "https://mineru.net"
 # 默认轮询:最多等待约 5 分钟
 DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 DEFAULT_MAX_WAIT_SECONDS = 300.0
-# MineU 单文件限制:≤200MB、≤200 页(见 mineru.net/apiManage/docs)。
-# 超过 200 页的 PDF 先拆成每块至多该页数再逐块解析。
+# MinerU 单文件限制:≤200 MB、≤200 页;批量上限 200 个文件。
+# 每次只申请一份文件的上传地址(低于单次申请最多 50 个的限制)。
 DEFAULT_MAX_PAGES_PER_CHUNK = 200
-DEFAULT_MAX_BYTES = 200 * 1024 * 1024
+DEFAULT_MAX_BYTES = 200_000_000
+DEFAULT_MAX_CHUNKS = 200
 
 
 class MinerUError(RuntimeError):
@@ -50,6 +51,7 @@ class MinerUClient:
                  poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
                  max_wait: float = DEFAULT_MAX_WAIT_SECONDS,
                  max_pages_per_chunk: int = DEFAULT_MAX_PAGES_PER_CHUNK,
+                 max_bytes_per_chunk: int = DEFAULT_MAX_BYTES,
                  opener: Callable[..., Any] | None = None,
                  sleep: Callable[[float], None] = time.sleep):
         if not api_key or not api_key.strip():
@@ -58,18 +60,24 @@ class MinerUClient:
         self.base_url = base_url.rstrip("/")
         self.poll_interval = poll_interval
         self.max_wait = max_wait
-        self.max_pages_per_chunk = max(1, max_pages_per_chunk)
+        if max_pages_per_chunk < 1 or max_bytes_per_chunk < 1:
+            raise ValueError("MinerU 分块上限必须大于零")
+        self.max_pages_per_chunk = min(max_pages_per_chunk, DEFAULT_MAX_PAGES_PER_CHUNK)
+        self.max_bytes_per_chunk = min(max_bytes_per_chunk, DEFAULT_MAX_BYTES)
         self._opener = opener or urlopen
         self._sleep = sleep
 
     # ---- 对外 ----
 
     def parse_pdf(self, pdf_bytes: bytes, filename: str = "document.pdf") -> MinerUResult:
-        """解析整份 PDF;超过单文件页数上限时自动分块并按页序合并结果。"""
-        if len(pdf_bytes) > DEFAULT_MAX_BYTES:
-            raise MinerUError(
-                f"PDF 超过 MineU 单文件大小限制({DEFAULT_MAX_BYTES // (1024 * 1024)}MB)")
-        chunks = pdf_backend.chunk_pdf(pdf_bytes, self.max_pages_per_chunk)
+        """按两个单文件限制拆分 PDF,逐块上传,结果按原页序合并。"""
+        try:
+            chunks = pdf_backend.chunk_pdf(
+                pdf_bytes, self.max_pages_per_chunk, self.max_bytes_per_chunk,
+                max_chunks=DEFAULT_MAX_CHUNKS,
+            )
+        except pdf_backend.PDFBackendError as exc:
+            raise MinerUError(f"PDF 拆分失败: {exc}") from exc
         if len(chunks) == 1:
             return self._parse_chunk(chunks[0], filename)
         # 多块:逐块解析,按页序拼接(页与页的相对顺序保持一致)
@@ -86,11 +94,12 @@ class MinerUClient:
     # ---- 内部:各步骤 ----
 
     def _parse_chunk(self, pdf_bytes: bytes, filename: str) -> MinerUResult:
+        expected_pages = pdf_backend.page_count(pdf_bytes)
         batch_id, upload_url = self._request_upload_url(filename)
         self._upload_pdf(upload_url, pdf_bytes)
         extract = self._poll_result(batch_id)
         zip_bytes = self._download(extract["full_zip_url"])
-        return MinerUResult(page_texts=_zip_to_page_texts(zip_bytes), raw=extract)
+        return MinerUResult(page_texts=_zip_to_page_texts(zip_bytes, expected_pages), raw=extract)
 
     def _request_upload_url(self, filename: str) -> tuple[str, str]:
         payload = {
@@ -170,7 +179,9 @@ class MinerUClient:
             envelope = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise MinerUError("MineU 返回的不是有效 JSON") from exc
-        if isinstance(envelope, dict) and envelope.get("success") is False:
+        if isinstance(envelope, dict) and (
+            envelope.get("success") is False or envelope.get("code", 0) != 0
+        ):
             raise MinerUError(f"MineU 错误: {envelope.get('msg') or envelope.get('msgCode')}")
         data = envelope.get("data") if isinstance(envelope, dict) else None
         if data is None:
@@ -178,11 +189,11 @@ class MinerUClient:
         return data
 
 
-def _zip_to_page_texts(zip_bytes: bytes) -> list[str]:
+def _zip_to_page_texts(zip_bytes: bytes, expected_pages: int | None = None) -> list[str]:
     """从结果 ZIP 提取按页文本。
 
     优先 content_list.json(带 page_idx,是真正的按页结构);
-    没有时退化用 full.md(MineU 不按 \f 分页时只能整篇一页)。
+    没有时使用带分页符的 full.md;多页结果缺少页码信息时直接报错。
     """
     try:
         archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -196,7 +207,7 @@ def _zip_to_page_texts(zip_bytes: bytes) -> list[str]:
             items = json.loads(archive.read(content_name).decode("utf-8", errors="replace"))
         except json.JSONDecodeError as exc:
             raise MinerUError("MineU content_list.json 不是有效 JSON") from exc
-        return _content_list_to_pages(items)
+        return _content_list_to_pages(items, expected_pages)
 
     md_name = next((n for n in names if n.endswith("full.md")), None) or \
         next((n for n in names if n.endswith(".md")), None)
@@ -204,11 +215,18 @@ def _zip_to_page_texts(zip_bytes: bytes) -> list[str]:
         raise MinerUError("MineU 结果 ZIP 中未找到 markdown")
     text = archive.read(md_name).decode("utf-8", errors="replace")
     if "\f" in text:
-        return [p.strip() for p in text.split("\f")]
-    return [text.strip()] if text.strip() else []
+        pages = [p.strip() for p in text.split("\f")]
+        if pages[-1] == "" and (expected_pages is None or len(pages) == expected_pages + 1):
+            pages.pop()
+        if expected_pages is not None and len(pages) != expected_pages:
+            raise MinerUError("MinerU 结果页数与上传的 PDF 不一致")
+        return pages
+    if expected_pages is not None and expected_pages != 1:
+        raise MinerUError("MinerU 多页结果缺少按页结构,无法保证原 PDF 页码准确")
+    return [text.strip()] if text.strip() or expected_pages == 1 else []
 
 
-def _content_list_to_pages(items: list[dict]) -> list[str]:
+def _content_list_to_pages(items: list[dict], expected_pages: int | None = None) -> list[str]:
     """把 content_list 的元素按 page_idx 聚成逐页文本。"""
     if not isinstance(items, list):
         return []
@@ -220,8 +238,16 @@ def _content_list_to_pages(items: list[dict]) -> list[str]:
         text = str(item.get("text") or "").strip()
         if page_idx is None or not text:
             continue
-        pages.setdefault(int(page_idx), []).append(text)
-    if not pages:
+        try:
+            index = int(page_idx)
+        except (TypeError, ValueError) as exc:
+            raise MinerUError("MinerU 结果中存在无效页码") from exc
+        if index < 0:
+            raise MinerUError("MinerU 结果中存在负数页码")
+        pages.setdefault(index, []).append(text)
+    if expected_pages is not None and pages and max(pages) >= expected_pages:
+        raise MinerUError("MinerU 结果中的页码超出上传 PDF 范围")
+    if not pages and expected_pages is None:
         return []
-    count = max(pages) + 1
+    count = expected_pages if expected_pages is not None else max(pages) + 1
     return ["\n".join(pages.get(i, [])) for i in range(count)]

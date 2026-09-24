@@ -64,6 +64,19 @@ pip freeze > requirements.lock.txt
 - `POST /api/qa` `{question, document_id?}` → `{answer, citations[], images[]}`
 - `GET /api/documents/{id}/images/{occ_id}`、`GET .../pages/{n}`:Bearer 鉴权**或** `?expires=&sig=` 短时签名(问答响应中已生成)
 
+### MinerU 云端解析的 PDF 自动分页
+
+在网页“设置”中选择 MinerU 并填写自己的 API Token。后台上传原 PDF 前会按
+**每份最多 200 页、序列化后最多 200,000,000 字节**自动拆分；拆分结果依原页序
+解析并合并，空白页也会占据原页码。某一页单独导出仍超限时会给出明确错误。
+整个文档最多拆成 200 份；当前每份独立申请一次上传地址，因此也符合官网
+“单次最多申请 50 个上传链接”的限制。Token 只保存在服务端设置中，不写入代码。
+
+原 PDF 的上传大小限制由 `DEEPHOTO_MAX_UPLOAD_MB` 控制，默认 100 MB；如需
+处理大于 200 MB 的原件，应按服务器内存情况提高该值。这个值是**原件上传限制**，
+与 MinerU 的**每份子文件限制**不同。完整解析依赖 MinerU Token，无法仅凭
+分页功能跳过云端鉴权。调用前请确认[官方 API 限制](https://mineru.net/apiManage/docs)。
+
 入库状态机:`queued → parsing → describing → indexing → ready`,失败为 `failed` 并记录错误。
 
 ## 关键设计(与文档条款对应)

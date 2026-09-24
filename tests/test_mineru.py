@@ -54,6 +54,22 @@ class ContentListPagingTest(unittest.TestCase):
         zb = _make_zip({"full.md": "整篇文本"})
         self.assertEqual(_zip_to_page_texts(zb), ["整篇文本"])
 
+    def test_preserves_trailing_blank_pages_for_original_page_numbers(self):
+        zb = _make_zip({"x_content_list.json": json.dumps([
+            {"type": "text", "text": "第一页", "page_idx": 0},
+        ])})
+        self.assertEqual(_zip_to_page_texts(zb, expected_pages=3), ["第一页", "", ""])
+
+    def test_rejects_multi_page_markdown_without_page_markers(self):
+        with self.assertRaisesRegex(MinerUError, "缺少按页结构"):
+            _zip_to_page_texts(_make_zip({"full.md": "整篇文本"}), expected_pages=2)
+
+    def test_preserves_trailing_blank_page_in_markdown(self):
+        self.assertEqual(
+            _zip_to_page_texts(_make_zip({"full.md": "第一页\f"}), expected_pages=2),
+            ["第一页", ""],
+        )
+
 
 class MinerUClientFlowTest(unittest.TestCase):
     """用注入的 opener 走完 申请->轮询->下载 流程(上传走 http.client,单独 mock)。"""
@@ -85,11 +101,14 @@ class MinerUClientFlowTest(unittest.TestCase):
         client._upload_pdf = lambda url, data: None
         import deephoto.parsing.mineru as m
         orig = m.pdf_backend.chunk_pdf
-        m.pdf_backend.chunk_pdf = lambda b, n: [b]
+        m.pdf_backend.chunk_pdf = lambda b, n, *args, **kwargs: [b]
+        orig_count = m.pdf_backend.page_count
+        m.pdf_backend.page_count = lambda b: 2
         try:
             result = client.parse_pdf(b"%PDF fake", "t.pdf")
         finally:
             m.pdf_backend.chunk_pdf = orig
+            m.pdf_backend.page_count = orig_count
         self.assertEqual(result.page_texts, ["第一页", "第二页"])
 
     def test_failed_state_raises(self):
@@ -105,12 +124,15 @@ class MinerUClientFlowTest(unittest.TestCase):
         client._upload_pdf = lambda url, data: None
         import deephoto.parsing.mineru as m
         orig = m.pdf_backend.chunk_pdf
-        m.pdf_backend.chunk_pdf = lambda b, n: [b]
+        m.pdf_backend.chunk_pdf = lambda b, n, *args, **kwargs: [b]
+        orig_count = m.pdf_backend.page_count
+        m.pdf_backend.page_count = lambda b: 1
         try:
             with self.assertRaises(MinerUError):
                 client.parse_pdf(b"%PDF fake", "t.pdf")
         finally:
             m.pdf_backend.chunk_pdf = orig
+            m.pdf_backend.page_count = orig_count
 
     def test_requires_token(self):
         with self.assertRaises(MinerUError):
@@ -140,7 +162,7 @@ class ChunkedParseTest(unittest.TestCase):
 
         import deephoto.parsing.mineru as m
         orig = m.pdf_backend.chunk_pdf
-        m.pdf_backend.chunk_pdf = lambda b, n: chunks
+        m.pdf_backend.chunk_pdf = lambda b, n, *args, **kwargs: chunks
         try:
             result = client.parse_pdf(b"%PDF big", "doc.pdf")
         finally:
@@ -156,20 +178,13 @@ class ChunkedParseTest(unittest.TestCase):
 
         import deephoto.parsing.mineru as m
         orig = m.pdf_backend.chunk_pdf
-        m.pdf_backend.chunk_pdf = lambda b, n: chunks
+        m.pdf_backend.chunk_pdf = lambda b, n, *args, **kwargs: chunks
         try:
             result = client.parse_pdf(b"%PDF small", "doc.pdf")
         finally:
             m.pdf_backend.chunk_pdf = orig
         self.assertEqual(result.page_texts, ["p1"])
         self.assertEqual(seen, ["doc.pdf"])
-
-    def test_oversize_bytes_rejected(self):
-        client = MinerUClient(api_key="tok")
-        big = b"x" * (201 * 1024 * 1024)
-        with self.assertRaises(MinerUError):
-            client.parse_pdf(big, "big.pdf")
-
 
 def _NR(page_texts):
     from deephoto.parsing.mineru import MinerUResult
@@ -195,6 +210,55 @@ class ChunkPdfTest(unittest.TestCase):
         raw = self._make_pdf(5)
         chunks = pdf_backend.chunk_pdf(raw, 2)
         self.assertEqual([self._count(c) for c in chunks], [2, 2, 1])
+
+    def test_byte_limit_splits_even_below_page_limit(self):
+        raw = self._make_pdf(5)
+        two_pages = pdf_backend.chunk_pdf(raw, 2)[0]
+        one_page = pdf_backend.chunk_pdf(raw, 1)[0]
+        limit = max(len(one_page), len(two_pages) - 1)
+        self.assertLess(limit, len(raw))
+        chunks = pdf_backend.chunk_pdf(raw, 200, max_bytes=limit)
+        self.assertEqual(sum(self._count(c) for c in chunks), 5)
+        self.assertTrue(all(len(c) <= limit for c in chunks))
+
+    def test_client_splits_by_bytes_and_restores_page_order(self):
+        import pymupdf
+        source = pymupdf.open()
+        for i in range(5):
+            source.new_page().insert_text((72, 72), f"Page {i}")
+        raw = source.tobytes()
+        source.close()
+        limit = len(pdf_backend.chunk_pdf(raw, 2)[0]) - 1
+        seen = []
+        client = MinerUClient(api_key="tok", max_bytes_per_chunk=limit)
+
+        def parse_chunk(chunk, filename):
+            self.assertLessEqual(len(chunk), limit)
+            doc = pymupdf.open(stream=chunk, filetype="pdf")
+            try:
+                pages = [page.get_text().strip() for page in doc]
+            finally:
+                doc.close()
+            seen.append((filename, pages))
+            return _NR(pages)
+
+        client._parse_chunk = parse_chunk
+        result = client.parse_pdf(raw, "source.pdf")
+        self.assertEqual(result.page_texts, [f"Page {i}" for i in range(5)])
+        self.assertGreater(len(seen), 1)
+        self.assertEqual([name for name, _ in seen], [
+            f"source_part{i}.pdf" for i in range(1, len(seen) + 1)
+        ])
+
+    def test_oversize_single_page_fails_without_upload(self):
+        raw = self._make_pdf(1)
+        with self.assertRaisesRegex(pdf_backend.PDFBackendError, "第 1 页"):
+            pdf_backend.chunk_pdf(raw, 200, max_bytes=len(raw) - 1)
+
+    def test_batch_file_limit_is_checked(self):
+        raw = self._make_pdf(5)
+        with self.assertRaisesRegex(pdf_backend.PDFBackendError, "超过 2 个"):
+            pdf_backend.chunk_pdf(raw, 2, max_chunks=2)
 
     def _count(self, raw):
         import pymupdf

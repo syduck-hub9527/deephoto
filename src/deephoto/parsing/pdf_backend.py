@@ -98,28 +98,58 @@ def render_region(pdf_bytes: bytes, page_number: int, bbox, dpi: int = _RENDER_D
     return _pymupdf_render(pdf_bytes, page_number, bbox, dpi)
 
 
-def chunk_pdf(pdf_bytes: bytes, max_pages: int) -> list[bytes]:
-    """把 PDF 按 max_pages 拆成若干子 PDF(供 MineU ≤200 页限制的分块上传)。
+def chunk_pdf(pdf_bytes: bytes, max_pages: int, max_bytes: int | None = None,
+              max_chunks: int | None = None) -> list[bytes]:
+    """按页数和实际序列化大小拆分 PDF,保持页序且不拆单页。
 
-    拆分需要 PyMuPDF(poppler 无写 PDF 能力);页数不超过 max_pages 时直接
-    返回原字节单元素列表,不产生额外拷贝。块内页序与原 PDF 一致。
+    每块选取满足两个上限的最长连续页范围。先尝试 max_pages 页,
+    超出字节上限时二分缩小范围。两项都满足时原样返回输入字节。
     """
+    if max_pages < 1 or (max_bytes is not None and max_bytes < 1):
+        raise ValueError("PDF 分块上限必须大于零")
+    if max_chunks is not None and max_chunks < 1:
+        raise ValueError("PDF 分块数量上限必须大于零")
     if not pymupdf_available():
-        raise PDFBackendError("拆分 PDF 需要 PyMuPDF(pypdf/pymupdf)")
+        raise PDFBackendError("拆分 PDF 需要 PyMuPDF(pymupdf)")
     src = _fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         total = src.page_count
-        if total <= max_pages:
+        if not total:
+            raise PDFBackendError("PDF 没有可解析的页面")
+        if total <= max_pages and (max_bytes is None or len(pdf_bytes) <= max_bytes):
             return [pdf_bytes]
-        chunks: list[bytes] = []
-        for start in range(0, total, max_pages):
-            end = min(start + max_pages - 1, total - 1)
+
+        def serialize(start: int, end: int) -> bytes:
             out = _fitz.open()
             try:
-                out.insert_pdf(src, from_page=start, to_page=end)
-                chunks.append(out.tobytes())
+                out.insert_pdf(src, from_page=start, to_page=end - 1)
+                return out.tobytes()
             finally:
                 out.close()
+
+        chunks: list[bytes] = []
+        start = 0
+        while start < total:
+            if max_chunks is not None and len(chunks) >= max_chunks:
+                raise PDFBackendError(f"PDF 分块超过 {max_chunks} 个,无法在单批中提交")
+            upper = min(start + max_pages, total)
+            candidate = serialize(start, upper)
+            if max_bytes is not None and len(candidate) > max_bytes:
+                low, high = start + 1, upper - 1
+                best: tuple[int, bytes] | None = None
+                while low <= high:
+                    mid = (low + high) // 2
+                    part = serialize(start, mid)
+                    if len(part) <= max_bytes:
+                        best = (mid, part)
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+                if best is None:
+                    raise PDFBackendError(f"PDF 第 {start + 1} 页单独导出仍超过单文件大小限制")
+                upper, candidate = best
+            chunks.append(candidate)
+            start = upper
         return chunks
     finally:
         src.close()
