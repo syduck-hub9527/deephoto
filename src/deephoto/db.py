@@ -20,6 +20,18 @@ CREATE TABLE IF NOT EXISTS users (
     created_at  TEXT NOT NULL
 );
 
+-- 每个租户一份可由设置页面修改的 OCR 配置。密钥只在服务端使用,
+-- API 返回时仅暴露是否已配置,不会把原值发给浏览器。
+CREATE TABLE IF NOT EXISTS ocr_settings (
+    tenant_id       TEXT PRIMARY KEY,
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    base_url        TEXT,
+    api_key         TEXT,
+    timeout_seconds REAL NOT NULL DEFAULT 60,
+    updated_at      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS documents (
     id                TEXT PRIMARY KEY,
     tenant_id         TEXT NOT NULL,

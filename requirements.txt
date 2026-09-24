@@ -1,4 +1,7 @@
 # 首次安装后建议用 `pip freeze > requirements.lock.txt` 锁定实际版本(见开发文档§8)
+# PDF 引擎二选一(运行时自动探测,优先 poppler):
+#   - poppler(Linux/WSL): apt-get install poppler-utils,无需 Python 依赖;
+#   - pymupdf(Windows 回退,下方已列)。
 fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9

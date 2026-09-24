@@ -12,7 +12,15 @@ import logging
 from .. import repo
 from ..config import Settings
 from ..db import connect
-from ..parsing.base import KIND_EMBEDDED_BITMAP, KIND_PAGE_FALLBACK, LayoutParser, ParsedDocument
+from ..ocr import OCR_PROVIDER_MINERU, OCRConfig, OCRConfigurationError
+from ..parsing.base import (
+    KIND_EMBEDDED_BITMAP,
+    KIND_PAGE_FALLBACK,
+    LayoutParser,
+    ParsedDocument,
+    ParsedParagraph,
+)
+from ..parsing.mineru import MinerUClient
 from ..storage import ObjectStore
 from .chunking import chunk_paragraphs
 from .describe import DESC_PROMPT_VERSION, describe_image
@@ -21,6 +29,36 @@ from .linking import resolve_links
 logger = logging.getLogger(__name__)
 
 _MIME_BY_PIL_FORMAT = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
+
+# MineU 不返回页面尺寸;正文用稳定占位即可(bbox 仅占位,不影响检索)
+_PAGE_W = 612.0
+_PAGE_H = 792.0
+
+
+def _pages_from_texts(page_texts: list[str]) -> ParsedDocument:
+    """把 MineU 按页文本构造成 ParsedDocument(整页作为段落范围,无图形)。"""
+    from ..parsing.base import ParsedPage
+
+    pages: list[ParsedPage] = []
+    for index, text in enumerate(page_texts):
+        page_number = index + 1
+        page = ParsedPage(
+            page_number=page_number,
+            width=_PAGE_W,
+            height=_PAGE_H,
+            is_scanned=False,
+        )
+        clean = text.strip()
+        if clean:
+            page.paragraphs.append(ParsedParagraph(
+                id=f"p{page_number}_mineru",
+                text=clean,
+                page_number=page_number,
+                bbox=(0.0, 0.0, _PAGE_W, _PAGE_H),
+                section=None,
+            ))
+        pages.append(page)
+    return ParsedDocument(page_count=len(pages), pages=pages)
 
 
 class IngestService:
@@ -61,10 +99,10 @@ class IngestService:
             conn.commit()
             return
 
-        # 2) 解析
+        # 2) 解析:无论是否扫描版,一律整 PDF 交给 MineU 解析(不本地判扫描/渲染页)
         repo.update_document_status(conn, document_id, "parsing")
         pdf_bytes = self.store.get(doc["pdf_object_key"])
-        parsed = self.parser.parse(pdf_bytes)
+        parsed = self._parse_with_mineru(conn, doc, pdf_bytes)
         occurrences = self._persist_figures(conn, doc, parsed, pdf_bytes)
         chunks = self._persist_chunks_and_links(conn, doc, parsed, occurrences)
         conn.commit()
@@ -79,6 +117,36 @@ class IngestService:
         self.index_service.upsert_document(conn, document_id)
         repo.update_document_status(conn, document_id, "ready", page_count=parsed.page_count)
         conn.commit()
+
+    def _ocr_config(self, conn, tenant_id: str) -> OCRConfig | None:
+        """读取租户 OCR 配置;无效或未启用返回 None。"""
+        values = repo.get_ocr_settings(conn, tenant_id, self.settings.ocr_defaults)
+        try:
+            return OCRConfig(
+                provider=str(values.get("provider") or "disabled"),
+                model=str(values.get("model") or ""),
+                base_url=str(values["base_url"]) if values.get("base_url") else None,
+                api_key=str(values["api_key"]) if values.get("api_key") else None,
+                timeout_seconds=float(values.get("timeout_seconds") or 60),
+            ).normalized()
+        except (OCRConfigurationError, ValueError) as exc:
+            logger.warning("OCR 配置无效,跳过扫描页识别: %s", exc)
+            return None
+
+    def _parse_with_mineru(self, conn, doc: dict, pdf_bytes: bytes) -> ParsedDocument:
+        """整 PDF 一律交给 MineU 解析,按页文本构造 ParsedDocument。
+
+        不本地判扫描、不本地渲染页、不存整页图(600+页扫描版不再产生整页图)。
+        MineU 失败时按异常上抛,由 ingest() 标记文档 failed 供重试。
+        """
+        config = self._ocr_config(conn, doc["tenant_id"])
+        if config is None or config.provider != OCR_PROVIDER_MINERU or not config.api_key:
+            raise OCRConfigurationError("未配置 MineU API Token,无法解析 PDF")
+        result = MinerUClient(
+            api_key=config.api_key,
+            base_url=config.base_url or "https://mineru.net",
+        ).parse_pdf(pdf_bytes, doc.get("filename") or "document.pdf")
+        return _pages_from_texts(result.page_texts)
 
     def _persist_figures(self, conn, doc: dict, parsed: ParsedDocument, pdf_bytes: bytes) -> list[dict]:
         """保存图片资产与出现位置;返回 [{id, page_number, figure_number, caption, parsed_figure}]。"""

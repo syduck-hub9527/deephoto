@@ -21,6 +21,7 @@ from ..security import ensure_bootstrap_user
 from ..storage import ObjectStore
 from .routes_documents import router as documents_router
 from .routes_qa import router as qa_router
+from .routes_settings import router as settings_router
 from .worker import IngestWorker
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(documents_router)
     app.include_router(qa_router)
+    app.include_router(settings_router)
 
     @app.get("/", include_in_schema=False)
     def index():

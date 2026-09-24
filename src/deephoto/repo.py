@@ -16,6 +16,44 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+# ---- tenant settings ----
+
+def get_ocr_settings(conn: Connection, tenant_id: str,
+                     defaults: dict[str, object] | None = None) -> dict[str, object]:
+    """读取租户 OCR 设置;尚未保存时返回环境变量默认值。"""
+    result = {
+        "provider": "third_party",
+        "model": "",
+        "base_url": None,
+        "api_key": None,
+        "timeout_seconds": 60.0,
+    }
+    if defaults:
+        result.update(defaults)
+    row = conn.execute(
+        "SELECT provider, model, base_url, api_key, timeout_seconds FROM ocr_settings"
+        " WHERE tenant_id = ?", (tenant_id,),
+    ).fetchone()
+    if row:
+        result.update(dict(row))
+    result["timeout_seconds"] = float(result["timeout_seconds"] or 60.0)
+    return result
+
+
+def save_ocr_settings(conn: Connection, tenant_id: str, *, provider: str, model: str,
+                      base_url: str | None, api_key: str | None,
+                      timeout_seconds: float) -> None:
+    conn.execute(
+        "INSERT INTO ocr_settings (tenant_id, provider, model, base_url, api_key,"
+        " timeout_seconds, updated_at) VALUES (?,?,?,?,?,?,?)"
+        " ON CONFLICT(tenant_id) DO UPDATE SET provider = excluded.provider,"
+        " model = excluded.model, base_url = excluded.base_url, api_key = excluded.api_key,"
+        " timeout_seconds = excluded.timeout_seconds, updated_at = excluded.updated_at",
+        (tenant_id, provider, model, base_url, api_key, float(timeout_seconds), _now()),
+    )
+    conn.commit()
+
+
 # ---- documents ----
 
 def insert_document(conn: Connection, *, tenant_id: str, owner_id: str, filename: str,

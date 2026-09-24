@@ -58,6 +58,43 @@
   .icon-btn { border: 1px solid var(--border); background: var(--card); color: var(--text);
               border-radius: 8px; padding: 7px 10px; }
 
+  /* ---- 设置 ---- */
+  #settingsModal { position: fixed; inset: 0; z-index: 45; display: flex; align-items: center;
+                   justify-content: center; background: rgba(20, 18, 14, .48); padding: 20px; }
+  #settingsModal[hidden] { display: none !important; }
+  .settings-card { width: min(760px, 100%); max-height: min(680px, 100%); overflow: hidden;
+                   display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--border);
+                   border-radius: 16px; box-shadow: 0 12px 40px rgba(30, 24, 15, .2); }
+  .settings-head { display: flex; align-items: center; gap: 12px; padding: 16px 20px;
+                   border-bottom: 1px solid var(--border); }
+  .settings-head h2 { margin: 0; font-size: 17px; font-weight: 650; }
+  .settings-close { margin-left: auto; border: none; background: none; color: var(--muted); font-size: 22px; }
+  .settings-body { display: flex; min-height: 390px; overflow: hidden; }
+  .settings-menu { width: 170px; flex-shrink: 0; padding: 12px 8px; background: var(--side);
+                   border-right: 1px solid var(--border); }
+  .settings-menu button { display: block; width: 100%; border: none; border-radius: 8px; padding: 9px 10px;
+                          background: none; color: var(--muted); text-align: left; font-size: 13px; }
+  .settings-menu button.active, .settings-menu button:hover { background: var(--card); color: var(--text); }
+  .settings-panel { flex: 1; overflow-y: auto; padding: 22px 24px; }
+  .settings-panel h3 { margin: 0 0 6px; font-size: 16px; }
+  .settings-panel .description { margin: 0 0 20px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+  .settings-form { display: grid; gap: 15px; max-width: 520px; }
+  .settings-field { display: grid; gap: 6px; }
+  .settings-field label { font-size: 13px; font-weight: 600; }
+  .settings-field small { color: var(--muted); font-size: 11px; line-height: 1.5; }
+  .settings-field input, .settings-field select { width: 100%; padding: 9px 10px; border: 1px solid var(--border);
+                                                    border-radius: 8px; background: var(--card); color: var(--text); }
+  .settings-field input:focus, .settings-field select:focus { outline: none; border-color: var(--accent); }
+  .settings-secret-row { display: flex; align-items: center; gap: 8px; }
+  .settings-secret-row input { flex: 1; }
+  .settings-secret-state { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .settings-check { display: flex; gap: 7px; align-items: center; width: fit-content;
+                    color: var(--muted); font-size: 12px; font-weight: 400; white-space: nowrap; }
+  .settings-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  .settings-save { border: none; border-radius: 8px; padding: 9px 16px; background: var(--accent); color: #fff; }
+  .settings-save:disabled { opacity: .55; cursor: default; }
+  .settings-status { color: var(--muted); font-size: 12px; }
+
   /* ---- 主区 ---- */
   #main { flex: 1; display: flex; flex-direction: column; height: 100vh; min-width: 0; }
   #topbar { display: flex; align-items: center; gap: 10px; padding: 12px 24px;
@@ -154,6 +191,7 @@
     <input id="token" placeholder="访问令牌" title="Bearer token">
     <button class="icon-btn" onclick="saveToken()" title="保存令牌">✓</button>
     <button class="icon-btn" onclick="toggleTheme()" title="切换主题" id="themeBtn">🌙</button>
+    <button class="icon-btn" onclick="openSettings()" title="设置">⚙</button>
   </div>
 </aside>
 
@@ -174,6 +212,59 @@
 </main>
 
 <div id="lightbox" hidden onclick="this.hidden = true"><img id="lightboxImg"></div>
+
+<div id="settingsModal" hidden onclick="if (event.target === this) closeSettings()">
+  <div class="settings-card" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="settings-head">
+      <h2 id="settingsTitle">设置</h2>
+      <button class="settings-close" onclick="closeSettings()" title="关闭">×</button>
+    </div>
+    <div class="settings-body">
+      <nav class="settings-menu" id="settingsMenu" aria-label="设置菜单"></nav>
+      <section class="settings-panel" id="ocrSettingsPanel">
+        <h3>OCR 配置</h3>
+        <p class="description">扫描版 PDF 入库时使用的文字识别服务。可连接本地部署模型，也可连接支持 OpenAI 兼容接口的第三方平台。</p>
+        <div class="settings-form">
+          <div class="settings-field">
+            <label for="ocrProvider">服务类型</label>
+            <select id="ocrProvider" onchange="updateOCRProviderHint()">
+              <option value="third_party">第三方平台</option>
+              <option value="local">本地部署</option>
+            </select>
+            <small id="ocrProviderHint"></small>
+          </div>
+          <div class="settings-field" id="ocrModelField">
+            <label for="ocrModel">模型名称</label>
+            <input id="ocrModel" placeholder="例如 qwen-vl-ocr 或 minicpm-v-2.6">
+            <small>填写服务端实际加载的模型 ID。</small>
+          </div>
+          <div class="settings-field" id="ocrBaseUrlField">
+            <label for="ocrBaseUrl">服务地址</label>
+            <input id="ocrBaseUrl" placeholder="http://127.0.0.1:8001/v1">
+            <small id="ocrBaseUrlHint">服务需要提供 OpenAI 兼容的 /chat/completions 接口。</small>
+          </div>
+          <div class="settings-field">
+            <label for="ocrApiKey">API Key</label>
+            <div class="settings-secret-row">
+              <input id="ocrApiKey" type="password" placeholder="留空以保留已保存的密钥">
+              <span class="settings-secret-state" id="ocrApiKeyState"></span>
+            </div>
+            <label class="settings-check"><input type="checkbox" id="ocrClearApiKey"> 清除已保存的密钥</label>
+            <small>勾选后保存将删除服务端已存的密钥；不勾选则保留（填了新密钥则直接替换）。一般在切换本地模型与第三方模型时使用。</small>
+          </div>
+          <div class="settings-field" id="ocrTimeoutField">
+            <label for="ocrTimeout">请求超时（秒）</label>
+            <input id="ocrTimeout" type="number" min="1" max="300" step="1" value="60">
+          </div>
+          <div class="settings-actions">
+            <button class="settings-save" id="ocrSaveBtn" onclick="saveOCRSettings()">保存 OCR 设置</button>
+            <span class="settings-status" id="ocrSettingsStatus"></span>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -213,6 +304,108 @@ function toggleTheme() {
 // ---- 令牌 ----
 function saveToken() { localStorage.setItem("deephoto_token", $("token").value.trim()); loadDocs(); toast("令牌已保存"); }
 function auth() { return { "Authorization": "Bearer " + ($("token").value.trim() || "dev-token") }; }
+
+// ---- 设置 ----
+async function openSettings() {
+  $("settingsModal").hidden = false;
+  $("ocrSettingsStatus").textContent = "读取中…";
+  await loadSettings();
+  $("ocrModel").focus();
+}
+function closeSettings() { $("settingsModal").hidden = true; }
+
+async function loadSettings() {
+  try {
+    const r = await fetch("/api/settings", { headers: auth() });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || r.status);
+    renderSettingsMenu(data.sections || []);
+    const ocr = data.ocr || {};
+    const providers = data.ocr_providers || [];
+    const select = $("ocrProvider");
+    const known = new Set(providers.map(p => p.id));
+    // 服务端按优先级返回提供商;MineU(整PDF解析)为默认。
+    const ordered = [...providers].sort((a, b) => (a.id === "mineru" ? -1 : b.id === "mineru" ? 1 : 0));
+    select.innerHTML = ordered.map(p =>
+      `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+    select.value = (ocr.provider && known.has(ocr.provider) && ocr.provider !== "disabled")
+      ? ocr.provider : "mineru";
+    $("ocrModel").value = ocr.model || "";
+    $("ocrBaseUrl").value = ocr.base_url || "";
+    $("ocrApiKey").value = "";
+    $("ocrApiKeyState").textContent = ocr.api_key_configured ? "已保存" : "未设置";
+    $("ocrClearApiKey").checked = false;
+    $("ocrTimeout").value = ocr.timeout_seconds || 60;
+    updateOCRProviderHint();
+    $("ocrSettingsStatus").textContent = "";
+  } catch (e) {
+    $("ocrSettingsStatus").textContent = "读取失败: " + e.message;
+  }
+}
+
+function renderSettingsMenu(sections) {
+  const menu = $("settingsMenu");
+  menu.innerHTML = sections.map((section, index) =>
+    `<button class="${index === 0 ? "active" : ""}" onclick="selectSettingsSection(this, '${esc(section.id)}')" title="${esc(section.description || "")}">${esc(section.label)}</button>`
+  ).join("");
+}
+function selectSettingsSection(button, id) {
+  document.querySelectorAll(".settings-menu button").forEach(b => b.classList.remove("active"));
+  button.classList.add("active");
+  // 后续菜单项可在此挂载自己的面板;当前只有 OCR。
+  $("ocrSettingsPanel").hidden = id !== "ocr";
+}
+function updateOCRProviderHint() {
+  const provider = $("ocrProvider").value;
+  // MineU 只需 Token,隐藏模型/地址;按页 OCR 才需要这两项。
+  const isMinerU = provider === "mineru";
+  $("ocrModelField").hidden = isMinerU;
+  $("ocrBaseUrlField").hidden = isMinerU;
+  $("ocrTimeoutField").hidden = isMinerU;
+  if (isMinerU) {
+    $("ocrProviderHint").textContent = "整份 PDF 交给 MineU 云端异步解析,失败时自动降级为按页 OCR。只需填写 API Token。";
+    $("ocrApiKey").placeholder = "MineU API Token";
+  } else if (provider === "local") {
+    $("ocrProviderHint").textContent = "适用于本机或内网部署的 OpenAI 兼容 OCR 服务(按页识别)。";
+    $("ocrBaseUrl").placeholder = "http://127.0.0.1:8001/v1";
+    $("ocrApiKey").placeholder = "留空以保留已保存的密钥";
+  } else {
+    $("ocrProviderHint").textContent = "适用于云厂商的 OpenAI 兼容 OCR 端点(按页识别),密钥只保存在服务端。";
+    $("ocrBaseUrl").placeholder = "https://api.example.com/v1";
+    $("ocrApiKey").placeholder = "留空以保留已保存的密钥";
+  }
+}
+async function saveOCRSettings() {
+  const button = $("ocrSaveBtn");
+  button.disabled = true;
+  $("ocrSettingsStatus").textContent = "保存中…";
+  const body = {
+    provider: $("ocrProvider").value,
+    model: $("ocrModel").value.trim(),
+    base_url: $("ocrBaseUrl").value.trim() || null,
+    api_key: $("ocrApiKey").value || null,
+    clear_api_key: $("ocrClearApiKey").checked,
+    timeout_seconds: Number($("ocrTimeout").value || 60),
+  };
+  try {
+    const r = await fetch("/api/settings/ocr", {
+      method: "PUT", headers: { ...auth(), "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || r.status);
+    const ocr = data.ocr || {};
+    $("ocrApiKey").value = "";
+    $("ocrApiKeyState").textContent = ocr.api_key_configured ? "已保存" : "未设置";
+    $("ocrClearApiKey").checked = false;
+    $("ocrSettingsStatus").textContent = "已保存";
+    toast("OCR 设置已保存");
+  } catch (e) {
+    $("ocrSettingsStatus").textContent = "保存失败: " + e.message;
+  } finally {
+    button.disabled = false;
+  }
+}
 
 // ---- 文档库 ----
 async function loadDocs() {

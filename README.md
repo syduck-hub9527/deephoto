@@ -52,11 +52,15 @@ pip freeze > requirements.lock.txt
 | `DATA_DIR` | 数据库与对象存储目录 | `./data` |
 | `MAX_UPLOAD_MB` | 上传大小上限 | `100` |
 | `INGESTION_VERSION` | 解析/索引版本;去重复用的判定维度之一 | `v1` |
+| `OCR_PROVIDER` / `OCR_MODEL` | OCR 默认服务类型(`disabled`/`local`/`third_party`)与模型名;可在网页“设置”中按租户覆盖 | 关闭 |
+| `OCR_BASE_URL` / `OCR_API_KEY` | OCR 默认 OpenAI 兼容端点与密钥;本地默认端点为 `http://127.0.0.1:8001/v1` | — |
+| `OCR_TIMEOUT_SECONDS` | 单页 OCR 请求超时时间 | `60` |
 
 ## API 摘要
 
 - `POST /api/documents` 上传 PDF → `{document_id, status: "queued"}`
 - `GET /api/documents` / `GET /api/documents/{id}` / `DELETE /api/documents/{id}`
+- `GET /api/settings` / `PUT /api/settings/ocr`:读取或保存当前租户的 OCR 设置(密钥只返回掩码状态)
 - `POST /api/qa` `{question, document_id?}` → `{answer, citations[], images[]}`
 - `GET /api/documents/{id}/images/{occ_id}`、`GET .../pages/{n}`:Bearer 鉴权**或** `?expires=&sig=` 短时签名(问答响应中已生成)
 
@@ -74,7 +78,7 @@ pip freeze > requirements.lock.txt
 ## 已知限制(首版)
 
 - 多栏排版阅读顺序为近似(未做栏检测);跨页图、复杂子图依赖 `needs_review` 抽检(§3.2 已声明需额外校验)。
-- 扫描页保存整页图像并标记待校验;未内置 OCR,可先用 K3 看图兜底。
+- 扫描页保存整页图像并标记待校验;在网页“设置”中启用 OCR 后,会逐页调用所选本地或第三方服务并把识别文本加入检索索引。
 - 鉴权为开发级 Bearer 令牌;生产应接入真实身份系统(权限边界已实现多租户隔离)。
 - worker 为单进程内线程;多副本部署需换真实队列。
 - **Kimi K3 注意点**:思考常开;其官方要求多轮/工具循环回传完整 assistant 消息(含 reasoning content)。若所用 langchain-openai 版本丢弃该字段,需在 `llm.py` 集中更换适配器。
