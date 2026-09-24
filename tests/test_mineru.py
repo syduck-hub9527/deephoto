@@ -4,6 +4,7 @@ import unittest
 import zipfile
 
 import _bootstrap  # noqa: F401
+
 from deephoto.parsing import pdf_backend
 from deephoto.parsing.mineru import (
     MinerUClient,
@@ -43,11 +44,14 @@ class ContentListPagingTest(unittest.TestCase):
         self.assertEqual(_content_list_to_pages(items), ["", "", "第三页"])
 
     def test_zip_prefers_content_list_over_full_md(self):
-        zb = _make_zip({
-            "x_content_list.json": json.dumps(
-                [{"type": "text", "text": "p0", "page_idx": 0}]),
-            "full.md": "不应该用这个",
-        })
+        zb = _make_zip(
+            {
+                "x_content_list.json": json.dumps(
+                    [{"type": "text", "text": "p0", "page_idx": 0}]
+                ),
+                "full.md": "不应该用这个",
+            }
+        )
         self.assertEqual(_zip_to_page_texts(zb), ["p0"])
 
     def test_zip_falls_back_to_full_md(self):
@@ -55,9 +59,15 @@ class ContentListPagingTest(unittest.TestCase):
         self.assertEqual(_zip_to_page_texts(zb), ["整篇文本"])
 
     def test_preserves_trailing_blank_pages_for_original_page_numbers(self):
-        zb = _make_zip({"x_content_list.json": json.dumps([
-            {"type": "text", "text": "第一页", "page_idx": 0},
-        ])})
+        zb = _make_zip(
+            {
+                "x_content_list.json": json.dumps(
+                    [
+                        {"type": "text", "text": "第一页", "page_idx": 0},
+                    ]
+                )
+            }
+        )
         self.assertEqual(_zip_to_page_texts(zb, expected_pages=3), ["第一页", "", ""])
 
     def test_rejects_multi_page_markdown_without_page_markers(self):
@@ -75,23 +85,39 @@ class MinerUClientFlowTest(unittest.TestCase):
     """用注入的 opener 走完 申请->轮询->下载 流程(上传走 http.client,单独 mock)。"""
 
     def test_parse_pdf_end_to_end(self):
-        content = _make_zip({
-            "x_content_list.json": json.dumps([
-                {"type": "text", "text": "第一页", "page_idx": 0},
-                {"type": "text", "text": "第二页", "page_idx": 1},
-            ]),
-        })
+        content = _make_zip(
+            {
+                "x_content_list.json": json.dumps(
+                    [
+                        {"type": "text", "text": "第一页", "page_idx": 0},
+                        {"type": "text", "text": "第二页", "page_idx": 1},
+                    ]
+                ),
+            }
+        )
         calls = {"n": 0}
 
         def opener(request, timeout):
             calls["n"] += 1
             url = request.full_url
             if "file-urls/batch" in url:
-                return _Response({"success": True, "data": {
-                    "batch_id": "b1", "file_urls": ["https://oss/upload"]}})
+                return _Response(
+                    {
+                        "success": True,
+                        "data": {"batch_id": "b1", "file_urls": ["https://oss/upload"]},
+                    }
+                )
             if "extract-results" in url:
-                return _Response({"success": True, "data": {
-                    "extract_result": [{"state": "done", "full_zip_url": "https://oss/zip"}]}})
+                return _Response(
+                    {
+                        "success": True,
+                        "data": {
+                            "extract_result": [
+                                {"state": "done", "full_zip_url": "https://oss/zip"}
+                            ]
+                        },
+                    }
+                )
             if url == "https://oss/zip":
                 return _Response(content, is_json=False)
             raise AssertionError("unexpected url " + url)
@@ -100,6 +126,7 @@ class MinerUClientFlowTest(unittest.TestCase):
         # 绕过真实 HTTP 上传与拆分(单块直通)
         client._upload_pdf = lambda url, data: None
         import deephoto.parsing.mineru as m
+
         orig = m.pdf_backend.chunk_pdf
         m.pdf_backend.chunk_pdf = lambda b, n, *args, **kwargs: [b]
         orig_count = m.pdf_backend.page_count
@@ -115,14 +142,25 @@ class MinerUClientFlowTest(unittest.TestCase):
         def opener(request, timeout):
             url = request.full_url
             if "file-urls/batch" in url:
-                return _Response({"success": True, "data": {
-                    "batch_id": "b1", "file_urls": ["https://oss/upload"]}})
-            return _Response({"success": True, "data": {
-                "extract_result": [{"state": "failed", "err_msg": "bad pdf"}]}})
+                return _Response(
+                    {
+                        "success": True,
+                        "data": {"batch_id": "b1", "file_urls": ["https://oss/upload"]},
+                    }
+                )
+            return _Response(
+                {
+                    "success": True,
+                    "data": {
+                        "extract_result": [{"state": "failed", "err_msg": "bad pdf"}]
+                    },
+                }
+            )
 
         client = MinerUClient(api_key="tok", opener=opener, sleep=lambda s: None)
         client._upload_pdf = lambda url, data: None
         import deephoto.parsing.mineru as m
+
         orig = m.pdf_backend.chunk_pdf
         m.pdf_backend.chunk_pdf = lambda b, n, *args, **kwargs: [b]
         orig_count = m.pdf_backend.page_count
@@ -161,6 +199,7 @@ class ChunkedParseTest(unittest.TestCase):
         client, seen = self._client_with_chunks(chunks, texts)
 
         import deephoto.parsing.mineru as m
+
         orig = m.pdf_backend.chunk_pdf
         m.pdf_backend.chunk_pdf = lambda b, n, *args, **kwargs: chunks
         try:
@@ -177,6 +216,7 @@ class ChunkedParseTest(unittest.TestCase):
         client, seen = self._client_with_chunks(chunks, [["p1"]])
 
         import deephoto.parsing.mineru as m
+
         orig = m.pdf_backend.chunk_pdf
         m.pdf_backend.chunk_pdf = lambda b, n, *args, **kwargs: chunks
         try:
@@ -186,8 +226,10 @@ class ChunkedParseTest(unittest.TestCase):
         self.assertEqual(result.page_texts, ["p1"])
         self.assertEqual(seen, ["doc.pdf"])
 
+
 def _NR(page_texts):
     from deephoto.parsing.mineru import MinerUResult
+
     return MinerUResult(page_texts=list(page_texts), raw={})
 
 
@@ -195,6 +237,7 @@ def _NR(page_texts):
 class ChunkPdfTest(unittest.TestCase):
     def _make_pdf(self, n_pages):
         import pymupdf
+
         d = pymupdf.open()
         for _ in range(n_pages):
             d.new_page(width=612, height=792)
@@ -223,6 +266,7 @@ class ChunkPdfTest(unittest.TestCase):
 
     def test_client_splits_by_bytes_and_restores_page_order(self):
         import pymupdf
+
         source = pymupdf.open()
         for i in range(5):
             source.new_page().insert_text((72, 72), f"Page {i}")
@@ -246,9 +290,10 @@ class ChunkPdfTest(unittest.TestCase):
         result = client.parse_pdf(raw, "source.pdf")
         self.assertEqual(result.page_texts, [f"Page {i}" for i in range(5)])
         self.assertGreater(len(seen), 1)
-        self.assertEqual([name for name, _ in seen], [
-            f"source_part{i}.pdf" for i in range(1, len(seen) + 1)
-        ])
+        self.assertEqual(
+            [name for name, _ in seen],
+            [f"source_part{i}.pdf" for i in range(1, len(seen) + 1)],
+        )
 
     def test_oversize_single_page_fails_without_upload(self):
         raw = self._make_pdf(1)
@@ -262,6 +307,7 @@ class ChunkPdfTest(unittest.TestCase):
 
     def _count(self, raw):
         import pymupdf
+
         d = pymupdf.open(stream=raw, filetype="pdf")
         n = d.page_count
         d.close()
