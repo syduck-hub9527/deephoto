@@ -20,7 +20,7 @@ from .keys import stable_item_id
 
 logger = logging.getLogger(__name__)
 
-EMBED_BATCH = 32
+EMBED_BATCH = 20
 _IMAGE_TEXT_LIMIT = 600
 
 
