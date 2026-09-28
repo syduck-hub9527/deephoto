@@ -14,15 +14,18 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import re
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from . import pdf_backend
+from .content_list import ContentElement, parse_content_list
 
 MINERU_DEFAULT_BASE_URL = "https://mineru.net"
 # 默认轮询:最多等待约 5 分钟
@@ -44,6 +47,8 @@ class MinerUResult:
     """按页 markdown(索引即页码-1)。"""
     page_texts: list[str]
     raw: dict[str, Any]
+    # 带类型的内容元素(标题/正文/图/表/图表,含原图字节);无 content_list 时为空,入库退回 page_texts
+    elements: list[ContentElement] = field(default_factory=list)
 
 
 class MinerUClient:
@@ -53,7 +58,8 @@ class MinerUClient:
                  max_pages_per_chunk: int = DEFAULT_MAX_PAGES_PER_CHUNK,
                  max_bytes_per_chunk: int = DEFAULT_MAX_BYTES,
                  opener: Callable[..., Any] | None = None,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 dump_dir: str | Path | None = None):
         if not api_key or not api_key.strip():
             raise MinerUError("MineU 需要 API Token")
         self.api_key = api_key.strip()
@@ -66,6 +72,7 @@ class MinerUClient:
         self.max_bytes_per_chunk = min(max_bytes_per_chunk, DEFAULT_MAX_BYTES)
         self._opener = opener or urlopen
         self._sleep = sleep
+        self.dump_dir = Path(dump_dir) if dump_dir else None
 
     # ---- 对外 ----
 
@@ -82,14 +89,17 @@ class MinerUClient:
             return self._parse_chunk(chunks[0], filename)
         # 多块:逐块解析,按页序拼接(页与页的相对顺序保持一致)
         page_texts: list[str] = []
+        elements: list[ContentElement] = []
         raws: list[dict[str, Any]] = []
         stem, dot, suffix = filename.rpartition(".")
         for index, chunk in enumerate(chunks):
             chunk_name = f"{stem}_part{index + 1}{dot}{suffix}" if dot else f"{filename}_part{index + 1}"
             result = self._parse_chunk(chunk, chunk_name)
+            offset = len(page_texts)          # 每块的 page_idx 都从 0 起,合并时按已有页数平移
+            elements.extend(replace(el, page_idx=el.page_idx + offset) for el in result.elements)
             page_texts.extend(result.page_texts)
             raws.append(result.raw)
-        return MinerUResult(page_texts=page_texts, raw={"chunks": raws})
+        return MinerUResult(page_texts=page_texts, raw={"chunks": raws}, elements=elements)
 
     # ---- 内部:各步骤 ----
 
@@ -99,7 +109,20 @@ class MinerUClient:
         self._upload_pdf(upload_url, pdf_bytes)
         extract = self._poll_result(batch_id)
         zip_bytes = self._download(extract["full_zip_url"])
-        return MinerUResult(page_texts=_zip_to_page_texts(zip_bytes, expected_pages), raw=extract)
+        self._dump(zip_bytes, filename)
+        page_texts, elements = _zip_extract(zip_bytes, expected_pages)
+        return MinerUResult(page_texts=page_texts, raw=extract, elements=elements)
+
+    def _dump(self, zip_bytes: bytes, filename: str) -> None:
+        """调试:配置 DEEPHOTO_MINERU_DUMP_DIR 后保存云端返回的原始 ZIP,用于核对真实字段格式。"""
+        if self.dump_dir is None:
+            return
+        try:
+            self.dump_dir.mkdir(parents=True, exist_ok=True)
+            safe = re.sub(r"[^\w.-]+", "_", filename)
+            (self.dump_dir / f"{int(time.time())}_{safe}.zip").write_bytes(zip_bytes)
+        except OSError:
+            pass   # 调试功能,落盘失败不影响解析
 
     def _request_upload_url(self, filename: str) -> tuple[str, str]:
         payload = {
@@ -190,7 +213,15 @@ class MinerUClient:
 
 
 def _zip_to_page_texts(zip_bytes: bytes, expected_pages: int | None = None) -> list[str]:
-    """从结果 ZIP 提取按页文本。
+    """从结果 ZIP 提取按页文本(兼容入口)。"""
+    return _zip_extract(zip_bytes, expected_pages)[0]
+
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _zip_extract(zip_bytes: bytes, expected_pages: int | None = None) -> tuple[list[str], list[ContentElement]]:
+    """从结果 ZIP 提取 (按页文本, 带类型的内容元素)。
 
     优先 content_list.json(带 page_idx,是真正的按页结构);
     没有时使用带分页符的 full.md;多页结果缺少页码信息时直接报错。
@@ -207,7 +238,10 @@ def _zip_to_page_texts(zip_bytes: bytes, expected_pages: int | None = None) -> l
             items = json.loads(archive.read(content_name).decode("utf-8", errors="replace"))
         except json.JSONDecodeError as exc:
             raise MinerUError("MineU content_list.json 不是有效 JSON") from exc
-        return _content_list_to_pages(items, expected_pages)
+        page_texts = _content_list_to_pages(items, expected_pages)
+        images = {n: archive.read(n) for n in names
+                  if n.lower().endswith(_IMAGE_EXTS) and not n.endswith("/")}
+        return page_texts, parse_content_list(items, images)
 
     md_name = next((n for n in names if n.endswith("full.md")), None) or \
         next((n for n in names if n.endswith(".md")), None)
@@ -220,10 +254,10 @@ def _zip_to_page_texts(zip_bytes: bytes, expected_pages: int | None = None) -> l
             pages.pop()
         if expected_pages is not None and len(pages) != expected_pages:
             raise MinerUError("MinerU 结果页数与上传的 PDF 不一致")
-        return pages
+        return pages, []
     if expected_pages is not None and expected_pages != 1:
         raise MinerUError("MinerU 多页结果缺少按页结构,无法保证原 PDF 页码准确")
-    return [text.strip()] if text.strip() or expected_pages == 1 else []
+    return ([text.strip()] if text.strip() or expected_pages == 1 else []), []
 
 
 def _content_list_to_pages(items: list[dict], expected_pages: int | None = None) -> list[str]:

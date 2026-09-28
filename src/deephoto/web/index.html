@@ -364,12 +364,18 @@ function renderText(m) {
   const citeMap = {};
   (m.citations || []).forEach(c => { citeMap[c.chunk_id] = "出处 p." + c.page; });
   const imgMap = {};
-  (m.images || []).forEach(im => { imgMap[im.image_occurrence_id] = (im.figure_number ? "图 " + im.figure_number : "图片") + " · p." + im.page; });
+  (m.images || []).forEach(im => { imgMap[im.image_occurrence_id] = figLabel(im.figure_number) + " · p." + im.page; });
   html = html.replace(/\[image:([A-Za-z0-9_]+)\]/g, (_, id) =>
     imgMap[id] ? `<span class="chip fig" style="margin:0 2px">🖼 ${esc(imgMap[id])}</span>` : "");
   html = html.replace(/\[chunk:([A-Za-z0-9_]+)\]/g, (_, id) =>
     citeMap[id] ? `<span class="chip" style="margin:0 2px">📄 ${esc(citeMap[id])}</span>` : "");
   return html;
+}
+
+// 图号带“表”前缀时是表格编号(如 "表1.1"),否则是图号(如 "1.1")
+function figLabel(n) {
+  if (!n) return "图片";
+  return n.startsWith("表") ? "表 " + n.slice(1) : "图 " + n;
 }
 
 function renderChips(m) {
@@ -385,7 +391,7 @@ function renderImages(m) {
       <img src="${im.image_url}" alt="${esc(im.caption || "文档配图")}" loading="lazy"
            onclick="zoom('${im.image_url}')">
       <figcaption>
-        <b>${im.figure_number ? "图 " + esc(im.figure_number) : "图片"}</b> · 第 ${im.page} 页
+        <b>${esc(figLabel(im.figure_number))}</b> · 第 ${im.page} 页
         ${im.caption ? "<br>" + esc(im.caption) : ""}
         <a href="${im.source_page_url}" target="_blank">查看 PDF 第 ${im.page} 页 ↗</a>
       </figcaption>

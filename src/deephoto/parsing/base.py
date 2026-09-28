@@ -15,6 +15,7 @@ BBox = tuple[float, float, float, float]
 KIND_EMBEDDED_BITMAP = "embedded_bitmap"   # 嵌入位图,可直接提取原图
 KIND_VECTOR_RENDER = "vector_render"       # 矢量/混合图,需渲染页面后裁剪
 KIND_PAGE_FALLBACK = "page_fallback"       # 边界不确定,整页回退(needs_review)
+KIND_PARSER_IMAGE = "parser_image"         # 解析器(MinerU)已裁好的图/表/图表,字节直接来自结果 ZIP
 
 
 @dataclass

@@ -42,6 +42,8 @@ class Settings:
     # MinerU 云端解析:唯一的 PDF 解析器,写死不可选;Token 仅由服务端环境变量提供
     mineru_api_key: str | None = None
     mineru_base_url: str | None = None
+    # 调试:设置后把 MinerU 返回的原始结果 ZIP 存到该目录,用于核对真实字段格式
+    mineru_dump_dir: str | None = None
 
     @property
     def embeddings_enabled(self) -> bool:
@@ -69,9 +71,10 @@ def load_settings() -> Settings:
         embedding_model=_get("EMBEDDING_MODEL"),
         data_dir=Path(_get("DATA_DIR", "./data")).resolve(),
         max_upload_mb=int(_get("MAX_UPLOAD_MB", "100")),
-        ingestion_version=_get("INGESTION_VERSION", "v1"),
+        ingestion_version=_get("INGESTION_VERSION", "v2"),
         mineru_api_key=_get("MINERU_API_KEY"),
         mineru_base_url=_get("MINERU_BASE_URL"),
+        mineru_dump_dir=_get("MINERU_DUMP_DIR"),
     )
 
 

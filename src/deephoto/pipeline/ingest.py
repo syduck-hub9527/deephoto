@@ -13,12 +13,12 @@ from .. import repo
 from ..config import Settings
 from ..db import connect
 from ..parsing.base import (
-    KIND_EMBEDDED_BITMAP,
     KIND_PAGE_FALLBACK,
     LayoutParser,
     ParsedDocument,
     ParsedParagraph,
 )
+from ..parsing.content_list import build_document
 from ..parsing.mineru import MINERU_DEFAULT_BASE_URL, MinerUClient, MinerUError
 from ..storage import ObjectStore
 from .chunking import chunk_paragraphs
@@ -35,7 +35,7 @@ _PAGE_H = 792.0
 
 
 def _pages_from_texts(page_texts: list[str]) -> ParsedDocument:
-    """把 MineU 按页文本构造成 ParsedDocument(整页作为段落范围,无图形)。"""
+    """兜底:结果里没有 content_list 时,把 MineU 按页文本构造成 ParsedDocument(整页一段,无图形)。"""
     from ..parsing.base import ParsedPage
 
     pages: list[ParsedPage] = []
@@ -128,7 +128,11 @@ class IngestService:
         result = MinerUClient(
             api_key=self.settings.mineru_api_key,
             base_url=self.settings.mineru_base_url or MINERU_DEFAULT_BASE_URL,
+            dump_dir=self.settings.mineru_dump_dir,
         ).parse_pdf(pdf_bytes, doc.get("filename") or "document.pdf")
+        if result.elements:
+            return build_document(result.elements, page_count=len(result.page_texts))
+        logger.warning("MinerU 结果不含 content_list,退回按页纯文本(无图/表/标题)")
         return _pages_from_texts(result.page_texts)
 
     def _persist_figures(self, conn, doc: dict, parsed: ParsedDocument, pdf_bytes: bytes) -> list[dict]:
@@ -139,7 +143,7 @@ class IngestService:
         for page in parsed.pages:
             captions_by_id = {c.id: c for c in page.captions}
             for figure in page.figures:
-                if figure.kind == KIND_EMBEDDED_BITMAP and figure.image_bytes:
+                if figure.image_bytes:            # 嵌入位图,或解析器(MinerU)已裁好的图
                     image_bytes = figure.image_bytes
                 elif figure.kind == KIND_PAGE_FALLBACK:
                     image_bytes = self.parser.render_page(pdf_bytes, page.page_number)

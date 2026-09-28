@@ -14,6 +14,7 @@ from sqlite3 import Connection
 import numpy as np
 
 from .. import repo
+from ..parsing.captions import display_label
 from .bm25 import BM25Index, normalize
 from .keys import stable_item_id
 
@@ -168,7 +169,7 @@ class IndexService:
 def _image_searchable_text(occ: dict) -> str:
     parts: list[str] = []
     if occ.get("figure_number"):
-        parts.append(f"图 {occ['figure_number']}")
+        parts.append(display_label(occ["figure_number"]))
     if occ.get("caption"):
         parts.append(occ["caption"])
     if occ.get("visible_labels"):

@@ -13,7 +13,7 @@ import logging
 from sqlite3 import Connection
 
 from .. import repo
-from ..parsing.captions import find_referenced_figures
+from ..parsing.captions import find_figure_mentions
 from ..pipeline.linking import CONF_DISPLAY_THRESHOLD
 from ..security import AuthContext
 from ..storage import ObjectStore
@@ -83,7 +83,7 @@ class KnowledgeService:
                     occs[occ_id] = occ
 
         # 显式图号兜底:“图 3”类问题直接锚定
-        for number in find_referenced_figures(query):
+        for number in find_figure_mentions(query):
             for doc_id in doc_ids:
                 for occ in repo.occurrences_for_document(conn, doc_id):
                     if occ["figure_number"] == number and occ["id"] not in occs:

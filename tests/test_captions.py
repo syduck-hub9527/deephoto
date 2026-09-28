@@ -29,7 +29,7 @@ class CaptionMatchTest(unittest.TestCase):
 
     def test_table(self):
         num, _ = match_caption("Table 2 - Results")
-        self.assertEqual(num, "2")
+        self.assertEqual(num, "表2")   # 表格编号带“表”前缀,与图号分属不同编号空间
 
     def test_not_caption(self):
         num, text = match_caption("本文提出一种新方法。")
