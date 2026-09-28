@@ -289,8 +289,15 @@ const detailLoader = SEG.createProgDetailLoader({
     return renderProgDetail((await r.json()).progress);
   },
   onRender: (id, html) => { const panel = $("prog-" + id); if (panel) panel.innerHTML = html; },
-  onError: (id) => { const panel = $("prog-" + id);
-    if (panel && !detailLoader.cachedHtml(id)) panel.innerHTML = '<div class="doc-err">详情加载失败</div>'; },
+  onError: (id, err) => {
+    const panel = $("prog-" + id);
+    if (!panel) return;
+    const cached = detailLoader.cachedHtml(id);
+    // 有缓存时保留上次内容并提示刷新失败;无缓存才显示加载失败
+    panel.innerHTML = cached
+      ? '<div class="doc-err">详情刷新失败,显示上次内容</div>' + cached
+      : '<div class="doc-err">详情加载失败</div>';
+  },
 });
 
 function detailInnerHtml(id) {

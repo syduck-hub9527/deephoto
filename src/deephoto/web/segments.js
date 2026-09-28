@@ -342,7 +342,7 @@
         cache.set(id, html);
         if (expandedId === id) opts.onRender(id, html);
       } catch (e) {
-        if (expandedId === id && opts.onError) opts.onError(e);
+        if (expandedId === id && opts.onError) opts.onError(id, e);   // 文档 ID 与异常一起回传
       } finally {
         inflight.delete(id);
       }

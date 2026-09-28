@@ -317,6 +317,29 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
       resolveSlow("<table>迟到的doc1</table>");
       await new Promise(r => setImmediate(r));
       check("切换后旧请求不渲染", renders.length === 1 && loader.cachedHtml("doc1").includes("迟到"));
+
+      // 失败路径:onError 收到 (文档 ID, 异常);缓存不被失败清除
+      const errors = [];
+      const failing = SEG.createProgDetailLoader({
+        fetchDetail: () => Promise.reject(new Error("HTTP 500")),
+        onRender: (id, html) => renders.push([id, html]),
+        onError: (id, err) => errors.push([id, err && err.message]),
+      });
+      failing.expanded("docX");
+      await failing.refresh("docX");
+      check("失败:onError 收到文档 ID 与异常",
+        errors.length === 1 && errors[0][0] === "docX" && errors[0][1] === "HTTP 500");
+      // 先成功一次拿到缓存,再失败:缓存保留(页面可显示上次内容)
+      let flip = false;
+      const flaky = SEG.createProgDetailLoader({
+        fetchDetail: () => flip ? Promise.reject(new Error("boom")) : Promise.resolve("<table>旧内容</table>"),
+        onRender: () => {}, onError: () => {},
+      });
+      flaky.expanded("docY");
+      await flaky.refresh("docY");
+      flip = true;
+      await flaky.refresh("docY");
+      check("失败后缓存保留", flaky.cachedHtml("docY").includes("旧内容"));
     }
 
     console.log(failures ? `\n${failures} 个失败` : "\n全部通过");
