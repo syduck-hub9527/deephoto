@@ -164,16 +164,20 @@ class KnowledgeService:
 
     # ---- 回答后端的图片组装 ----
 
-    def build_image_entries(self, conn: Connection, ctx: AuthContext, occ_ids: list[str]) -> list[dict]:
+    def build_image_entries(self, conn: Connection, ctx: AuthContext, occ_ids: list[str],
+                            dedupe_assets: bool = True) -> list[dict]:
+        """构造图片条目。dedupe_assets=True(默认)按图片资产去重,用于自动补图;
+        正文显式引用路径传 False,让每个有效锚点都保留自己的图号与出处页。"""
         entries: list[dict] = []
         seen_assets: set[str] = set()
         for occ_id in occ_ids:
             occ = repo.get_occurrence(conn, occ_id)
             if occ is None or occ["tenant_id"] != ctx.tenant_id:
                 continue    # 丢弃无效/越权引用(§6)
-            if occ["image_asset_id"] in seen_assets:
-                continue    # 同图多处出现时按命中上下文取第一个正确出处
-            seen_assets.add(occ["image_asset_id"])
+            if dedupe_assets:
+                if occ["image_asset_id"] in seen_assets:
+                    continue    # 同图多处出现时按命中上下文取第一个正确出处
+                seen_assets.add(occ["image_asset_id"])
             doc_id = occ["document_id"]
             entries.append({
                 "image_occurrence_id": occ_id,

@@ -69,4 +69,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def index():
         return FileResponse(_WEB_DIR / "index.html")
 
+    @app.get("/segments.js", include_in_schema=False)
+    def segments_js():
+        return FileResponse(_WEB_DIR / "segments.js", media_type="text/javascript")
+
     return app

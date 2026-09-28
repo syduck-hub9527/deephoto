@@ -39,7 +39,13 @@ SYSTEM_PROMPT = (
     "4. 引用证据必须使用固定格式:正文 [chunk:chunk_id],图片 [image:image_occurrence_id];"
     "只能引用工具返回过的 ID,不得编造页码、图号或图片。\n"
     "5. 回答中注明出处页码(证据里的 page_start / page 字段)。\n"
-    "6. 检索不到可靠依据时明确说明不知道,不要编造内容。"
+    "6. 检索不到可靠依据时明确说明不知道,不要编造内容。\n"
+    "7. 需要展示证据图片时,在解释到该图的位置插入 [image:image_occurrence_id]:标记独占一行、"
+    "前后各空一行,它将被界面替换为 PDF 原图;多张图分别放在各自相关的段落之间,"
+    "不要统一集中到答案末尾;同一图片通常只插入一次,后续用图号提及即可。"
+    "只能使用工具返回过的 image_occurrence_id;不要输出图片 URL、HTML img 标签或 Markdown 图片链接;"
+    "找不到对应图片时明确说明,不要编造标记。不要强制每个回答都插图,"
+    "仅当用户要求展示或图片有助于解释且有可靠证据时插入。"
 )
 
 _CITE_CHUNK_RE = re.compile(r"\[chunk:([A-Za-z0-9_]+)\]")
@@ -199,11 +205,14 @@ class QAService:
                 citations.append({"document_id": chunk["document_id"], "chunk_id": chunk["id"],
                                   "page": chunk["page_start"]})
 
-        # 用户明确要求看图而模型未引用时,附带本轮证据中的图片候选
-        if not cited_images and asks_for_images(question):
-            cited_images = list(tracker["images"])[:3]
+        # 用户明确要求看图而模型未引用时,附带本轮证据中的图片候选(稳定排序,保持资产去重)
+        fallback = not cited_images and asks_for_images(question)
+        if fallback:
+            cited_images = sorted(tracker["images"])[:3]
 
-        images = self.knowledge.build_image_entries(conn, ctx, cited_images)
+        # 正文显式引用:按 occurrence 保留各自的图号与出处页,不做资产去重,
+        # 否则同一张图的两个合法锚点会丢掉第二个的元数据(内嵌位置即失去可信条目)
+        images = self.knowledge.build_image_entries(conn, ctx, cited_images, dedupe_assets=fallback)
         return {"answer": answer_text, "citations": citations, "images": images}
 
 

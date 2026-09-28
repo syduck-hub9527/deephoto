@@ -134,6 +134,16 @@
   #lightbox[hidden] { display: none !important; }   /* 显式 display:flex 会顶掉 hidden 属性 */
   #lightbox img { max-width: 94vw; max-height: 94vh; }
 
+  /* ---- 正文内嵌图片 ---- */
+  .img-card.inline { margin: 12px auto; max-width: 560px; }
+  .img-card.placeholder { padding: 18px 14px; text-align: center; color: var(--muted); font-size: 12.5px; }
+  .img-card .img-err { padding: 14px; text-align: center; color: var(--muted); font-size: 12.5px; }
+  .img-missing { margin: 8px 0; color: var(--muted); font-size: 12.5px; }
+  .img-ref { margin: 6px 0; }
+  .supplement { margin-top: 14px; border-top: 1px dashed var(--border); padding-top: 10px; }
+  .supplement .sup-title { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .msg .warn { margin-top: 8px; font-size: 12.5px; color: var(--accent); }
+
   @media (max-width: 760px) {
     #sidebar { position: fixed; z-index: 40; left: 0; top: 0; transform: translateX(-100%);
                transition: transform .2s; }
@@ -173,15 +183,18 @@
 
 <div id="lightbox" hidden onclick="this.hidden = true"><img id="lightboxImg"></div>
 
+<script src="/segments.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
+const SEG = DeepphotoSegments;
 const STATUS_LABEL = { queued: "排队中", parsing: "解析中", describing: "描述图片", indexing: "索引中", ready: "就绪", failed: "失败" };
-let messages = [];      // {role, content, citations?, images?}
+let messages = [];      // {role, content, citations?, images?, validated?, warning?, broken?}
 let sending = false;
 
 // ---- 初始化 ----
 initTheme();
 messages = JSON.parse(localStorage.getItem("deephoto_chat") || "[]");
+messages.forEach(m => { m.streaming = false; });   // 恢复的记录一律视为已完成,不继续流式态
 renderThread();
 loadDocs();
 
@@ -286,11 +299,18 @@ async function send() {
     if (!r.ok || !r.body) {
       const j = await r.json().catch(() => ({}));
       msg.content = "⚠️ 请求失败:" + (j.detail || r.status);
+      msg.broken = true;
     } else {
       await consumeSSE(r.body, msg);
+      // 流结束却没收到 done(网络中断):保留已生成文本,标记未完成校验
+      if (!msg.validated && !msg.broken) {
+        msg.broken = true;
+        msg.warning = msg.warning || "回答未完成(连接中断),图片未通过校验";
+      }
     }
   } catch (e) {
-    msg.content = "⚠️ 网络错误:" + e.message;
+    msg.content += (msg.content ? "\n\n" : "") + "⚠️ 网络错误:" + e.message;
+    msg.broken = true;
   }
   msg.streaming = false;
   localStorage.setItem("deephoto_chat", JSON.stringify(messages.slice(-60)));
@@ -318,10 +338,14 @@ async function consumeSSE(body, msg) {
         msg.content = ev.answer || msg.content;
         msg.citations = ev.citations || [];
         msg.images = ev.images || [];
+        msg.validated = true;      // 独立的校验状态:收到 done 立即切换最终图文渲染
       }
-      else if (ev.type === "warning") msg.content += "\n\n⚠️ " + ev.detail;
+      else if (ev.type === "warning") msg.warning = ev.detail;   // 独立字段,done 覆盖正文时不丢
       // 出错时保留已流出的部分内容,不整体替换
-      else if (ev.type === "error") msg.content += (msg.content ? "\n\n" : "") + "⚠️ " + ev.detail;
+      else if (ev.type === "error") {
+        msg.broken = true;
+        msg.content += (msg.content ? "\n\n" : "") + "⚠️ " + ev.detail;
+      }
       renderThread();   // token 级刷新;量不大,直接重渲染
     }
   }
@@ -333,9 +357,12 @@ function renderThread() {
     box.innerHTML = `<div class="empty"><div class="logo">📚</div>
       <h2>向你的 PDF 提问</h2>
       <p>先在左侧上传图文 PDF,等待状态变为“就绪”<br>
-      回答会附上出处页码,命中配图时返回完整原图</p></div>`;
+      回答会附上出处页码,命中配图时在对应段落内嵌完整原图</p></div>`;
     return;
   }
+  // 仅当用户原本接近底部时才跟随滚动,图片加载/重渲染不把阅读上文的人拉走
+  const thread = $("thread");
+  const nearBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
   box.innerHTML = messages.map(m => {
     if (m.role === "user")
       return `<div class="msg user"><div class="avatar">我</div>
@@ -345,37 +372,16 @@ function renderThread() {
          <div class="think-body">${esc(m.thinking)}</div></details>` : "";
     const cursor = m.streaming && !m.content && !m.thinking
       ? `<div class="typing"><i></i><i></i><i></i></div>` : "";
+    const body = SEG.renderAnswerBody(m);   // 正文按标记位置内嵌图片;返回未使用图片给补充区
+    const warn = m.warning ? `<div class="warn">⚠️ ${esc(m.warning)}</div>` : "";
     return `<div class="msg assistant"><div class="avatar">D</div>
       <div class="body">${thinking}
-        <div class="text">${renderText(m)}${m.streaming && m.content ? '<span class="cursor"></span>' : ''}${cursor}</div>
-        ${m.streaming ? "" : renderChips(m) + renderImages(m)}
+        ${body.html}${m.streaming && m.content ? '<span class="cursor"></span>' : ''}${cursor}
+        ${warn}
+        ${m.streaming ? "" : renderChips(m) + renderSupplement(body.supplement)}
       </div></div>`;
   }).join("");
-  requestAnimationFrame(() => { $("thread").scrollTop = $("thread").scrollHeight; });
-}
-
-// 渲染正文:转义 -> 极简 markdown -> 把 [chunk:..]/[image:..] 标记换成可读徽标
-// 流式期间保持原文,结束后(done 事件带校验结果)再替换为徽标
-function renderText(m) {
-  let html = esc(m.content)
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>");
-  if (m.streaming) return html;
-  const citeMap = {};
-  (m.citations || []).forEach(c => { citeMap[c.chunk_id] = "出处 p." + c.page; });
-  const imgMap = {};
-  (m.images || []).forEach(im => { imgMap[im.image_occurrence_id] = figLabel(im.figure_number) + " · p." + im.page; });
-  html = html.replace(/\[image:([A-Za-z0-9_]+)\]/g, (_, id) =>
-    imgMap[id] ? `<span class="chip fig" style="margin:0 2px">🖼 ${esc(imgMap[id])}</span>` : "");
-  html = html.replace(/\[chunk:([A-Za-z0-9_]+)\]/g, (_, id) =>
-    citeMap[id] ? `<span class="chip" style="margin:0 2px">📄 ${esc(citeMap[id])}</span>` : "");
-  return html;
-}
-
-// 图号带“表”前缀时是表格编号(如 "表1.1"),否则是图号(如 "1.1")
-function figLabel(n) {
-  if (!n) return "图片";
-  return n.startsWith("表") ? "表 " + n.slice(1) : "图 " + n;
+  if (nearBottom) requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; });
 }
 
 function renderChips(m) {
@@ -384,19 +390,27 @@ function renderChips(m) {
   return `<div class="chips">${cites.join("")}</div>`;
 }
 
-function renderImages(m) {
-  if (!m.images || !m.images.length) return "";
-  return `<div class="img-grid">` + m.images.map(im => `
-    <figure class="img-card">
-      <img src="${im.image_url}" alt="${esc(im.caption || "文档配图")}" loading="lazy"
-           onclick="zoom('${im.image_url}')">
-      <figcaption>
-        <b>${esc(figLabel(im.figure_number))}</b> · 第 ${im.page} 页
-        ${im.caption ? "<br>" + esc(im.caption) : ""}
-        <a href="${im.source_page_url}" target="_blank">查看 PDF 第 ${im.page} 页 ↗</a>
-      </figcaption>
-    </figure>`).join("") + `</div>`;
+// 正文锚点未使用到的已校验图片(例如模型没插图但后端补了候选):末尾"补充图片"区
+function renderSupplement(supplement) {
+  if (!supplement || !supplement.length) return "";
+  return `<div class="supplement"><div class="sup-title">补充图片</div><div class="img-grid">` +
+    supplement.map(im => SEG.imageCardHTML(im)).join("") + `</div></div>`;
 }
+
+// 图片放大与加载失败都走事件委托/捕获,不把 URL 放进内联 JS
+$("threadInner").addEventListener("click", e => {
+  const img = e.target.closest("img[data-zoomable]");
+  if (img) zoom(img.getAttribute("src"));
+});
+$("threadInner").addEventListener("error", e => {
+  const img = e.target;
+  if (!(img instanceof HTMLImageElement)) return;
+  const card = img.closest(".img-card");
+  if (!card) return;
+  const err = card.querySelector(".img-err");
+  if (err) err.hidden = false;
+  img.remove();
+}, true);   // error 不冒泡,必须捕获阶段监听
 
 function zoom(url) { $("lightboxImg").src = url; $("lightbox").hidden = false; }
 
