@@ -193,8 +193,8 @@ let sending = false;
 
 // ---- 初始化 ----
 initTheme();
-messages = JSON.parse(localStorage.getItem("deephoto_chat") || "[]");
-messages.forEach(m => { m.streaming = false; });   // 恢复的记录一律视为已完成,不继续流式态
+messages = SEG.restoreMessages(JSON.parse(localStorage.getItem("deephoto_chat") || "[]"));
+localStorage.setItem("deephoto_chat", JSON.stringify(messages.slice(-60)));   // 持久化补齐的消息 ID
 renderThread();
 loadDocs();
 
@@ -286,7 +286,7 @@ async function send() {
   sending = true; $("sendBtn").disabled = true;
   const history = messages.map(m => ({ role: m.role, content: m.content }));
   messages.push({ role: "user", content: question });
-  const msg = { role: "assistant", content: "", thinking: "", citations: [], images: [], streaming: true };
+  const msg = SEG.createAssistantMessage();
   messages.push(msg);
   $("input").value = ""; autoGrow();
   renderThread();
@@ -298,18 +298,14 @@ async function send() {
     });
     if (!r.ok || !r.body) {
       const j = await r.json().catch(() => ({}));
-      msg.content = "⚠️ 请求失败:" + (j.detail || r.status);
+      msg.error = "请求失败:" + (j.detail || r.status);
       msg.broken = true;
     } else {
       await consumeSSE(r.body, msg);
-      // 流结束却没收到 done(网络中断):保留已生成文本,标记未完成校验
-      if (!msg.validated && !msg.broken) {
-        msg.broken = true;
-        msg.warning = msg.warning || "回答未完成(连接中断),图片未通过校验";
-      }
+      SEG.finishStream(msg);   // EOF:无 done 且无 error 才算传输中断;已有答案不撤销
     }
   } catch (e) {
-    msg.content += (msg.content ? "\n\n" : "") + "⚠️ 网络错误:" + e.message;
+    msg.error = "网络错误:" + e.message;   // 错误独立于正文保存,不拼进 content
     msg.broken = true;
   }
   msg.streaming = false;
@@ -332,20 +328,7 @@ async function consumeSSE(body, msg) {
       const line = raw.split("\n").find(l => l.startsWith("data:"));
       if (!line) continue;
       let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
-      if (ev.type === "token") msg.content += ev.text;
-      else if (ev.type === "thinking") msg.thinking += ev.text;
-      else if (ev.type === "done") {
-        msg.content = ev.answer || msg.content;
-        msg.citations = ev.citations || [];
-        msg.images = ev.images || [];
-        msg.validated = true;      // 独立的校验状态:收到 done 立即切换最终图文渲染
-      }
-      else if (ev.type === "warning") msg.warning = ev.detail;   // 独立字段,done 覆盖正文时不丢
-      // 出错时保留已流出的部分内容,不整体替换
-      else if (ev.type === "error") {
-        msg.broken = true;
-        msg.content += (msg.content ? "\n\n" : "") + "⚠️ " + ev.detail;
-      }
+      SEG.applyStreamEvent(msg, ev);   // token/thinking/done/warning/error 的状态迁移在 segments.js
       renderThread();   // token 级刷新;量不大,直接重渲染
     }
   }
@@ -374,11 +357,12 @@ function renderThread() {
       ? `<div class="typing"><i></i><i></i><i></i></div>` : "";
     const body = SEG.renderAnswerBody(m);   // 正文按标记位置内嵌图片;返回未使用图片给补充区
     const warn = m.warning ? `<div class="warn">⚠️ ${esc(m.warning)}</div>` : "";
+    const err = m.error ? `<div class="warn">⚠️ ${esc(m.error)}</div>` : "";
     return `<div class="msg assistant"><div class="avatar">D</div>
       <div class="body">${thinking}
         ${body.html}${m.streaming && m.content ? '<span class="cursor"></span>' : ''}${cursor}
-        ${warn}
-        ${m.streaming ? "" : renderChips(m) + renderSupplement(body.supplement)}
+        ${warn}${err}
+        ${m.streaming ? "" : renderChips(m) + renderSupplement(m, body.supplement)}
       </div></div>`;
   }).join("");
   if (nearBottom) requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; });
@@ -391,10 +375,11 @@ function renderChips(m) {
 }
 
 // 正文锚点未使用到的已校验图片(例如模型没插图但后端补了候选):末尾"补充图片"区
-function renderSupplement(supplement) {
+// 定位命名与正文插图一致(消息 ID + occurrence ID)
+function renderSupplement(m, supplement) {
   if (!supplement || !supplement.length) return "";
   return `<div class="supplement"><div class="sup-title">补充图片</div><div class="img-grid">` +
-    supplement.map(im => SEG.imageCardHTML(im)).join("") + `</div></div>`;
+    supplement.map(im => SEG.imageCardHTML(im, m.message_id)).join("") + `</div></div>`;
 }
 
 // 图片放大与加载失败都走事件委托/捕获,不把 URL 放进内联 JS
