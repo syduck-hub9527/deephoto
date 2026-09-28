@@ -66,19 +66,42 @@ def describe_image(
         {"type": "image_url", "image_url": {"url": data_url}},
     ])
     response = chat_model.invoke([message])
-    result = parse_description_json(response.content if isinstance(response.content, str) else str(response.content))
-    return result
+    return parse_description_json(_response_text(response.content))
+
+
+def _response_text(content) -> str:
+    """提取响应文本:字符串直接用;内容块列表只取 text 类型,不 str(list) 后当 JSON。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "") for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(content)
 
 
 def parse_description_json(raw: str) -> dict:
-    """宽松解析模型输出:提取第一个 JSON 对象并校验字段。"""
+    """宽松解析模型输出:提取第一个 JSON 对象并校验字段类型。
+
+    空输出、截断、非法 JSON、非对象根值、字段类型不匹配一律 parse_failed,
+    不能当成功(空字符串字段值本身可能是合法的"不清楚",不按内容判)。
+    """
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
-        return _fallback(f"模型未返回 JSON:{raw[:200]}")
+        return _fallback("模型未返回 JSON 对象")
     try:
         data = json.loads(match.group(0))
     except json.JSONDecodeError as exc:
-        return _fallback(f"JSON 解析失败:{exc}")
+        return _fallback(f"JSON 解析失败:{type(exc).__name__}")
+    if not isinstance(data, dict):
+        return _fallback("模型返回的 JSON 不是对象")
+    for key in ("visible_summary", "caption", "context_summary"):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            return _fallback(f"{key} 字段不是字符串")
+    for key in ("visible_labels", "uncertain_details"):
+        if data.get(key) is not None and not isinstance(data[key], list):
+            return _fallback(f"{key} 字段不是列表")
     return {
         "visible_summary": str(data.get("visible_summary") or ""),
         "visible_labels": [str(x) for x in data.get("visible_labels") or []][:20],

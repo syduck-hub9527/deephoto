@@ -15,7 +15,7 @@ from ..agent.qa import QAService
 from ..config import Settings, load_settings
 from ..db import init_db
 from ..indexing.service import IndexService
-from ..llm import build_chat_model, build_embeddings
+from ..llm import build_description_model, build_embeddings
 from ..parsing.pymupdf_parser import PyMuPDFParser
 from ..pipeline.ingest import IngestService
 from ..progress_store import ProgressStore
@@ -50,7 +50,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     ingest_service = IngestService(
         settings, store, parser, index_service,
-        chat_model_factory=lambda: build_chat_model(settings),
+        # 图片描述专用工厂(与问答模型解耦);问答服务继续走 build_chat_model,互不共享缓存
+        chat_model_factory=lambda: build_description_model(settings),
         progress_store=progress_store,
     )
     knowledge = KnowledgeService(store, index_service)
@@ -61,6 +62,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         worker = IngestWorker(ingest_service, settings.db_path, progress_store=progress_store)
         worker.start()
         logger.info("deephoto started; embeddings=%s", "on" if embeddings else "off")
+        logger.info("image_description enabled=%s model=%s reasoning_effort=%s timeout=%s retries=%s",
+                    settings.description_enabled,
+                    settings.description_model if settings.description_enabled else "-",
+                    settings.description_reasoning_effort if settings.description_enabled else "-",
+                    settings.description_timeout_seconds, settings.description_max_retries)
         yield
         worker.stop()
         worker.join(timeout=5)

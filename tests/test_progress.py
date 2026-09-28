@@ -506,6 +506,45 @@ class LateFixesTest(ProgressTestBase):
         detail = new.detail(LOCAL_CTX.tenant_id, doc_id, business_status="ready")
         self.assertEqual(detail["summary"]["state"], "succeeded")
 
+    def test_description_model_recorded_and_skip_reason_updated(self):
+        # 成功与异常两处都记录实际描述模型配置名(不再残留 settings.chat_model);
+        # 关闭时跳过原因明确为"已关闭"
+        calls = {"n": 0}
+
+        def one_bad(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return GOOD_DESC()
+
+        doc_id = self._new_doc()
+        self._ingest(doc_id, describe=one_bad)
+        occs = repo.occurrences_for_document(self.conn, doc_id)
+        for occ in occs:
+            self.assertEqual(occ["description_model"], "qwen3.8-omni-flash:v1", occ["figure_number"])
+        stages = self._stages(doc_id)
+        self.assertEqual(stages["describing"]["result"], "partial")
+
+        doc2 = self._new_doc(b"%PDF-1.4 other")
+        self._ingest(doc2, describe=None)
+        self.assertIn("已关闭", self._stages(doc2)["describing"]["detail"]["reason"])
+
+    def test_description_init_error_not_swallowed_as_unconfigured(self):
+        # 初始化异常不得伪装成"未配置":应进入入库失败路径,记录真实失败
+        doc_id = self._new_doc()
+        self.prog.register_run(f"run_{doc_id}", doc_id, LOCAL_CTX.tenant_id)
+        self.prog.claim_run(f"run_{doc_id}")
+        service = IngestService(
+            self.settings, self.store, parser=None, index_service=IndexService(),
+            chat_model_factory=lambda: (_ for _ in ()).throw(RuntimeError("init boom")),
+            progress_store=self.prog,
+            mineru_client_factory=lambda obs: _FakeMinerU(obs))
+        service.ingest(doc_id)
+        doc = repo.get_document(self.conn, doc_id)
+        self.assertEqual(doc["status"], "failed")
+        self.assertIn("init boom", doc["error"])
+        self.assertNotEqual(self._stages(doc_id)["describing"]["result"], "skipped")
+
     def test_merge_end_measures_only_merge_work(self):
         # 多块合并耗时只含拼接操作,不含拆分与各块往返(此前按整个解析计时)
         import time as _time

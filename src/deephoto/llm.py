@@ -34,6 +34,36 @@ def build_chat_model(settings: Settings):
     )
 
 
+def build_description_model(settings: Settings):
+    """图片描述专用模型(OpenAI 兼容,如百炼 qwen3.8-omni-flash;与问答/嵌入配置解耦)。
+
+    未启用(DEEPHOTO_DESCRIPTION_ENABLED 非 true)返回 None——这是明确的"已关闭"
+    状态,与初始化失败严格区分:启用后配置缺项在 load_settings 启动校验时已报出;
+    其余初始化异常直接上抛,由入库失败路径记录真实失败,不伪装成未配置。
+    """
+    if not settings.description_enabled:
+        return None
+    from langchain_openai import ChatOpenAI
+    from pydantic import SecretStr
+
+    kwargs = dict(
+        model=settings.description_model,
+        api_key=SecretStr(settings.description_api_key or ""),
+        base_url=settings.description_base_url,
+        timeout=settings.description_timeout_seconds,
+        max_retries=settings.description_max_retries,
+        max_tokens=settings.description_max_tokens,
+        # 官方 HTTP 指南推荐流式;invoke 由 LangChain 聚合为完整响应后再解析一次 JSON,
+        # 流式中断的半段 JSON 不会被当成成功
+        streaming=True,
+    )
+    if settings.description_reasoning_effort:
+        # qwen-omni 系列:Chat Completions 请求体顶层 reasoning_effort="none" 关闭思考;
+        # 不混用其他 Qwen 型号的 enable_thinking / thinking_budget
+        kwargs["reasoning_effort"] = settings.description_reasoning_effort
+    return ChatOpenAI(**kwargs)
+
+
 def build_embeddings(settings: Settings):
     """可选嵌入模型(OpenAI 兼容端点)。未配置返回 None,检索退化为纯关键词。"""
     if not settings.embeddings_enabled:

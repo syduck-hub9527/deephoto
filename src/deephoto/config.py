@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import overload
+from urllib.parse import urlparse
 
 _ENV_PREFIX = "DEEPHOTO_"
 
@@ -19,6 +20,61 @@ def _get(name: str, default: str) -> str: ...
 def _get(name: str, default: None = None) -> str | None: ...
 def _get(name: str, default: str | None = None) -> str | None:
     return os.environ.get(_ENV_PREFIX + name, default)
+
+
+def _get_bool(name: str, default: bool) -> bool:
+    """布尔解析:true/false、1/0(兼容 yes/no);不用 bool("false") 这种坑。"""
+    raw = _get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须是 true/false/1/0(可 yes/no),当前值无法解析")
+
+
+def _get_float(name: str, default: float, *, minimum: float) -> float:
+    raw = _get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须是数字,当前值无法解析") from None
+    if value < minimum:
+        raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须 >= {minimum}")
+    return value
+
+
+def _get_int(name: str, default: int, *, minimum: int) -> int:
+    raw = _get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须是整数,当前值无法解析") from None
+    if value < minimum:
+        raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须 >= {minimum}")
+    return value
+
+
+def _description_url_error(url: str) -> str | None:
+    """Base URL 校验;只描述问题,不回显任何值(防泄露)。"""
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "必须是合法的 http/https Base URL"
+    if parsed.username or parsed.password:
+        return "不能包含用户名或密码"
+    if parsed.query:
+        return "不能包含查询参数"
+    if parsed.path.rstrip("/").endswith("/chat/completions"):
+        return "请填到 /v1 为止的 Base URL,不要包含 /chat/completions"
+    if "{" in url or "}" in url or "YOUR_" in url.upper():
+        return "含有未替换的占位符,请按控制台调用示例填写真实地址"
+    return None
 
 
 @dataclass(frozen=True)
@@ -45,6 +101,16 @@ class Settings:
     # 调试:设置后把 MinerU 返回的原始结果 ZIP 存到该目录,用于核对真实字段格式
     mineru_dump_dir: str | None = None
 
+    # 图片描述模型:独立于问答/Embedding/MinerU;默认关闭(显式 DESCRIPTION_ENABLED=true 启用)
+    description_enabled: bool = False
+    description_api_key: str | None = None
+    description_base_url: str | None = None
+    description_model: str = "qwen3.8-omni-flash"
+    description_reasoning_effort: str | None = "none"   # 空字符串 -> None,不发送该参数
+    description_timeout_seconds: float = 90.0
+    description_max_retries: int = 1
+    description_max_tokens: int = 1024
+
     @property
     def embeddings_enabled(self) -> bool:
         return bool(self.embedding_base_url and self.embedding_model)
@@ -66,7 +132,7 @@ class Settings:
 def load_settings() -> Settings:
     """从环境变量加载配置。支持 .env 文件(简单解析,不引入额外依赖)。"""
     _load_dotenv()
-    return Settings(
+    settings = Settings(
         moonshot_api_key=_get("MOONSHOT_API_KEY"),
         moonshot_base_url=_get("MOONSHOT_BASE_URL", "https://api.kimi.com/coding/v1"),
         chat_model=_get("CHAT_MODEL", "k3"),
@@ -80,7 +146,35 @@ def load_settings() -> Settings:
         mineru_api_key=_get("MINERU_API_KEY"),
         mineru_base_url=_get("MINERU_BASE_URL"),
         mineru_dump_dir=_get("MINERU_DUMP_DIR"),
+        description_enabled=_get_bool("DESCRIPTION_ENABLED", False),
+        description_api_key=_get("DESCRIPTION_API_KEY"),
+        description_base_url=_get("DESCRIPTION_BASE_URL"),
+        description_model=_get("DESCRIPTION_MODEL", "qwen3.8-omni-flash"),
+        description_reasoning_effort=(_get("DESCRIPTION_REASONING_EFFORT", "none") or "").strip() or None,
+        description_timeout_seconds=_get_float("DESCRIPTION_TIMEOUT_SECONDS", 90.0, minimum=1.0),
+        description_max_retries=_get_int("DESCRIPTION_MAX_RETRIES", 1, minimum=0),
+        description_max_tokens=_get_int("DESCRIPTION_MAX_TOKENS", 1024, minimum=1),
     )
+    _validate_description(settings)
+    return settings
+
+
+def _validate_description(settings: "Settings") -> None:
+    """启用描述时启动校验:报配置变量名,不输出变量值或密钥。关闭时不要求 key/URL。"""
+    if not settings.description_enabled:
+        return
+    problems = []
+    if not (settings.description_api_key or "").strip():
+        problems.append("DEEPHOTO_DESCRIPTION_API_KEY 为空")
+    base_url = (settings.description_base_url or "").strip()
+    if not base_url:
+        problems.append("DEEPHOTO_DESCRIPTION_BASE_URL 为空")
+    elif error := _description_url_error(base_url):
+        problems.append(f"DEEPHOTO_DESCRIPTION_BASE_URL {error}")
+    if not (settings.description_model or "").strip():
+        problems.append("DEEPHOTO_DESCRIPTION_MODEL 为空")
+    if problems:
+        raise ValueError("图片描述配置不完整: " + "; ".join(problems))
 
 
 def _load_dotenv() -> None:

@@ -135,7 +135,7 @@ class IngestService:
         self.store = store
         self.parser = parser
         self.index_service = index_service
-        self._chat_model_factory = chat_model_factory
+        self._chat_model_factory = chat_model_factory   # 注:在 IngestService 内代表"描述模型"工厂
         self._chat_model = None
         self._progress_store = progress_store            # 观测存储;None 时全部走 NoOpObserver
         self._mineru_client_factory = mineru_client_factory  # 测试注入假客户端(on_progress) -> client
@@ -229,7 +229,7 @@ class IngestService:
         conn.commit()
         if stats["model"] is None:
             observer.stage_end(pg.STAGE_DESCRIBING, pg.RESULT_SKIPPED,
-                               detail={"reason": "未配置 DEEPHOTO_MOONSHOT_API_KEY"})
+                               detail={"reason": "图片描述已关闭(DEEPHOTO_DESCRIPTION_ENABLED 未开启)"})
         else:
             result = pg.RESULT_SUCCEEDED if not stats["failed"] else pg.RESULT_PARTIAL
             observer.stage_end(pg.STAGE_DESCRIBING, result)
@@ -349,8 +349,9 @@ class IngestService:
         model = self._get_chat_model()
         stats = {"model": model, "ok": 0, "failed": 0}
         if model is None:
-            logger.warning("未配置 DEEPHOTO_MOONSHOT_API_KEY,跳过图片描述(仅用图注检索)")
+            logger.warning("图片描述已关闭,跳过(仅以图注检索)")
             return stats
+        desc_model_tag = f"{self.settings.description_model}:{DESC_PROMPT_VERSION}"
         for seq, occ in enumerate(occurrences, start=1):
             full = repo.get_occurrence(conn, occ["id"])
             asset = repo.get_asset(conn, full["image_asset_id"])
@@ -371,7 +372,7 @@ class IngestService:
                     caption=result["caption"] or (occ["caption"] or ""),
                     context_summary=result["context_summary"],
                     uncertain_details=result["uncertain_details"],
-                    description_model=f"{self.settings.chat_model}:{DESC_PROMPT_VERSION}",
+                    description_model=desc_model_tag,
                 )
                 diag = (result.get("diagnostic") or {}).get("result", "ok")
                 if diag == "ok":
@@ -389,18 +390,17 @@ class IngestService:
                     conn, occ["id"], visible_summary="", visible_labels=[],
                     caption=occ["caption"] or "", context_summary="",
                     uncertain_details=[f"描述生成失败:{type(exc).__name__}: {exc}"],
-                    description_model=f"{self.settings.chat_model}:{DESC_PROMPT_VERSION}",
+                    description_model=desc_model_tag,
                 )
                 stats["failed"] += 1
                 observer.item_end("image", seq, pg.ITEM_ERROR, error_kind=type(exc).__name__)
         return stats
 
     def _get_chat_model(self):
+        """描述模型(进程内缓存)。工厂返回 None 表示"描述已关闭"(明确状态);
+        初始化异常直接上抛,由 ingest() 记录文档失败——不伪装成未配置。"""
         if self._chat_model is None and self._chat_model_factory is not None:
-            try:
-                self._chat_model = self._chat_model_factory()
-            except RuntimeError:
-                return None
+            self._chat_model = self._chat_model_factory()
         return self._chat_model
 
 

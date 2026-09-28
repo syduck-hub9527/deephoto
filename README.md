@@ -42,16 +42,28 @@ pip freeze > requirements.lock.txt
 
 | 变量 | 说明 | 默认 |
 | --- | --- | --- |
-| `MOONSHOT_API_KEY` | Kimi K3 密钥(必填,描述与问答需要) | — |
+| `MOONSHOT_API_KEY` | Kimi K3 密钥(**只负责问答**,不负责图片描述) | — |
 | `MOONSHOT_BASE_URL` | Kimi Code 会员路由 `https://api.kimi.com/coding/v1`;直连 API 用 `https://api.moonshot.cn/v1` | coding 路由 |
 | `CHAT_MODEL` | coding 路由用 `k3`;直连 API 用 `kimi-k3`(不可混用) | `k3` |
 | `CHAT_TEMPERATURE` | 采样温度 | `1` |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_API_KEY` | 可选嵌入端点(任意 OpenAI 兼容,如阿里云百炼 `https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen3.7-text-embedding`)。**不配置时自动降级为纯关键词检索** | 关闭 |
 | `DATA_DIR` | 数据库与对象存储目录 | `./data` |
 | `MAX_UPLOAD_MB` | 上传大小上限 | `100` |
-| `INGESTION_VERSION` | 解析/索引版本;去重复用的判定维度之一 | `v1` |
+| `INGESTION_VERSION` | 解析/索引版本;去重复用的判定维度之一 | `v2` |
 | `MINERU_API_KEY` | MinerU 云端解析 Token(必填,唯一的 PDF 解析器;租户不可配置) | — |
 | `MINERU_BASE_URL` | MinerU 服务地址 | `https://mineru.net` |
+| `DESCRIPTION_ENABLED` | 图片描述专用模型开关(独立于问答/嵌入/MinerU) | **`false`** |
+| `DESCRIPTION_API_KEY` / `DESCRIPTION_BASE_URL` | 描述服务独立密钥与 OpenAI 兼容 Base URL(到 `/v1` 为止;不回退使用聊天密钥) | — |
+| `DESCRIPTION_MODEL` | 描述模型名 | `qwen3.8-omni-flash` |
+| `DESCRIPTION_REASONING_EFFORT` | 顶层关思考参数;空字符串表示不发送该参数 | `none` |
+| `DESCRIPTION_TIMEOUT_SECONDS` / `DESCRIPTION_MAX_RETRIES` / `DESCRIPTION_MAX_TOKENS` | 单次请求超时 / SDK 重试上限 / 输出上限 | `90` / `1` / `1024` |
+
+> ⚠️ **升级注意：图片描述默认关闭。** 早期版本复用聊天模型(Moonshot)生成图片描述;
+> 从本版本起描述使用独立的 `DESCRIPTION_*` 配置,仅填了旧聊天配置的用户**不会再自动描述图片**
+> (入库阶段显示"图片描述已关闭",仅以图注检索)。按上表填好密钥与地址后设
+> `DESCRIPTION_ENABLED=true` 并**完整重启服务**生效。已有入库文档的描述不会因此改变;
+> 需要重新生成时请换一个新的 `INGESTION_VERSION` 再重新上传(去重按内容哈希+版本判定)。
+> `qwen3.8-omni-flash` 走 Chat Completions,与 realtime 型号不是同一接入方式,不要混用。
 
 ## API 摘要
 
