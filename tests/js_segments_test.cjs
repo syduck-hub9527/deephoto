@@ -290,6 +290,35 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
     const htmlActive = SEG.renderImageItems([runningItem], true);
     check("运行中任务:在途图片现算耗时", htmlActive.includes("小时"));
 
+    // 详情响应慢于轮询周期:在途期间重复 refresh 不发新请求;
+    // 响应到达后写入一次;缓存保留供列表重建复用
+    {
+      let fetchCalls = 0, resolveSlow;
+      const renders = [];
+      const loader = SEG.createProgDetailLoader({
+        fetchDetail: (id) => { fetchCalls++; return new Promise(r => { resolveSlow = r; }); },
+        onRender: (id, html) => renders.push([id, html]),
+      });
+      loader.expanded("doc1");
+      loader.refresh("doc1");                       // 展开时发起
+      // 模拟 3 次列表轮询(响应始终未回):不应叠加请求,也不应重置内容
+      loader.refresh("doc1"); loader.refresh("doc1"); loader.refresh("doc1");
+      check("慢响应:在途期间不重复发送", fetchCalls === 1 && loader.inflightCount === 1);
+      check("慢响应:尚未渲染", renders.length === 0);
+      resolveSlow("<table>阶段表</table>");
+      await new Promise(r => setImmediate(r));
+      check("慢响应:到达后写入一次", renders.length === 1 && renders[0][1].includes("阶段表"));
+      check("慢响应:缓存供列表重建复用", loader.cachedHtml("doc1").includes("阶段表"));
+      // 新一轮轮询(上一请求已完成):允许再发一次
+      loader.refresh("doc1");
+      check("完成后允许再次刷新", fetchCalls === 2);
+      // 切换展开文档:旧请求结果只进缓存,不渲染
+      loader.expanded("doc2");
+      resolveSlow("<table>迟到的doc1</table>");
+      await new Promise(r => setImmediate(r));
+      check("切换后旧请求不渲染", renders.length === 1 && loader.cachedHtml("doc1").includes("迟到"));
+    }
+
     console.log(failures ? `\n${failures} 个失败` : "\n全部通过");
     process.exit(failures ? 1 : 0);
   })();

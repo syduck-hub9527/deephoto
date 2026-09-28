@@ -243,7 +243,7 @@ const docPoller = SEG.createDocPoller({
     docs = (await r.json()).documents;
     docsUpdatedAt = new Date(); docsStale = false;
     renderDocs();
-    if (expandedDoc) refreshProgDetail(expandedDoc);   // 只有展开时才额外请求细分项
+    if (expandedDoc) detailLoader.refresh(expandedDoc);   // 在途去重:慢请求期间不会重复发送
     // 有未完成文档才继续轮询;全部终态则停止(详情仍可手动展开查看)
     return docs.some(d => !["ready", "failed"].includes(d.status));
   },
@@ -254,8 +254,6 @@ function refreshDocs(immediate) {
   docPoller.start();                 // 已停止(全终态)时重新启动;运行中不叠加
   if (immediate) docPoller.tick();   // 上传/删除后立即刷新一次
 }
-
-docPoller.start();   // 启动轮询(定义之后;全部终态时会自行停止,由 refreshDocs 再唤醒)
 
 function renderDocs() {
   const scope = localStorage.getItem("deephoto_scope") || "";
@@ -269,7 +267,7 @@ function renderDocs() {
         <button class="doc-del" onclick="event.stopPropagation(); delDoc('${d.id}')" title="删除">×</button>
       </div>
       ${line ? `<div class="doc-prog">${esc(line)}${d.progress ? ` <a class="doc-prog-toggle" data-prog="${d.id}">${expandedDoc === d.id ? "收起耗时" : "展开耗时"}</a>` : ""}</div>
-      <div class="doc-prog-detail" id="prog-${d.id}" ${expandedDoc === d.id ? "" : "hidden"}></div>` : ""}
+      <div class="doc-prog-detail" id="prog-${d.id}" ${expandedDoc === d.id ? "" : "hidden"}>${expandedDoc === d.id ? detailInnerHtml(d.id) : ""}</div>` : ""}
       ${d.error ? `<div class="doc-err">${esc(d.error)}</div>` : ""}`;
   }).join("") || '<div class="doc-err" style="color:var(--muted)">暂无文档,先上传一份 PDF</div>');
   const ready = docs.filter(d => d.status === "ready");
@@ -282,43 +280,41 @@ function fmtClock(dt) {
   return `${p(dt.getHours())}:${p(dt.getMinutes())}:${p(dt.getSeconds())}`;
 }
 
+// 耗时详情加载器:同一文档在途请求唯一;缓存上次内容,列表重建不清空;
+// 响应回来写入当前节点;切换展开文档后旧请求结果不渲染
+const detailLoader = SEG.createProgDetailLoader({
+  fetchDetail: async (id) => {
+    const r = await fetch("/api/documents/" + id);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return renderProgDetail((await r.json()).progress);
+  },
+  onRender: (id, html) => { const panel = $("prog-" + id); if (panel) panel.innerHTML = html; },
+  onError: (id) => { const panel = $("prog-" + id);
+    if (panel && !detailLoader.cachedHtml(id)) panel.innerHTML = '<div class="doc-err">详情加载失败</div>'; },
+});
+
+function detailInnerHtml(id) {
+  return detailLoader.cachedHtml(id)
+    || '<div class="doc-err" style="color:var(--muted)">加载中…</div>';
+}
+
 // 展开/收起耗时详情(事件委托;只有展开时才请求细分项)
 $("docList").addEventListener("click", e => {
   const t = e.target.closest("[data-prog]");
   if (!t) return;
   e.stopPropagation();
   const id = t.dataset.prog;
-  if (expandedDoc === id) { expandedDoc = null; renderDocs(); return; }
+  if (expandedDoc === id) {
+    expandedDoc = null;
+    detailLoader.expanded(null);      // 收起:在途请求结果只进缓存,不再渲染
+    renderDocs();
+    return;
+  }
   expandedDoc = id;
+  detailLoader.expanded(id);          // 切换文档:此前的在途请求结果失效(仅缓存)
   renderDocs();
-  refreshProgDetail(id);
+  detailLoader.refresh(id);
 });
-
-// 每个文档一个请求序号:慢响应回来时列表可能已重建节点/已有更新请求,
-// 只有最新请求才写入,且写入前重新获取当前节点
-const progDetailReq = {};
-
-async function refreshProgDetail(id) {
-  if (expandedDoc !== id) return;
-  const seq = (progDetailReq[id] = (progDetailReq[id] || 0) + 1);
-  const fresh = () => (expandedDoc === id && progDetailReq[id] === seq) ? $("prog-" + id) : null;
-  const panel = fresh();
-  if (panel && !panel.dataset.loaded) {
-    panel.innerHTML = '<div class="doc-err" style="color:var(--muted)">加载中…</div>';
-  }
-  try {
-    const r = await fetch("/api/documents/" + id);
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const j = await r.json();
-    const target = fresh();
-    if (!target) return;
-    target.dataset.loaded = "1";
-    target.innerHTML = renderProgDetail(j.progress);
-  } catch {
-    const target = fresh();
-    if (target) target.innerHTML = '<div class="doc-err">详情加载失败</div>';
-  }
-}
 
 function renderProgDetail(p) {
   if (!p) return '<div class="doc-err" style="color:var(--muted)">无本次耗时记录</div>';
@@ -513,6 +509,9 @@ function toast(text) {
 }
 
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+// 全部定义之后再启动轮询(const 暂时性死区:load 会访问 renderDocs/detailLoader)
+docPoller.start();
 </script>
 </body>
 </html>

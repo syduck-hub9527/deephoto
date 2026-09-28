@@ -324,9 +324,36 @@
     return `<div class="prog-sub">向量逐批结果:</div><table class="prog-table">${rows}</table>`;
   }
 
+  /* 文档耗时详情加载器:
+   * - 同一文档只允许一个请求在途,期间 refresh 不再重复发送(慢于轮询周期也不会堆积);
+   * - 最近一次成功内容入缓存,列表重建时直接复用,不再每轮回退到"加载中…";
+   * - 响应回来后由调用方写入当前节点;切换展开文档后,旧请求结果只进缓存不渲染。 */
+  function createProgDetailLoader(opts) {
+    let expandedId = null;
+    const inflight = new Set();
+    const cache = new Map();
+    function expanded(id) { expandedId = id; }      // null 表示收起
+    function cachedHtml(id) { return cache.get(id) || null; }
+    async function refresh(id) {
+      if (expandedId !== id || inflight.has(id)) return;
+      inflight.add(id);
+      try {
+        const html = await opts.fetchDetail(id);
+        cache.set(id, html);
+        if (expandedId === id) opts.onRender(id, html);
+      } catch (e) {
+        if (expandedId === id && opts.onError) opts.onError(e);
+      } finally {
+        inflight.delete(id);
+      }
+    }
+    return { expanded, refresh, cachedHtml,
+             get inflightCount() { return inflight.size; } };
+  }
+
   return { esc, figLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
            imageCardHTML, figureDomId, newMessageId, createAssistantMessage,
            applyStreamEvent, finishStream, restoreMessages,
            PROG_STAGE_NAMES, PROG_STAGE_STATE, formatElapsed, progressLine, createDocPoller,
-           renderChunks, renderImageItems, renderBatchItems };
+           renderChunks, renderImageItems, renderBatchItems, createProgDetailLoader };
 });
