@@ -2,7 +2,7 @@ import unittest
 
 import _bootstrap  # noqa: F401
 from deephoto.parsing.base import ParsedParagraph
-from deephoto.pipeline.chunking import MAX_CHARS, chunk_paragraphs
+from deephoto.pipeline.chunking import MAX_CHARS, chunk_paragraphs, split_long_text
 
 
 def para(pid, text, page=1, section=None):
@@ -22,6 +22,32 @@ class ChunkingTest(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
         for chunk in chunks:
             self.assertLessEqual(len(chunk.text), MAX_CHARS)
+
+    def test_single_oversize_paragraph_is_split(self):
+        # MinerU 整页文本 = 一个段落,过去会原样成为一个 2000 字的块
+        text = "这是一个完整的句子,用来测试拆分。" * 150      # 约 2400 字
+        chunks = chunk_paragraphs([para("p1_mineru", text)])
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk.text), MAX_CHARS)
+        self.assertEqual("".join(c.text.replace("\n", "") for c in chunks), text)   # 不丢字
+        self.assertEqual(chunks[0].paragraph_ids[0], "p1_mineru#1")
+
+    def test_small_head_plus_big_paragraph_respects_cap(self):
+        # 过去:100 字 + 1500 字 会被追加成 1601 字的块
+        chunks = chunk_paragraphs([para("p1", "甲" * 100), para("p2", "乙。" * 750)])
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk.text), MAX_CHARS)
+
+    def test_split_prefers_sentence_boundary(self):
+        pieces = split_long_text("第一句。" * 400, limit=900)
+        for piece in pieces:
+            self.assertTrue(piece.endswith("。"))
+            self.assertLessEqual(len(piece), 900)
+
+    def test_split_hard_cuts_punctuation_free_text(self):
+        pieces = split_long_text("字" * 2500, limit=900)
+        self.assertEqual([len(x) for x in pieces], [900, 900, 700])
 
     def test_section_boundary(self):
         chunks = chunk_paragraphs([

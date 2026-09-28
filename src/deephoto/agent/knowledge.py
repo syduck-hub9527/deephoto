@@ -21,6 +21,10 @@ from ..storage import ObjectStore
 logger = logging.getLogger(__name__)
 
 _SNIPPET_CHARS = 320
+# 单次检索返回给模型的正文总字符预算:预算内的命中块给全文,超出的只给开头并标 truncated,
+# 模型可再调用 read_chunk 读取全文。块长有硬上限(MAX_CHARS),预算约可容纳 6 个满长块。
+_FULL_TEXT_BUDGET = 8000
+_MAX_NEIGHBORS = 2
 
 
 class KnowledgeService:
@@ -86,16 +90,26 @@ class KnowledgeService:
                         occs[occ["id"]] = occ
                         chunk_image_rel[occ["id"]] = ("explicit_figure", 1.0)
 
+        # 按分数从高到低在预算内给全文;补充进来的关联块(无分数)排最后
+        ordered = sorted(chunks.values(),
+                         key=lambda c: chunk_hits.get(c["id"], {}).get("score") or 0.0, reverse=True)
+        budget = _FULL_TEXT_BUDGET
+        chunk_entries: list[dict] = []
+        for c in ordered:
+            text, truncated = c["text"], False
+            if len(text) <= budget:
+                budget -= len(text)
+            else:
+                text, truncated = text[:_SNIPPET_CHARS] + "…", True
+            chunk_entries.append({
+                "chunk_id": c["id"], "document_id": c["document_id"],
+                "section": c["section"], "page_start": c["page_start"], "page_end": c["page_end"],
+                "score": chunk_hits.get(c["id"], {}).get("score"),
+                "text": text, "truncated": truncated,
+            })
+
         return {
-            "chunks": [
-                {
-                    "chunk_id": c["id"], "document_id": c["document_id"],
-                    "section": c["section"], "page_start": c["page_start"], "page_end": c["page_end"],
-                    "score": chunk_hits.get(c["id"], {}).get("score"),
-                    "text": c["text"][:_SNIPPET_CHARS] + ("…" if len(c["text"]) > _SNIPPET_CHARS else ""),
-                }
-                for c in chunks.values()
-            ],
+            "chunks": chunk_entries,
             "images": [
                 {
                     "image_occurrence_id": o["id"], "document_id": o["document_id"],
@@ -107,6 +121,28 @@ class KnowledgeService:
                 for o in occs.values()
             ],
         }
+
+    # ---- 读全文工具(read_chunk 的实现)----
+
+    def read_chunk(self, conn: Connection, ctx: AuthContext, chunk_id: str,
+                   neighbors: int = 0) -> dict:
+        """读取某个正文块的完整文本;neighbors>0 时一并返回前后相邻块(阅读顺序)。"""
+        chunk = next(iter(repo.get_chunks(conn, [chunk_id])), None)
+        if chunk is None or chunk["tenant_id"] != ctx.tenant_id \
+                or not self.allowed_document_ids(conn, ctx, chunk["document_id"]):
+            return {"error": f"正文块 {chunk_id} 不存在或无权限访问", "chunks": []}
+        neighbors = max(0, min(int(neighbors or 0), _MAX_NEIGHBORS))
+        ordered = repo.chunks_in_order(conn, chunk["document_id"])
+        index = next((i for i, c in enumerate(ordered) if c["id"] == chunk_id), 0)
+        window = ordered[max(0, index - neighbors): index + neighbors + 1]
+        return {"chunks": [
+            {
+                "chunk_id": c["id"], "document_id": c["document_id"], "section": c["section"],
+                "page_start": c["page_start"], "page_end": c["page_end"], "text": c["text"],
+                "role": "target" if c["id"] == chunk_id else "neighbor",
+            }
+            for c in window
+        ]}
 
     # ---- 看图工具(inspect_image 的实现)----
 

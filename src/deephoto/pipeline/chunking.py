@@ -6,14 +6,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 
 from ..parsing.base import ParsedParagraph
 from ..parsing.captions import find_referenced_figures
 
-TARGET_CHARS = 900     # 目标块长
-MAX_CHARS = 1300       # 超过即强制切分(在段落边界)
-MIN_CHARS = 250        # 低于此长度尽量与下一段合并
+TARGET_CHARS = 900     # 目标块长;超长段落按此长度拆分
+MAX_CHARS = 1300       # 块长度硬上限:任何块的文本都不会超过它
+MIN_CHARS = 250        # 低于此长度的尾块尽量并入前一块
+
+# 句末切分点:中文句号/问号/叹号/分号/换行之后,或英文句点+空白之后
+_SENTENCE_END = re.compile(r"(?<=[。！？；!?;\n])|(?<=\.)\s+")
 
 
 @dataclass
@@ -26,8 +30,45 @@ class ChunkDraft:
     referenced_figures: list[str] = field(default_factory=list)   # 图号,如 "3"
 
 
+def split_long_text(text: str, limit: int = TARGET_CHARS) -> list[str]:
+    """把超长文本按句子边界拆成不超过 limit 的片段;无标点的超长句硬切。"""
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    pieces: list[str] = []
+    buf = ""
+    for sentence in filter(None, _SENTENCE_END.split(text)):
+        while len(sentence) > limit:          # 单句就超长:先收尾 buf,再硬切
+            if buf:
+                pieces.append(buf)
+                buf = ""
+            pieces.append(sentence[:limit])
+            sentence = sentence[limit:]
+        if buf and len(buf) + len(sentence) > limit:
+            pieces.append(buf)
+            buf = ""
+        buf += sentence
+    if buf:
+        pieces.append(buf)
+    return [piece.strip() for piece in pieces if piece.strip()]
+
+
+def _expand_oversize(paragraphs: list[ParsedParagraph]) -> list[ParsedParagraph]:
+    """超过 MAX_CHARS 的段落(如 MinerU 整页文本)拆成多个子段落,保证块有硬上限。"""
+    expanded: list[ParsedParagraph] = []
+    for para in paragraphs:
+        text = para.text.strip()
+        if len(text) <= MAX_CHARS:
+            expanded.append(para)
+            continue
+        for index, piece in enumerate(split_long_text(text), start=1):
+            expanded.append(replace(para, id=f"{para.id}#{index}", text=piece))
+    return expanded
+
+
 def chunk_paragraphs(paragraphs: list[ParsedParagraph]) -> list[ChunkDraft]:
-    """输入按阅读顺序排列的段落,输出分块草稿。"""
+    """输入按阅读顺序排列的段落,输出分块草稿。每块文本长度 <= MAX_CHARS。"""
+    paragraphs = _expand_oversize(paragraphs)
     chunks: list[ChunkDraft] = []
     current: ChunkDraft | None = None
 
@@ -53,7 +94,7 @@ def chunk_paragraphs(paragraphs: list[ParsedParagraph]) -> list[ChunkDraft]:
         big_enough = len(current.text) >= MIN_CHARS
         section_changed = para.section != current.section   # 章节是硬边界,始终切分
         page_gap = para.page_number > current.page_end + 1 and big_enough
-        if (would_exceed and big_enough) or section_changed or page_gap:
+        if would_exceed or section_changed or page_gap:
             flush()
             current = ChunkDraft(
                 section=para.section, text=text,

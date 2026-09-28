@@ -91,7 +91,15 @@ def insert_chunk(conn: Connection, *, chunk_id: str | None = None, tenant_id: st
 
 
 def chunks_for_document(conn: Connection, document_id: str) -> list[dict]:
-    rows = conn.execute("SELECT * FROM text_chunks WHERE document_id = ?", (document_id,)).fetchall()
+    rows = conn.execute("SELECT * FROM text_chunks WHERE document_id = ? ORDER BY rowid",
+                        (document_id,)).fetchall()
+    return [_chunk_dict(r) for r in rows]
+
+
+def chunks_in_order(conn: Connection, document_id: str) -> list[dict]:
+    """按入库顺序(即阅读顺序)返回文档的全部块;用于读取相邻块。"""
+    rows = conn.execute("SELECT * FROM text_chunks WHERE document_id = ? ORDER BY rowid",
+                        (document_id,)).fetchall()
     return [_chunk_dict(r) for r in rows]
 
 

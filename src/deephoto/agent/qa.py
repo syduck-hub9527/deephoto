@@ -32,12 +32,14 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = (
     "你是文档知识库问答助手。回答当前用户的问题时遵守:\n"
     "1. 先用 search_knowledge 检索文档(用户指定了文档就传该 document_id,否则检索全部可访问文档)。\n"
-    "2. 当问题涉及图中的标签、箭头、数值、颜色或空间关系时,必须用 inspect_image 查看完整原图后再作答;"
+    "2. search_knowledge 返回的正文若 truncated 为 true 且与问题相关,必须先用 read_chunk 读取全文再作答;\n"
+    "   答案可能跨块或跨页时,用 read_chunk 的 neighbors=1 一并读取前后块。不要只凭截断的开头下结论。\n"
+    "3. 当问题涉及图中的标签、箭头、数值、颜色或空间关系时,必须用 inspect_image 查看完整原图后再作答;"
     "不要只凭图片的文字描述下结论。\n"
-    "3. 引用证据必须使用固定格式:正文 [chunk:chunk_id],图片 [image:image_occurrence_id];"
+    "4. 引用证据必须使用固定格式:正文 [chunk:chunk_id],图片 [image:image_occurrence_id];"
     "只能引用工具返回过的 ID,不得编造页码、图号或图片。\n"
-    "4. 回答中注明出处页码(证据里的 page_start / page 字段)。\n"
-    "5. 检索不到可靠依据时明确说明不知道,不要编造内容。"
+    "5. 回答中注明出处页码(证据里的 page_start / page 字段)。\n"
+    "6. 检索不到可靠依据时明确说明不知道,不要编造内容。"
 )
 
 _CITE_CHUNK_RE = re.compile(r"\[chunk:([A-Za-z0-9_]+)\]")
@@ -156,6 +158,14 @@ class QAService:
                 tracker["images"].add(i["image_occurrence_id"])
             return json.dumps(result, ensure_ascii=False)
 
+        def read_chunk(chunk_id: str, neighbors: int = 0) -> str:
+            """读取 search_knowledge 命中的某个正文块的完整文本。当结果里 truncated 为 true 时使用;
+            neighbors 取 0~2,为 1 时同时返回前后相邻块,用于答案跨块、跨页的情况。"""
+            result = knowledge.read_chunk(connect(db_path), ctx, chunk_id, neighbors)
+            for c in result.get("chunks", []):
+                tracker["chunks"].add(c["chunk_id"])
+            return json.dumps(result, ensure_ascii=False)
+
         def inspect_image(image_occurrence_id: str) -> list[dict]:
             """查看 search_knowledge 命中的图片的完整原图,核对图内标签、箭头、数值与空间关系。
             传入证据中的 image_occurrence_id。"""
@@ -164,7 +174,7 @@ class QAService:
                 tracker["images"].add(image_occurrence_id)
             return blocks
 
-        return [search_knowledge, inspect_image], tracker
+        return [search_knowledge, read_chunk, inspect_image], tracker
 
     def _assemble(self, conn: Connection, ctx: AuthContext, answer_text: str,
                   question: str, tracker: dict,
