@@ -179,7 +179,8 @@ class ProgressStore:
         self._write("领取任务", op)
 
     def mark_interrupted(self) -> None:
-        """启动时调用:旧实例未结束的运行标记中断,不伪造结束时间(业务终态优先于本值)。"""
+        """启动时调用:旧实例未结束的运行标记中断(含在途单项),不伪造结束时间
+        (业务终态优先于本值;未知耗时保持空,展示为未知)。"""
         def op(conn):
             rows = conn.execute(
                 "SELECT run_id FROM runs WHERE result = 'running' AND instance_id != ?"
@@ -190,6 +191,10 @@ class ProgressStore:
                     " WHERE run_id = ?", (pg.RESULT_INTERRUPTED, row["run_id"]))
                 conn.execute(
                     "UPDATE stages SET result = ? WHERE run_id = ? AND result = 'running'",
+                    (pg.RESULT_INTERRUPTED, row["run_id"]))
+                # 单项一并标记中断:否则前端逐图仍显示"进行中"并持续累计耗时
+                conn.execute(
+                    "UPDATE items SET result = ? WHERE run_id = ? AND result = 'running'",
                     (pg.RESULT_INTERRUPTED, row["run_id"]))
             return len(rows)
         count = self._write("标记旧实例中断", op)
@@ -275,8 +280,10 @@ class ProgressStore:
 
     # ---- 读取:详情 ----
 
-    def detail(self, tenant_id: str, document_id: str) -> dict | None:
-        """详情:运行摘要 + 阶段耗时 + 单项结果 + 最慢项。tenant 由路由先行校验。"""
+    def detail(self, tenant_id: str, document_id: str,
+               business_status: str | None = None) -> dict | None:
+        """详情:运行摘要 + 阶段耗时 + 单项结果 + 最慢项。tenant 由路由先行校验;
+        business_status 传入真实业务状态,与列表接口共用同一套终态判断。"""
         run = self._latest_run(tenant_id, document_id)
         if run is None:
             return None
@@ -298,7 +305,8 @@ class ProgressStore:
         finished_items = [i for i in items if i.get("duration_ms") is not None]
         slowest = sorted(finished_items, key=lambda i: i["duration_ms"], reverse=True)[:3]
         return {
-            "summary": self._summary(run, {"id": document_id, "status": ""}, self._iso()),
+            "summary": self._summary(run, {"id": document_id, "status": business_status or ""},
+                                     self._iso()),
             "stage_names": dict(pg.STAGE_NAMES),
             "stages": stages,
             "items": items,

@@ -285,8 +285,48 @@
     return { start, stop, tick, get running() { return running; } };
   }
 
+  /* 详情页细分表。runActive(任务是否运行中)决定是否现算在途耗时;
+   * 中断/终态任务的在途项耗时显示 —,不随时间虚涨。 */
+  function renderChunks(items) {
+    const chunks = items.filter(i => i.kind === "mineru_chunk");
+    if (!chunks.length) return "";
+    const rows = chunks.map(i => {
+      const d = i.detail || {};
+      return `<tr><td>第 ${i.seq} 部分</td><td>${esc(PROG_STAGE_STATE[i.result] || i.result)}</td>` +
+        `<td>申请 ${formatElapsed(d.request_ms)} · 上传 ${formatElapsed(d.upload_ms)}<br>` +
+        `等待 ${formatElapsed(d.wait_ms)} · 下载 ${formatElapsed(d.download_ms)}</td></tr>`;
+    }).join("");
+    return `<div class="prog-sub">云端解析逐块往返:</div><table class="prog-table">${rows}</table>`;
+  }
+
+  function renderImageItems(items, runActive) {
+    const images = items.filter(i => i.kind === "image");
+    if (!images.length) return "";
+    const rows = images.map(i => {
+      // 仅任务运行中且该张仍在进行时才现算;中断的显示 —
+      const live = runActive && i.result === "running" && i.started_at;
+      const elapsed = i.duration_ms != null ? i.duration_ms
+        : (live ? Date.now() - Date.parse(i.started_at) : null);
+      return `<tr><td>${esc(i.label || "第 " + i.seq + " 张")}</td>` +
+        `<td>${i.page != null ? "p." + i.page : ""}</td>` +
+        `<td>${esc(PROG_STAGE_STATE[i.result] || i.result)}</td>` +
+        `<td>${formatElapsed(elapsed)}</td></tr>`;
+    }).join("");
+    return `<div class="prog-sub">图片描述逐张结果:</div><table class="prog-table">${rows}</table>`;
+  }
+
+  function renderBatchItems(items) {
+    const batches = items.filter(i => i.kind === "embed_batch");
+    if (!batches.length) return "";
+    const rows = batches.map(i => `<tr><td>第 ${i.seq} 批</td><td>${i.count != null ? i.count + " 条" : ""}</td>` +
+      `<td>${esc(PROG_STAGE_STATE[i.result] || i.result)}</td>` +
+      `<td>${formatElapsed(i.duration_ms)}</td></tr>`).join("");
+    return `<div class="prog-sub">向量逐批结果:</div><table class="prog-table">${rows}</table>`;
+  }
+
   return { esc, figLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
            imageCardHTML, figureDomId, newMessageId, createAssistantMessage,
            applyStreamEvent, finishStream, restoreMessages,
-           PROG_STAGE_NAMES, PROG_STAGE_STATE, formatElapsed, progressLine, createDocPoller };
+           PROG_STAGE_NAMES, PROG_STAGE_STATE, formatElapsed, progressLine, createDocPoller,
+           renderChunks, renderImageItems, renderBatchItems };
 });

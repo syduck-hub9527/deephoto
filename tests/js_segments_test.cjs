@@ -279,6 +279,17 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
     const startAt = html.indexOf("docPoller.start()");
     check("P1: docPoller 定义在首次启动之前", defAt > 0 && startAt > defAt);
 
+    // 中断任务的逐图渲染:在途项耗时显示 —,不虚涨;运行中才现算
+    const oldStart = new Date(Date.now() - 8 * 3600 * 1000).toISOString();
+    const runningItem = { kind: "image", seq: 1, label: "图 1.1", page: 2,
+                          result: "running", started_at: oldStart, duration_ms: null };
+    const interruptedItem = { ...runningItem, seq: 2, result: "interrupted" };
+    const htmlStopped = SEG.renderImageItems([runningItem, interruptedItem], false);
+    check("中断任务:在途图片显示 —", (htmlStopped.match(/—/g) || []).length === 2
+      && !htmlStopped.includes("小时"));
+    const htmlActive = SEG.renderImageItems([runningItem], true);
+    check("运行中任务:在途图片现算耗时", htmlActive.includes("小时"));
+
     console.log(failures ? `\n${failures} 个失败` : "\n全部通过");
     process.exit(failures ? 1 : 0);
   })();

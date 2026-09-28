@@ -86,7 +86,7 @@ class _MinerUProgressAdapter:
             obs.item_end("mineru_chunk", index, pg.ITEM_OK, detail=detail)
         elif kind == "merge_end":
             obs.stage_start("mineru_merge", parent=pg.STAGE_PARSING)
-            # 合并耗时 = 全程(拆分+逐块往返+装配),用事件自带值
+            # 只含实际合并操作耗时(客户端逐块拼接时累计),用事件自带值
             obs.stage_end("mineru_merge", duration_ms=event.get("duration_ms"), counts={
                 "chunks": event.get("chunks"), "pages": event.get("pages")})
 
@@ -166,7 +166,7 @@ class IngestService:
         """任务结束输出一次简短汇总(父子阶段不重复求和)。"""
         if self._progress_store is None:
             return
-        detail = self._progress_store.detail(doc["tenant_id"], doc["id"])
+        detail = self._progress_store.detail(doc["tenant_id"], doc["id"], doc["status"])
         if not detail:
             return
         stages = {s["stage"]: s for s in detail["stages"]}

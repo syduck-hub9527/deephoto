@@ -485,6 +485,51 @@ class LateFixesTest(ProgressTestBase):
         count = self.prog._conn().execute("SELECT COUNT(*) c FROM runs").fetchone()["c"]
         self.assertEqual(count, 0)
 
+    def test_interrupt_marks_items_and_detail_uses_business_terminal(self):
+        # 旧实例中断:在途单项一并标记中断(不再"进行中"),未知耗时保持空
+        old = ProgressStore(Path(self.tmp.name) / "p3.db", instance_id="old",
+                            now=self.clock.wall, clock=self.clock.monotonic)
+        doc_id = self._new_doc()
+        old.register_run("run_old", doc_id, LOCAL_CTX.tenant_id)
+        old.claim_run("run_old")
+        observer = old.observer("run_old")
+        observer.stage_start(pg.STAGE_DESCRIBING, total=1)
+        observer.item_start("image", 1, label="图 1.1")
+        new = ProgressStore(Path(self.tmp.name) / "p3.db", instance_id="new",
+                            now=self.clock.wall, clock=self.clock.monotonic)
+        new.mark_interrupted()
+        detail = new.detail(LOCAL_CTX.tenant_id, doc_id, business_status="queued")
+        item = detail["items"][0]
+        self.assertEqual(item["result"], "interrupted")
+        self.assertIsNone(item["duration_ms"])            # 未知耗时显示未知,不虚涨
+        # 业务已终态、观测终态未写成功:详情与列表同一套终态判断
+        detail = new.detail(LOCAL_CTX.tenant_id, doc_id, business_status="ready")
+        self.assertEqual(detail["summary"]["state"], "succeeded")
+
+    def test_merge_end_measures_only_merge_work(self):
+        # 多块合并耗时只含拼接操作,不含拆分与各块往返(此前按整个解析计时)
+        import time as _time
+        from deephoto.parsing.mineru import MinerUClient
+        events = []
+        client = MinerUClient(api_key="tok", sleep=lambda s: None, on_progress=events.append)
+        chunks = [b"c0", b"c1"]
+
+        def slow_chunk(pdf, name):
+            _time.sleep(0.2)
+            return MinerUResult(page_texts=[f"{name}文本"], raw={}, elements=[])
+
+        client._parse_chunk = slow_chunk
+        import deephoto.parsing.mineru as m
+        orig = m.pdf_backend.chunk_pdf
+        m.pdf_backend.chunk_pdf = lambda b, n, *a, **k: chunks
+        try:
+            client.parse_pdf(b"%PDF big", "doc.pdf")
+        finally:
+            m.pdf_backend.chunk_pdf = orig
+        merge = next(e for e in events if e["type"] == "merge_end")
+        self.assertIsNotNone(merge["duration_ms"])
+        self.assertLess(merge["duration_ms"], 200)        # 各块往返共 0.4s,合并只有拼接
+
 
 if __name__ == "__main__":
     unittest.main()

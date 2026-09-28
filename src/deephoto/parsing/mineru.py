@@ -115,17 +115,20 @@ class MinerUClient:
         page_texts: list[str] = []
         elements: list[ContentElement] = []
         raws: list[dict[str, Any]] = []
+        merge_ms = 0          # 只累计实际合并操作耗时(不含拆分与各块网络往返)
         stem, dot, suffix = filename.rpartition(".")
         for index, chunk in enumerate(chunks):
             chunk_name = f"{stem}_part{index + 1}{dot}{suffix}" if dot else f"{filename}_part{index + 1}"
             self._chunk_index = index + 1
             result = self._parse_chunk(chunk, chunk_name)
+            clock = time.monotonic()
             offset = len(page_texts)          # 每块的 page_idx 都从 0 起,合并时按已有页数平移
             elements.extend(replace(el, page_idx=el.page_idx + offset) for el in result.elements)
             page_texts.extend(result.page_texts)
             raws.append(result.raw)
+            merge_ms += int((time.monotonic() - clock) * 1000)
         self._emit({"type": "merge_end", "chunks": len(chunks), "pages": len(page_texts),
-                    "duration_ms": int((time.monotonic() - started) * 1000)})
+                    "duration_ms": merge_ms})
         return MinerUResult(page_texts=page_texts, raw={"chunks": raws}, elements=elements)
 
     # ---- 内部:各步骤 ----

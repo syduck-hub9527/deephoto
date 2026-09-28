@@ -294,19 +294,29 @@ $("docList").addEventListener("click", e => {
   refreshProgDetail(id);
 });
 
+// 每个文档一个请求序号:慢响应回来时列表可能已重建节点/已有更新请求,
+// 只有最新请求才写入,且写入前重新获取当前节点
+const progDetailReq = {};
+
 async function refreshProgDetail(id) {
-  const panel = $("prog-" + id);
-  if (!panel || expandedDoc !== id) return;
-  if (!panel.dataset.loaded) panel.innerHTML = '<div class="doc-err" style="color:var(--muted)">加载中…</div>';
+  if (expandedDoc !== id) return;
+  const seq = (progDetailReq[id] = (progDetailReq[id] || 0) + 1);
+  const fresh = () => (expandedDoc === id && progDetailReq[id] === seq) ? $("prog-" + id) : null;
+  const panel = fresh();
+  if (panel && !panel.dataset.loaded) {
+    panel.innerHTML = '<div class="doc-err" style="color:var(--muted)">加载中…</div>';
+  }
   try {
     const r = await fetch("/api/documents/" + id);
     if (!r.ok) throw new Error("HTTP " + r.status);
     const j = await r.json();
-    if (expandedDoc !== id) return;
-    panel.dataset.loaded = "1";
-    panel.innerHTML = renderProgDetail(j.progress);
+    const target = fresh();
+    if (!target) return;
+    target.dataset.loaded = "1";
+    target.innerHTML = renderProgDetail(j.progress);
   } catch {
-    if (expandedDoc === id) panel.innerHTML = '<div class="doc-err">详情加载失败</div>';
+    const target = fresh();
+    if (target) target.innerHTML = '<div class="doc-err">详情加载失败</div>';
   }
 }
 
@@ -324,42 +334,9 @@ function renderProgDetail(p) {
       <td>${esc(state)}${stageCount(s)}</td><td>${SEG.formatElapsed(elapsed)}</td></tr>`;
   }).join("");
   const warns = (p.summary && p.summary.warnings || []).map(w => `<div class="doc-warn">⚠ ${esc(w)}</div>`).join("");
-  return `<table class="prog-table">${rows}</table>${renderChunks(p.items || [])}${renderImageItems(p.items || [])}${renderBatchItems(p.items || [])}${warns}`;
-}
-
-// MinerU 逐块往返:申请/上传/等待/下载分项,直接看出解析慢在哪一段
-function renderChunks(items) {
-  const chunks = items.filter(i => i.kind === "mineru_chunk");
-  if (!chunks.length) return "";
-  const rows = chunks.map(i => {
-    const d = i.detail || {};
-    return `<tr><td>第 ${i.seq} 部分</td><td>${esc(SEG.PROG_STAGE_STATE[i.result] || i.result)}</td>
-      <td>申请 ${SEG.formatElapsed(d.request_ms)} · 上传 ${SEG.formatElapsed(d.upload_ms)}<br>
-      等待 ${SEG.formatElapsed(d.wait_ms)} · 下载 ${SEG.formatElapsed(d.download_ms)}</td></tr>`;
-  }).join("");
-  return `<div class="prog-sub">云端解析逐块往返:</div><table class="prog-table">${rows}</table>`;
-}
-
-// 逐张图片:序号、图号、页码、耗时、结果(慢在哪张直接可见)
-function renderImageItems(items) {
-  const images = items.filter(i => i.kind === "image");
-  if (!images.length) return "";
-  const rows = images.map(i => `<tr><td>${esc(i.label || "第 " + i.seq + " 张")}</td>
-    <td>${i.page != null ? "p." + i.page : ""}</td>
-    <td>${esc(SEG.PROG_STAGE_STATE[i.result] || i.result)}</td>
-    <td>${SEG.formatElapsed(i.duration_ms != null ? i.duration_ms
-        : (i.started_at ? Date.now() - Date.parse(i.started_at) : null))}</td></tr>`).join("");
-  return `<div class="prog-sub">图片描述逐张结果:</div><table class="prog-table">${rows}</table>`;
-}
-
-// 向量逐批:实际条目数、耗时、是否降级
-function renderBatchItems(items) {
-  const batches = items.filter(i => i.kind === "embed_batch");
-  if (!batches.length) return "";
-  const rows = batches.map(i => `<tr><td>第 ${i.seq} 批</td><td>${i.count != null ? i.count + " 条" : ""}</td>
-    <td>${esc(SEG.PROG_STAGE_STATE[i.result] || i.result)}</td>
-    <td>${SEG.formatElapsed(i.duration_ms)}</td></tr>`).join("");
-  return `<div class="prog-sub">向量逐批结果:</div><table class="prog-table">${rows}</table>`;
+  return `<table class="prog-table">${rows}</table>` +
+    SEG.renderChunks(p.items || []) + SEG.renderImageItems(p.items || [], runActive) +
+    SEG.renderBatchItems(p.items || []) + warns;
 }
 
 function stageCount(s) {

@@ -70,8 +70,9 @@ def document_detail(request: Request, document_id: str, ctx: AuthContext = CtxDe
     doc.pop("pdf_object_key", None)
     progress = getattr(request.app.state, "progress_store", None)
     if progress is not None:
-        # 归属校验(上方 get_owned_document)之后再读同 tenant 的观测数据
-        doc["progress"] = progress.detail(ctx.tenant_id, document_id)
+        # 归属校验(上方 get_owned_document)之后再读同 tenant 的观测数据;
+        # 传入真实业务状态,与列表接口共用同一套终态判断
+        doc["progress"] = progress.detail(ctx.tenant_id, document_id, doc["status"])
     else:
         doc["progress"] = None
     return doc
