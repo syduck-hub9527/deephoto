@@ -327,27 +327,45 @@
   /* 文档耗时详情加载器:
    * - 同一文档只允许一个请求在途,期间 refresh 不再重复发送(慢于轮询周期也不会堆积);
    * - 最近一次成功内容入缓存,列表重建时直接复用,不再每轮回退到"加载中…";
+   * - 失败状态按文档持久保存:列表重建、收起再展开、重试在途都不提前清除,
+   *   只有成功获得新详情后才清除(否则用户会把旧内容误认为最新结果);
    * - 响应回来后由调用方写入当前节点;切换展开文档后,旧请求结果只进缓存不渲染。 */
   function createProgDetailLoader(opts) {
     let expandedId = null;
     const inflight = new Set();
     const cache = new Map();
+    const errors = new Set();
     function expanded(id) { expandedId = id; }      // null 表示收起
     function cachedHtml(id) { return cache.get(id) || null; }
+    function hasError(id) { return errors.has(id); }
+
+    // 错误回调与列表重建共用的渲染出口(三态:失败+缓存 / 失败无缓存 / 加载中)
+    function innerHtml(id) {
+      const cached = cache.get(id);
+      if (errors.has(id)) {
+        return cached
+          ? '<div class="doc-err">详情刷新失败,显示上次内容</div>' + cached
+          : '<div class="doc-err">详情加载失败</div>';
+      }
+      return cached || '<div class="doc-err" style="color:var(--muted)">加载中…</div>';
+    }
+
     async function refresh(id) {
       if (expandedId !== id || inflight.has(id)) return;
       inflight.add(id);
       try {
         const html = await opts.fetchDetail(id);
         cache.set(id, html);
+        errors.delete(id);                       // 只有成功获得新详情才清除失败状态
         if (expandedId === id) opts.onRender(id, html);
       } catch (e) {
+        errors.add(id);                          // 失败状态与旧缓存共存
         if (expandedId === id && opts.onError) opts.onError(id, e);   // 文档 ID 与异常一起回传
       } finally {
         inflight.delete(id);
       }
     }
-    return { expanded, refresh, cachedHtml,
+    return { expanded, refresh, cachedHtml, hasError, innerHtml,
              get inflightCount() { return inflight.size; } };
   }
 

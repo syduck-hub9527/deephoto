@@ -281,7 +281,7 @@ function fmtClock(dt) {
 }
 
 // 耗时详情加载器:同一文档在途请求唯一;缓存上次内容,列表重建不清空;
-// 响应回来写入当前节点;切换展开文档后旧请求结果不渲染
+// 失败状态按文档持久保存(见 loader.innerHtml);切换展开文档后旧请求结果不渲染
 const detailLoader = SEG.createProgDetailLoader({
   fetchDetail: async (id) => {
     const r = await fetch("/api/documents/" + id);
@@ -289,21 +289,11 @@ const detailLoader = SEG.createProgDetailLoader({
     return renderProgDetail((await r.json()).progress);
   },
   onRender: (id, html) => { const panel = $("prog-" + id); if (panel) panel.innerHTML = html; },
-  onError: (id, err) => {
-    const panel = $("prog-" + id);
-    if (!panel) return;
-    const cached = detailLoader.cachedHtml(id);
-    // 有缓存时保留上次内容并提示刷新失败;无缓存才显示加载失败
-    panel.innerHTML = cached
-      ? '<div class="doc-err">详情刷新失败,显示上次内容</div>' + cached
-      : '<div class="doc-err">详情加载失败</div>';
-  },
+  // 与列表重建共用同一渲染出口:失败提示/旧内容/加载中三态由 loader.innerHtml 决定
+  onError: (id) => { const panel = $("prog-" + id); if (panel) panel.innerHTML = detailLoader.innerHtml(id); },
 });
 
-function detailInnerHtml(id) {
-  return detailLoader.cachedHtml(id)
-    || '<div class="doc-err" style="color:var(--muted)">加载中…</div>';
-}
+function detailInnerHtml(id) { return detailLoader.innerHtml(id); }
 
 // 展开/收起耗时详情(事件委托;只有展开时才请求细分项)
 $("docList").addEventListener("click", e => {

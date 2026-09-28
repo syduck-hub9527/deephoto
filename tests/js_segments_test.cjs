@@ -340,6 +340,28 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
       flip = true;
       await flaky.refresh("docY");
       check("失败后缓存保留", flaky.cachedHtml("docY").includes("旧内容"));
+
+      // 失败状态持久化矩阵(详情刷新失败提示不被列表重建清除)
+      // 1) 无缓存失败后:innerHtml 显示失败提示,不再是"加载中"
+      check("无缓存失败:innerHtml 显示失败提示", failing.innerHtml("docX").includes("详情加载失败")
+        && !failing.innerHtml("docX").includes("加载中"));
+      // 2) 有缓存失败后:显示提示及旧内容
+      check("有缓存失败:提示及旧内容", flaky.innerHtml("docY").includes("详情刷新失败")
+        && flaky.innerHtml("docY").includes("旧内容"));
+      // 3) 收起再展开:失败状态不丢
+      flaky.expanded(null);
+      check("收起后失败状态仍在", flaky.hasError("docY"));
+      flaky.expanded("docY");
+      check("再展开仍显示提示及旧内容", flaky.innerHtml("docY").includes("详情刷新失败"));
+      // 4) 成功重试后:错误提示消失并显示新内容
+      flip = false;
+      await flaky.refresh("docY");
+      check("成功重试后错误清除", !flaky.hasError("docY")
+        && !flaky.innerHtml("docY").includes("详情刷新失败")
+        && flaky.innerHtml("docY").includes("旧内容"));
+      // 5) 不同文档的失败状态互不影响
+      check("失败状态按文档隔离", !flaky.hasError("docX") && failing.hasError("docX")
+        && !failing.hasError("docY"));
     }
 
     console.log(failures ? `\n${failures} 个失败` : "\n全部通过");
