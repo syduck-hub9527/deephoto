@@ -45,6 +45,16 @@ class ChunkingTest(unittest.TestCase):
             self.assertTrue(piece.endswith("。"))
             self.assertLessEqual(len(piece), 900)
 
+    def test_split_keeps_space_after_english_period(self):
+        # 回归:曾因正则消耗了句号后的空白,得到 "wafer.Photolithography" 这样的粘连词,
+        # 且 BM25 分词会把它当成一个词,导致英文检索失效
+        text = "Photolithography transfers the mask pattern onto the wafer. " * 30
+        pieces = split_long_text(text, limit=900)
+        self.assertGreater(len(pieces), 1)
+        self.assertEqual(" ".join(pieces).split(), text.split())      # 不丢词、词间空白保留
+        for piece in pieces:
+            self.assertNotIn("wafer.Photolithography", piece)
+
     def test_split_hard_cuts_punctuation_free_text(self):
         pieces = split_long_text("字" * 2500, limit=900)
         self.assertEqual([len(x) for x in pieces], [900, 900, 700])

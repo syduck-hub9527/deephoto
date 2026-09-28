@@ -9,7 +9,7 @@
 
 | 文档部件 | 实现 |
 | --- | --- |
-| Deep Agents 问答智能体 | `agent/qa.py`:`create_deep_agent` + `search_knowledge` / `inspect_image` |
+| Deep Agents 问答智能体 | `agent/qa.py`:`create_deep_agent` + `search_knowledge` / `read_chunk` / `inspect_image` |
 | PDF 版面解析器 | `parsing/pymupdf_parser.py`(默认),协议见 `parsing/base.py`,可换 Docling |
 | 多模态模型 | Kimi K3(`llm.py`,OpenAI 兼容接口,base64 图片输入) |
 | 对象存储 | `storage.py`:本地文件系统内容寻址(sha256) |
