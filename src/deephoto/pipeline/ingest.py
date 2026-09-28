@@ -57,7 +57,8 @@ class _MinerUProgressAdapter:
         obs = self._observer
         if kind == "split":
             obs.stage_start("mineru_split", parent=pg.STAGE_PARSING)
-            obs.stage_end("mineru_split", counts={
+            # 拆分/合并事件自带真实耗时(客户端已计时),不能让 stage_start/end 连记成 0
+            obs.stage_end("mineru_split", duration_ms=event.get("duration_ms"), counts={
                 "pages": event.get("pages"), "bytes": event.get("bytes"),
                 "chunks": event.get("chunks")})
         elif kind == "chunk_start":
@@ -85,7 +86,8 @@ class _MinerUProgressAdapter:
             obs.item_end("mineru_chunk", index, pg.ITEM_OK, detail=detail)
         elif kind == "merge_end":
             obs.stage_start("mineru_merge", parent=pg.STAGE_PARSING)
-            obs.stage_end("mineru_merge", counts={
+            # 合并耗时 = 全程(拆分+逐块往返+装配),用事件自带值
+            obs.stage_end("mineru_merge", duration_ms=event.get("duration_ms"), counts={
                 "chunks": event.get("chunks"), "pages": event.get("pages")})
 
 

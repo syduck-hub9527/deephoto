@@ -270,6 +270,7 @@
     let timer = null, inflight = false, running = false;
     async function tick() {
       if (!running || inflight) return;
+      if (timer !== null) { clearT(timer); timer = null; }   // 立即刷新前先取消待触发定时器:调度始终只有一条
       inflight = true;
       let cont = true;
       try { cont = await opts.load(); }

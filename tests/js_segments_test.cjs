@@ -260,6 +260,25 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
     check("轮询:在途请求不并发", maxConcurrent === 1);
     resolveBlock(); p3.stop();
 
+    // 手动立即刷新:已有待触发定时器时先取消,调度仍只有一条
+    let loads4 = 0;
+    const p4 = SEG.createDocPoller({ interval: 10, setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout,
+      load: async () => { loads4++; return true; } });
+    p4.start();
+    await new Promise(r => setImmediate(r));
+    check("轮询:一拍后有一个待触发定时器", timers.length === 1);
+    p4.tick();                                   // 手动刷新
+    await new Promise(r => setImmediate(r));
+    check("轮询:手动刷新后仍只有一个定时器", timers.length === 1 && loads4 === 2);
+    p4.stop();
+
+    // P1 回归:docPoller 必须先定义后启动(暂时性死区曾中断整个页面初始化)
+    const fs = require("fs");
+    const html = fs.readFileSync(__dirname + "/../src/deephoto/web/index.html", "utf-8");
+    const defAt = html.indexOf("const docPoller =");
+    const startAt = html.indexOf("docPoller.start()");
+    check("P1: docPoller 定义在首次启动之前", defAt > 0 && startAt > defAt);
+
     console.log(failures ? `\n${failures} 个失败` : "\n全部通过");
     process.exit(failures ? 1 : 0);
   })();

@@ -119,13 +119,17 @@ class ProgressStore:
             logger.warning("入库观测%s失败(已忽略,不影响业务): %s: %s", what, type(exc).__name__, exc)
 
     def _write(self, what: str, fn) -> bool:
-        """短事务写入;失败节流告警并返回 False。"""
+        """短事务写入;失败回滚并节流告警,返回 False。绝不打断业务。"""
         try:
             conn = self._conn()
             fn(conn)
             conn.commit()
             return True
         except (sqlite3.Error, OSError) as exc:
+            try:
+                conn.rollback()
+            except (sqlite3.Error, OSError, UnboundLocalError):
+                pass
             self._write_failed(what, exc)
             return False
 
@@ -357,25 +361,34 @@ class RunObserver:
         self._log.info("stage start: run=%s stage=%s total=%s", self._run_id, stage, total)
 
     def stage_end(self, stage: str, result: str = pg.RESULT_SUCCEEDED, *,
-                  counts: dict | None = None, detail: dict | None = None) -> None:
+                  counts: dict | None = None, detail: dict | None = None,
+                  duration_ms: int | None = None) -> None:
         store = self._store
         now = store._iso()
-        duration = self._duration(self._stage_clock.pop(stage, None))
+        if duration_ms is None:
+            duration_ms = self._duration(self._stage_clock.pop(stage, None))
+        else:
+            self._stage_clock.pop(stage, None)
         started = store._stage_started_at(self._run_id, stage)
 
         def op(conn):
+            parent = conn.execute(
+                "SELECT parent FROM stages WHERE run_id = ? AND stage = ?",
+                (self._run_id, stage)).fetchone()
             conn.execute(
                 "UPDATE stages SET finished_at = ?, duration_ms = ?, result = ?,"
                 " counts = COALESCE(?, counts), detail = COALESCE(?, detail)"
                 " WHERE run_id = ? AND stage = ?",
-                (now, duration if duration is not None else pg.elapsed_ms(started, now), result,
+                (now, duration_ms if duration_ms is not None else pg.elapsed_ms(started, now), result,
                  json.dumps(counts, ensure_ascii=False) if counts else None,
                  json.dumps(detail, ensure_ascii=False) if detail else None,
                  self._run_id, stage))
-            conn.execute("UPDATE runs SET last_event_at = ? WHERE run_id = ?", (now, self._run_id))
+            # 子阶段结束后把当前阶段恢复给父级(否则云端等待期间仍显示"读取与拆分")
+            conn.execute("UPDATE runs SET current_stage = ?, last_event_at = ? WHERE run_id = ?",
+                     (parent["parent"] if parent else None, now, self._run_id))
         store._write("阶段结束", op)
         self._log.info("stage end: run=%s stage=%s result=%s duration_ms=%s",
-                       self._run_id, stage, result, duration)
+                       self._run_id, stage, result, duration_ms)
 
     # -- 单项 --
 
@@ -400,22 +413,25 @@ class RunObserver:
 
     def item_update(self, kind: str, seq: int, *, label: str | None = None,
                     detail: dict | None = None) -> None:
-        """在途更新(如云端轮询状态):刷新摘要,不结束单项。"""
+        """在途更新(如云端轮询状态):刷新摘要,不结束单项。
+        当前单项保留原始开始时间——轮询只更新状态与最近事件时间,不重设计时。"""
         store = self._store
         now = store._iso()
 
         def op(conn):
+            row = conn.execute(
+                "SELECT detail, started_at FROM items WHERE run_id = ? AND kind = ? AND seq = ?",
+                (self._run_id, kind, seq)).fetchone()
             if detail:
-                old = conn.execute(
-                    "SELECT detail FROM items WHERE run_id = ? AND kind = ? AND seq = ?",
-                    (self._run_id, kind, seq)).fetchone()
-                merged = {**(_json(old["detail"] if old else None) or {}), **detail}
+                merged = {**(_json(row["detail"] if row else None) or {}), **detail}
                 conn.execute(
                     "UPDATE items SET detail = ? WHERE run_id = ? AND kind = ? AND seq = ?",
                     (json.dumps(merged, ensure_ascii=False), self._run_id, kind, seq))
             if label:
-                current = json.dumps({"index": seq, "label": label, "started_at": now},
-                                     ensure_ascii=False)
+                current = json.dumps(
+                    {"index": seq, "label": label,
+                     "started_at": (row["started_at"] if row else None) or now},
+                    ensure_ascii=False)
                 conn.execute("UPDATE runs SET current_item = ?, last_event_at = ? WHERE run_id = ?",
                              (current, now, self._run_id))
             else:
@@ -430,6 +446,8 @@ class RunObserver:
         duration = self._duration(self._item_clock.pop((kind, seq), None))
 
         def op(conn):
+            if not store._run_exists(conn, self._run_id):
+                return   # 文档已删除:迟到回调不重建、不抛错
             detail_json = None
             if detail:
                 # 与在途更新(request/upload/poll 等)合并,不能整段覆盖
@@ -444,8 +462,9 @@ class RunObserver:
                 " WHERE run_id = ? AND kind = ? AND seq = ?",
                 (now, duration, result, count, error_kind, detail_json,
                  self._run_id, kind, seq))
-            counts = _bump_counts(_json(conn.execute(
-                "SELECT counts FROM runs WHERE run_id = ?", (self._run_id,)).fetchone()["counts"]), result)
+            counts_row = conn.execute(
+                "SELECT counts FROM runs WHERE run_id = ?", (self._run_id,)).fetchone()
+            counts = _bump_counts(_json(counts_row["counts"] if counts_row else None), result)
             if counts is not None:
                 # 进度计数同步到在途阶段(单项都属于某个带 total 的阶段)
                 conn.execute(
@@ -464,8 +483,11 @@ class RunObserver:
         store = self._store
 
         def op(conn):
-            warnings = _json(conn.execute(
-                "SELECT warnings FROM runs WHERE run_id = ?", (self._run_id,)).fetchone()["warnings"]) or []
+            row = conn.execute(
+                "SELECT warnings FROM runs WHERE run_id = ?", (self._run_id,)).fetchone()
+            if row is None:
+                return   # 文档已删除:迟到回调不重建、不抛错
+            warnings = _json(row["warnings"]) or []
             if message not in warnings:
                 warnings.append(message)
             conn.execute("UPDATE runs SET warnings = ?, last_event_at = ? WHERE run_id = ?",
@@ -473,17 +495,31 @@ class RunObserver:
         store._write("记录警告", op)
 
     def finish(self, result: str) -> None:
-        """任务终态(业务提交成功后记录);失败时在途阶段一并收尾为 failed。"""
+        """任务终态(业务提交成功后记录);失败时在途阶段/单项以真实耗时收尾为 failed,
+        无法确定的一律不填假 0。"""
         store = self._store
         now = store._iso()
 
         def op(conn):
+            if not store._run_exists(conn, self._run_id):
+                return
             if result == pg.RESULT_FAILED:
-                conn.execute(
-                    "UPDATE stages SET finished_at = COALESCE(finished_at, ?),"
-                    " duration_ms = COALESCE(duration_ms, 0), result = ?"
-                    " WHERE run_id = ? AND result = 'running'",
-                    (now, pg.RESULT_FAILED, self._run_id))
+                for stage in conn.execute(
+                        "SELECT stage, started_at FROM stages WHERE run_id = ? AND result = 'running'",
+                        (self._run_id,)).fetchall():
+                    conn.execute(
+                        "UPDATE stages SET finished_at = ?, duration_ms = ?, result = ?"
+                        " WHERE run_id = ? AND stage = ?",
+                        (now, pg.elapsed_ms(stage["started_at"], now), pg.RESULT_FAILED,
+                         self._run_id, stage["stage"]))
+                for item in conn.execute(
+                        "SELECT kind, seq, started_at FROM items WHERE run_id = ? AND result = 'running'",
+                        (self._run_id,)).fetchall():
+                    conn.execute(
+                        "UPDATE items SET finished_at = ?, duration_ms = ?, result = ?"
+                        " WHERE run_id = ? AND kind = ? AND seq = ?",
+                        (now, pg.elapsed_ms(item["started_at"], now), pg.RESULT_FAILED,
+                         self._run_id, item["kind"], item["seq"]))
             conn.execute(
                 "UPDATE runs SET result = ?, finished_at = ?, current_stage = NULL,"
                 " current_item = NULL, last_event_at = ? WHERE run_id = ?",

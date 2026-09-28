@@ -205,7 +205,7 @@ initTheme();
 messages = SEG.restoreMessages(JSON.parse(localStorage.getItem("deephoto_chat") || "[]"));
 localStorage.setItem("deephoto_chat", JSON.stringify(messages.slice(-60)));   // 持久化补齐的消息 ID
 renderThread();
-docPoller.start();
+// docPoller 在下方"文档库"一节定义后才启动(const 暂时性死区:提前调用会中断整个初始化)
 
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
@@ -254,6 +254,8 @@ function refreshDocs(immediate) {
   docPoller.start();                 // 已停止(全终态)时重新启动;运行中不叠加
   if (immediate) docPoller.tick();   // 上传/删除后立即刷新一次
 }
+
+docPoller.start();   // 启动轮询(定义之后;全部终态时会自行停止,由 refreshDocs 再唤醒)
 
 function renderDocs() {
   const scope = localStorage.getItem("deephoto_scope") || "";
@@ -311,20 +313,53 @@ async function refreshProgDetail(id) {
 function renderProgDetail(p) {
   if (!p) return '<div class="doc-err" style="color:var(--muted)">无本次耗时记录</div>';
   const names = p.stage_names || {};
+  const runActive = p.summary && p.summary.state === "running";
   const rows = (p.stages || []).map(s => {
     const state = SEG.PROG_STAGE_STATE[s.result] || s.result;
-    // 进行中的阶段在浏览器按 started_at 现算已等待;终态用服务端 duration_ms
+    // 仅"运行中的任务且该阶段仍在进行"才按 started_at 现算已等待;
+    // 终态用服务端 duration_ms;中断且耗时未知的显示 —,不随时间虚涨
     const elapsed = s.duration_ms != null ? s.duration_ms
-      : (s.started_at ? Date.now() - Date.parse(s.started_at) : null);
+      : (runActive && s.result === "running" && s.started_at ? Date.now() - Date.parse(s.started_at) : null);
     return `<tr><td>${esc(s.display_name || names[s.stage] || s.stage)}</td>
       <td>${esc(state)}${stageCount(s)}</td><td>${SEG.formatElapsed(elapsed)}</td></tr>`;
   }).join("");
-  const slow = (p.slowest || []).filter(i => i.kind === "image" || i.kind === "embed_batch");
-  const slowHtml = slow.length
-    ? `<div class="prog-sub">最慢单项:</div><ul class="prog-slow">` + slow.map(i =>
-        `<li>${esc(i.label || i.kind)} · ${SEG.formatElapsed(i.duration_ms)}${i.result !== "ok" ? " · " + esc(SEG.PROG_STAGE_STATE[i.result] || i.result) : ""}</li>`).join("") + `</ul>` : "";
   const warns = (p.summary && p.summary.warnings || []).map(w => `<div class="doc-warn">⚠ ${esc(w)}</div>`).join("");
-  return `<table class="prog-table">${rows}</table>${slowHtml}${warns}`;
+  return `<table class="prog-table">${rows}</table>${renderChunks(p.items || [])}${renderImageItems(p.items || [])}${renderBatchItems(p.items || [])}${warns}`;
+}
+
+// MinerU 逐块往返:申请/上传/等待/下载分项,直接看出解析慢在哪一段
+function renderChunks(items) {
+  const chunks = items.filter(i => i.kind === "mineru_chunk");
+  if (!chunks.length) return "";
+  const rows = chunks.map(i => {
+    const d = i.detail || {};
+    return `<tr><td>第 ${i.seq} 部分</td><td>${esc(SEG.PROG_STAGE_STATE[i.result] || i.result)}</td>
+      <td>申请 ${SEG.formatElapsed(d.request_ms)} · 上传 ${SEG.formatElapsed(d.upload_ms)}<br>
+      等待 ${SEG.formatElapsed(d.wait_ms)} · 下载 ${SEG.formatElapsed(d.download_ms)}</td></tr>`;
+  }).join("");
+  return `<div class="prog-sub">云端解析逐块往返:</div><table class="prog-table">${rows}</table>`;
+}
+
+// 逐张图片:序号、图号、页码、耗时、结果(慢在哪张直接可见)
+function renderImageItems(items) {
+  const images = items.filter(i => i.kind === "image");
+  if (!images.length) return "";
+  const rows = images.map(i => `<tr><td>${esc(i.label || "第 " + i.seq + " 张")}</td>
+    <td>${i.page != null ? "p." + i.page : ""}</td>
+    <td>${esc(SEG.PROG_STAGE_STATE[i.result] || i.result)}</td>
+    <td>${SEG.formatElapsed(i.duration_ms != null ? i.duration_ms
+        : (i.started_at ? Date.now() - Date.parse(i.started_at) : null))}</td></tr>`).join("");
+  return `<div class="prog-sub">图片描述逐张结果:</div><table class="prog-table">${rows}</table>`;
+}
+
+// 向量逐批:实际条目数、耗时、是否降级
+function renderBatchItems(items) {
+  const batches = items.filter(i => i.kind === "embed_batch");
+  if (!batches.length) return "";
+  const rows = batches.map(i => `<tr><td>第 ${i.seq} 批</td><td>${i.count != null ? i.count + " 条" : ""}</td>
+    <td>${esc(SEG.PROG_STAGE_STATE[i.result] || i.result)}</td>
+    <td>${SEG.formatElapsed(i.duration_ms)}</td></tr>`).join("");
+  return `<div class="prog-sub">向量逐批结果:</div><table class="prog-table">${rows}</table>`;
 }
 
 function stageCount(s) {

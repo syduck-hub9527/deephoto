@@ -427,5 +427,64 @@ class SlowCallVisibleTest(ProgressTestBase):
         self.assertEqual(repo.get_document(self.conn, doc_id)["status"], "ready")
 
 
+class LateFixesTest(ProgressTestBase):
+    """评审修复回归:轮询计时不归零、拆分/合并真实耗时、失败收尾、迟到回调不抛错。"""
+
+    def test_poll_updates_preserve_original_start(self):
+        # 模拟云端等待 120 秒:轮询只更新状态,当前单项已等待仍按原始开始时间累计
+        doc_id = self._new_doc()
+        self.prog.register_run("run_1", doc_id, LOCAL_CTX.tenant_id)
+        observer = self.prog.observer("run_1")
+        observer.item_start("mineru_chunk", 1, label="第 1 部分")
+        self.clock.sleep(120.0)
+        observer.item_update("mineru_chunk", 1, label="第 1 部分 · 云端解析",
+                             detail={"last_state": "running", "polls": 40})
+        summary = self.prog.summaries(LOCAL_CTX.tenant_id, [{"id": doc_id, "status": "parsing"}])[doc_id]
+        self.assertEqual(summary["current_item"]["elapsed_ms"], 120_000)
+
+    def test_split_uses_event_duration_and_restores_parent_stage(self):
+        doc_id = self._new_doc()
+        self.prog.register_run("run_1", doc_id, LOCAL_CTX.tenant_id)
+        observer = self.prog.observer("run_1")
+        observer.stage_start(pg.STAGE_PARSING)
+        from deephoto.pipeline.ingest import _MinerUProgressAdapter
+        adapter = _MinerUProgressAdapter(observer)
+        adapter({"type": "split", "pages": 7, "bytes": 1000, "chunks": 1, "duration_ms": 8000})
+        stages = self._stages(doc_id)
+        self.assertEqual(stages["mineru_split"]["duration_ms"], 8000)     # 事件自带耗时,不记 0
+        run = self.prog._latest_run(LOCAL_CTX.tenant_id, doc_id)
+        self.assertEqual(run["current_stage"], "parsing")                 # 子阶段结束恢复父级
+
+    def test_failed_run_ends_in_flight_stage_and_item_with_real_duration(self):
+        doc_id = self._new_doc()
+        self.prog.register_run("run_1", doc_id, LOCAL_CTX.tenant_id)
+        observer = self.prog.observer("run_1")
+        observer.stage_start(pg.STAGE_DESCRIBING, total=2)
+        observer.item_start("image", 1, label="图 1.1")
+        self.clock.sleep(42.0)
+        observer.finish(pg.RESULT_FAILED)
+        detail = self._detail(doc_id)
+        stage = {s["stage"]: s for s in detail["stages"]}["describing"]
+        self.assertEqual((stage["result"], stage["duration_ms"]), ("failed", 42_000))   # 不填假 0
+        item = detail["items"][0]
+        self.assertEqual((item["result"], item["duration_ms"]), ("failed", 42_000))     # 单项不再显示进行中
+
+    def test_late_callbacks_after_cleanup_do_not_raise_or_recreate(self):
+        doc_id = self._new_doc()
+        self.prog.register_run("run_1", doc_id, LOCAL_CTX.tenant_id)
+        observer = self.prog.observer("run_1")
+        observer.stage_start(pg.STAGE_DESCRIBING, total=1)
+        observer.item_start("image", 1, label="图 1.1")
+        self.prog.cleanup_documents([doc_id])
+        # 单项结束/警告/终态在记录清理后必须安静无副作用(观测不能干扰业务)
+        observer.item_end("image", 1, pg.ITEM_ERROR, error_kind="RuntimeError")
+        observer.warn("迟到警告")
+        observer.stage_end(pg.STAGE_DESCRIBING, pg.RESULT_FAILED)
+        observer.finish(pg.RESULT_FAILED)
+        self.assertIsNone(self._detail(doc_id))
+        count = self.prog._conn().execute("SELECT COUNT(*) c FROM runs").fetchone()["c"]
+        self.assertEqual(count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
