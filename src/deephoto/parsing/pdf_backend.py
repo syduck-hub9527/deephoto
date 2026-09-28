@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-# 渲染分辨率:150 DPI 足够页预览与喂给 OCR
+# 渲染分辨率:150 DPI 足够页预览
 _RENDER_DPI = 150
 
 _pdftotext = shutil.which("pdftotext")

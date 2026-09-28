@@ -1,18 +1,17 @@
-"""文档路由:上传、状态、图片与页面资源(带鉴权/签名)。
+"""文档路由:上传、状态、图片与页面资源。
 
-对应开发文档§3.1、§5.3:图片接口再次检查权限,
-不允许靠猜测 image_occurrence_id 获取其他文档图片。
+本地单机部署,无鉴权;租户隔离结构保留(固定租户,见 security.LOCAL_CTX)。
 """
 
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 
 from .. import repo
-from ..security import AuthContext, verify_resource_signature
+from ..security import AuthContext
 from .deps import CtxDep, conn_for
 
 logger = logging.getLogger(__name__)
@@ -71,30 +70,11 @@ def delete_document(request: Request, document_id: str, ctx: AuthContext = CtxDe
     return {"deleted": document_id}
 
 
-# ---- 图片与页面资源:Bearer 鉴权或短时签名 URL 二选一 ----
-
-def _authorize_resource(request: Request, conn, document_id: str, resource: str,
-                        expires: int | None, sig: str | None) -> None:
-    settings = request.app.state.settings
-    if expires and sig:
-        if verify_resource_signature(settings.secret_key, document_id, resource, expires, sig):
-            return
-        raise HTTPException(status_code=403, detail="签名无效或已过期")
-    # 无签名则要求 Bearer 鉴权 + 租户归属
-    authorization = request.headers.get("authorization", "")
-    if authorization.lower().startswith("bearer "):
-        from ..security import resolve_token
-        ctx = resolve_token(conn, authorization.split(None, 1)[1].strip())
-        if ctx and repo.get_owned_document(conn, document_id, ctx.tenant_id):
-            return
-    raise HTTPException(status_code=401, detail="需要 Bearer 令牌或有效签名")
-
+# ---- 图片与页面资源 ----
 
 @router.get("/{document_id}/images/{occurrence_id}")
-def get_image(request: Request, document_id: str, occurrence_id: str,
-              expires: int | None = Query(default=None), sig: str | None = Query(default=None)):
+def get_image(request: Request, document_id: str, occurrence_id: str):
     conn = conn_for(request)
-    _authorize_resource(request, conn, document_id, f"images/{occurrence_id}", expires, sig)
     occ = repo.get_occurrence(conn, occurrence_id)
     if occ is None or occ["document_id"] != document_id:
         raise HTTPException(status_code=404, detail="图片不存在")
@@ -105,10 +85,8 @@ def get_image(request: Request, document_id: str, occurrence_id: str,
 
 
 @router.get("/{document_id}/pages/{page_number}")
-def get_page_preview(request: Request, document_id: str, page_number: int,
-                     expires: int | None = Query(default=None), sig: str | None = Query(default=None)):
+def get_page_preview(request: Request, document_id: str, page_number: int):
     conn = conn_for(request)
-    _authorize_resource(request, conn, document_id, f"pages/{page_number}", expires, sig)
     doc = repo.get_document(conn, document_id)
     if doc is None or page_number < 1 or (doc["page_count"] and page_number > doc["page_count"]):
         raise HTTPException(status_code=404, detail="页面不存在")

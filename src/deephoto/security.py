@@ -1,17 +1,14 @@
-"""开发级鉴权:Bearer 令牌 -> 请求上下文(tenant_id / user_id)。
+"""本地单机部署的身份上下文与 ID 生成。
 
-生产环境应替换为真实身份系统;但权限过滤边界(tenant 隔离、
-文档归属校验)在本模块之后的所有层都已按多租户实现。
+项目仅本人在本地访问,无鉴权:所有请求归属同一个固定租户。
+tenant_id 沿用历史 bootstrap 默认值 "default",已有数据库中的文档保持可见。
+历史库中残留的 users 表与令牌字段不再使用。
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import time
 import uuid
 from dataclasses import dataclass
-from sqlite3 import Connection
 
 
 @dataclass(frozen=True)
@@ -20,44 +17,9 @@ class AuthContext:
     user_id: str
 
 
+# 固定租户上下文:所有请求共享,不再校验任何令牌。
+LOCAL_CTX = AuthContext(tenant_id="default", user_id="admin")
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:24]}"
-
-
-def ensure_bootstrap_user(conn: Connection, tenant_id: str, user_name: str, token: str) -> None:
-    """启动时种入开发用户(幂等)。"""
-    row = conn.execute("SELECT id FROM users WHERE token = ?", (token,)).fetchone()
-    if row:
-        return
-    conn.execute(
-        "INSERT INTO users (id, tenant_id, name, token, created_at) VALUES (?,?,?,?,?)",
-        (new_id("usr"), tenant_id, user_name, token, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
-    )
-    conn.commit()
-
-
-def resolve_token(conn: Connection, token: str) -> AuthContext | None:
-    row = conn.execute("SELECT id, tenant_id FROM users WHERE token = ?", (token,)).fetchone()
-    if row is None:
-        return None
-    return AuthContext(tenant_id=row["tenant_id"], user_id=row["id"])
-
-
-# ---- 短时签名图片 URL(能力凭证,供前端 <img> 直接使用)----
-
-def sign_resource(secret_key: str, document_id: str, resource: str, ttl_seconds: int = 600) -> tuple[int, str]:
-    """返回 (过期时间戳, 签名)。resource 形如 'images/occ_xxx' 或 'pages/4'。"""
-    expires = int(time.time()) + ttl_seconds
-    payload = f"{document_id}:{resource}:{expires}"
-    sig = hmac.new(secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
-    return expires, sig
-
-
-def verify_resource_signature(
-    secret_key: str, document_id: str, resource: str, expires: int, sig: str
-) -> bool:
-    if int(time.time()) > expires:
-        return False
-    payload = f"{document_id}:{resource}:{expires}"
-    expected = hmac.new(secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
-    return hmac.compare_digest(expected, sig)

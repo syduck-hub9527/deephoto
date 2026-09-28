@@ -34,23 +34,14 @@ class Settings:
     embedding_api_key: str | None
     embedding_model: str | None
 
-    # 安全
-    secret_key: str
-    bootstrap_token: str
-    bootstrap_tenant: str
-    bootstrap_user: str
-
     # 存储
     data_dir: Path
     max_upload_mb: int
     ingestion_version: str
 
-    # OCR 配置(租户设置可在运行时覆盖这些默认值)
-    ocr_provider: str = "third_party"
-    ocr_model: str = ""
-    ocr_base_url: str | None = None
-    ocr_api_key: str | None = None
-    ocr_timeout_seconds: float = 60.0
+    # MinerU 云端解析:唯一的 PDF 解析器,写死不可选;Token 仅由服务端环境变量提供
+    mineru_api_key: str | None = None
+    mineru_base_url: str | None = None
 
     @property
     def embeddings_enabled(self) -> bool:
@@ -64,17 +55,6 @@ class Settings:
     def object_dir(self) -> Path:
         return self.data_dir / "objects"
 
-    @property
-    def ocr_defaults(self) -> dict[str, object]:
-        """返回 OCR 的环境变量默认值,供租户设置存储层合并使用。"""
-        return {
-            "provider": self.ocr_provider,
-            "model": self.ocr_model,
-            "base_url": self.ocr_base_url,
-            "api_key": self.ocr_api_key,
-            "timeout_seconds": self.ocr_timeout_seconds,
-        }
-
 
 def load_settings() -> Settings:
     """从环境变量加载配置。支持 .env 文件(简单解析,不引入额外依赖)。"""
@@ -87,18 +67,11 @@ def load_settings() -> Settings:
         embedding_base_url=_get("EMBEDDING_BASE_URL"),
         embedding_api_key=_get("EMBEDDING_API_KEY"),
         embedding_model=_get("EMBEDDING_MODEL"),
-        secret_key=_get("SECRET_KEY", "dev-secret-change-me"),
-        bootstrap_token=_get("BOOTSTRAP_TOKEN", "dev-token"),
-        bootstrap_tenant=_get("BOOTSTRAP_TENANT", "default"),
-        bootstrap_user=_get("BOOTSTRAP_USER", "admin"),
         data_dir=Path(_get("DATA_DIR", "./data")).resolve(),
         max_upload_mb=int(_get("MAX_UPLOAD_MB", "100")),
         ingestion_version=_get("INGESTION_VERSION", "v1"),
-        ocr_provider=_get("OCR_PROVIDER", "third_party"),
-        ocr_model=_get("OCR_MODEL", ""),
-        ocr_base_url=_get("OCR_BASE_URL"),
-        ocr_api_key=_get("OCR_API_KEY"),
-        ocr_timeout_seconds=float(_get("OCR_TIMEOUT_SECONDS", "60")),
+        mineru_api_key=_get("MINERU_API_KEY"),
+        mineru_base_url=_get("MINERU_BASE_URL"),
     )
 
 

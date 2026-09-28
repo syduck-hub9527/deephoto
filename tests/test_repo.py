@@ -8,7 +8,7 @@ import _bootstrap  # noqa: F401
 
 from deephoto import repo
 from deephoto.db import connect, init_db
-from deephoto.security import ensure_bootstrap_user, resolve_token
+from deephoto.security import AuthContext
 
 
 class RepoTestBase(unittest.TestCase):
@@ -18,10 +18,8 @@ class RepoTestBase(unittest.TestCase):
         self.db_path = Path(self.tmp.name) / "test.db"
         init_db(self.db_path)
         self.conn = connect(self.db_path)
-        ensure_bootstrap_user(self.conn, "tenant_a", "admin", "tok_a")
-        ensure_bootstrap_user(self.conn, "tenant_b", "admin", "tok_b")
-        self.ctx_a = resolve_token(self.conn, "tok_a")
-        self.ctx_b = resolve_token(self.conn, "tok_b")
+        self.ctx_a = AuthContext(tenant_id="tenant_a", user_id="admin")
+        self.ctx_b = AuthContext(tenant_id="tenant_b", user_id="admin")
 
     def tearDown(self):
         self.conn.close()

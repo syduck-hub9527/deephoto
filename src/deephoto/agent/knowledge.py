@@ -13,10 +13,9 @@ import logging
 from sqlite3 import Connection
 
 from .. import repo
-from ..config import Settings
 from ..parsing.captions import find_referenced_figures
 from ..pipeline.linking import CONF_DISPLAY_THRESHOLD
-from ..security import AuthContext, sign_resource
+from ..security import AuthContext
 from ..storage import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -25,8 +24,7 @@ _SNIPPET_CHARS = 320
 
 
 class KnowledgeService:
-    def __init__(self, settings: Settings, store: ObjectStore, index_service):
-        self.settings = settings
+    def __init__(self, store: ObjectStore, index_service):
         self.store = store
         self.index_service = index_service
 
@@ -128,7 +126,7 @@ class KnowledgeService:
              "mime_type": asset["mime_type"]},
         ]
 
-    # ---- 回答后端的图片组装(带短时签名 URL)----
+    # ---- 回答后端的图片组装 ----
 
     def build_image_entries(self, conn: Connection, ctx: AuthContext, occ_ids: list[str]) -> list[dict]:
         entries: list[dict] = []
@@ -141,15 +139,13 @@ class KnowledgeService:
                 continue    # 同图多处出现时按命中上下文取第一个正确出处
             seen_assets.add(occ["image_asset_id"])
             doc_id = occ["document_id"]
-            exp1, sig1 = sign_resource(self.settings.secret_key, doc_id, f"images/{occ_id}")
-            exp2, sig2 = sign_resource(self.settings.secret_key, doc_id, f"pages/{occ['page_number']}")
             entries.append({
                 "image_occurrence_id": occ_id,
                 "document_id": doc_id,
                 "figure_number": occ["figure_number"],
                 "caption": occ["caption"],
                 "page": occ["page_number"],
-                "image_url": f"/api/documents/{doc_id}/images/{occ_id}?expires={exp1}&sig={sig1}",
-                "source_page_url": f"/api/documents/{doc_id}/pages/{occ['page_number']}?expires={exp2}&sig={sig2}",
+                "image_url": f"/api/documents/{doc_id}/images/{occ_id}",
+                "source_page_url": f"/api/documents/{doc_id}/pages/{occ['page_number']}",
             })
         return entries

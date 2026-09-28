@@ -12,7 +12,6 @@ import logging
 from .. import repo
 from ..config import Settings
 from ..db import connect
-from ..ocr import OCR_PROVIDER_MINERU, OCRConfig, OCRConfigurationError
 from ..parsing.base import (
     KIND_EMBEDDED_BITMAP,
     KIND_PAGE_FALLBACK,
@@ -20,7 +19,7 @@ from ..parsing.base import (
     ParsedDocument,
     ParsedParagraph,
 )
-from ..parsing.mineru import MinerUClient
+from ..parsing.mineru import MINERU_DEFAULT_BASE_URL, MinerUClient, MinerUError
 from ..storage import ObjectStore
 from .chunking import chunk_paragraphs
 from .describe import DESC_PROMPT_VERSION, describe_image
@@ -102,7 +101,7 @@ class IngestService:
         # 2) 解析:无论是否扫描版,一律整 PDF 交给 MineU 解析(不本地判扫描/渲染页)
         repo.update_document_status(conn, document_id, "parsing")
         pdf_bytes = self.store.get(doc["pdf_object_key"])
-        parsed = self._parse_with_mineru(conn, doc, pdf_bytes)
+        parsed = self._parse_with_mineru(doc, pdf_bytes)
         occurrences = self._persist_figures(conn, doc, parsed, pdf_bytes)
         chunks = self._persist_chunks_and_links(conn, doc, parsed, occurrences)
         conn.commit()
@@ -118,33 +117,17 @@ class IngestService:
         repo.update_document_status(conn, document_id, "ready", page_count=parsed.page_count)
         conn.commit()
 
-    def _ocr_config(self, conn, tenant_id: str) -> OCRConfig | None:
-        """读取租户 OCR 配置;无效或未启用返回 None。"""
-        values = repo.get_ocr_settings(conn, tenant_id, self.settings.ocr_defaults)
-        try:
-            return OCRConfig(
-                provider=str(values.get("provider") or "disabled"),
-                model=str(values.get("model") or ""),
-                base_url=str(values["base_url"]) if values.get("base_url") else None,
-                api_key=str(values["api_key"]) if values.get("api_key") else None,
-                timeout_seconds=float(values.get("timeout_seconds") or 60),
-            ).normalized()
-        except (OCRConfigurationError, ValueError) as exc:
-            logger.warning("OCR 配置无效,跳过扫描页识别: %s", exc)
-            return None
-
-    def _parse_with_mineru(self, conn, doc: dict, pdf_bytes: bytes) -> ParsedDocument:
+    def _parse_with_mineru(self, doc: dict, pdf_bytes: bytes) -> ParsedDocument:
         """整 PDF 一律交给 MineU 解析,按页文本构造 ParsedDocument。
 
         不本地判扫描、不本地渲染页、不存整页图(600+页扫描版不再产生整页图)。
         MineU 失败时按异常上抛,由 ingest() 标记文档 failed 供重试。
         """
-        config = self._ocr_config(conn, doc["tenant_id"])
-        if config is None or config.provider != OCR_PROVIDER_MINERU or not config.api_key:
-            raise OCRConfigurationError("未配置 MineU API Token,无法解析 PDF")
+        if not self.settings.mineru_api_key:
+            raise MinerUError("未配置 DEEPHOTO_MINERU_API_KEY,无法解析 PDF")
         result = MinerUClient(
-            api_key=config.api_key,
-            base_url=config.base_url or "https://mineru.net",
+            api_key=self.settings.mineru_api_key,
+            base_url=self.settings.mineru_base_url or MINERU_DEFAULT_BASE_URL,
         ).parse_pdf(pdf_bytes, doc.get("filename") or "document.pdf")
         return _pages_from_texts(result.page_texts)
 

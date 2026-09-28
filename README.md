@@ -29,7 +29,7 @@ cp .env.example .env   # 填入 DEEPHOTO_MOONSHOT_API_KEY
 
 # 3. 启动(手动)
 python -m deephoto
-# 打开 http://127.0.0.1:8000 ,输入令牌(默认 dev-token)
+# 打开 http://127.0.0.1:8000(本地单机,无鉴权)
 ```
 
 首次启动后在真实样本上验证通过,建议锁定依赖版本:
@@ -47,30 +47,27 @@ pip freeze > requirements.lock.txt
 | `CHAT_MODEL` | coding 路由用 `k3`;直连 API 用 `kimi-k3`(不可混用) | `k3` |
 | `CHAT_TEMPERATURE` | 采样温度 | `1` |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_API_KEY` | 可选嵌入端点(任意 OpenAI 兼容,如阿里云百炼 `https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen3.7-text-embedding`)。**不配置时自动降级为纯关键词检索** | 关闭 |
-| `SECRET_KEY` | 图片短时 URL 签名密钥,生产必改 | `dev-secret-change-me` |
-| `BOOTSTRAP_TOKEN` / `BOOTSTRAP_TENANT` / `BOOTSTRAP_USER` | 首次启动种入的开发用户 | `dev-token` / `default` / `admin` |
 | `DATA_DIR` | 数据库与对象存储目录 | `./data` |
 | `MAX_UPLOAD_MB` | 上传大小上限 | `100` |
 | `INGESTION_VERSION` | 解析/索引版本;去重复用的判定维度之一 | `v1` |
-| `OCR_PROVIDER` / `OCR_MODEL` | OCR 默认服务类型(`disabled`/`local`/`third_party`)与模型名;可在网页“设置”中按租户覆盖 | 关闭 |
-| `OCR_BASE_URL` / `OCR_API_KEY` | OCR 默认 OpenAI 兼容端点与密钥;本地默认端点为 `http://127.0.0.1:8001/v1` | — |
-| `OCR_TIMEOUT_SECONDS` | 单页 OCR 请求超时时间 | `60` |
+| `MINERU_API_KEY` | MinerU 云端解析 Token(必填,唯一的 PDF 解析器;租户不可配置) | — |
+| `MINERU_BASE_URL` | MinerU 服务地址 | `https://mineru.net` |
 
 ## API 摘要
 
 - `POST /api/documents` 上传 PDF → `{document_id, status: "queued"}`
 - `GET /api/documents` / `GET /api/documents/{id}` / `DELETE /api/documents/{id}`
-- `GET /api/settings` / `PUT /api/settings/ocr`:读取或保存当前租户的 OCR 设置(密钥只返回掩码状态)
 - `POST /api/qa` `{question, document_id?}` → `{answer, citations[], images[]}`
-- `GET /api/documents/{id}/images/{occ_id}`、`GET .../pages/{n}`:Bearer 鉴权**或** `?expires=&sig=` 短时签名(问答响应中已生成)
+- `GET /api/documents/{id}/images/{occ_id}`、`GET .../pages/{n}`:图片与页预览(问答响应中已生成 URL,本地部署无鉴权)
 
 ### MinerU 云端解析的 PDF 自动分页
 
-在网页“设置”中选择 MinerU 并填写自己的 API Token。后台上传原 PDF 前会按
+MinerU 是唯一的 PDF 解析器(代码中写死,租户不可选择)。Token 由服务端环境变量
+`DEEPHOTO_MINERU_API_KEY` 提供,不写入代码、不经过浏览器。后台上传原 PDF 前会按
 **每份最多 200 页、序列化后最多 200,000,000 字节**自动拆分；拆分结果依原页序
 解析并合并，空白页也会占据原页码。某一页单独导出仍超限时会给出明确错误。
 整个文档最多拆成 200 份；当前每份独立申请一次上传地址，因此也符合官网
-“单次最多申请 50 个上传链接”的限制。Token 只保存在服务端设置中，不写入代码。
+“单次最多申请 50 个上传链接”的限制。
 
 原 PDF 的上传大小限制由 `DEEPHOTO_MAX_UPLOAD_MB` 控制，默认 100 MB；如需
 处理大于 200 MB 的原件，应按服务器内存情况提高该值。这个值是**原件上传限制**，
@@ -91,8 +88,8 @@ pip freeze > requirements.lock.txt
 ## 已知限制(首版)
 
 - 多栏排版阅读顺序为近似(未做栏检测);跨页图、复杂子图依赖 `needs_review` 抽检(§3.2 已声明需额外校验)。
-- 扫描页保存整页图像并标记待校验;在网页“设置”中启用 OCR 后,会逐页调用所选本地或第三方服务并把识别文本加入检索索引。
-- 鉴权为开发级 Bearer 令牌;生产应接入真实身份系统(权限边界已实现多租户隔离)。
+- 扫描版 PDF 同样整份交给 MinerU 解析;MinerU 不可用时对应文档标记 `failed`,无本地 OCR 兜底。
+- 无鉴权,仅本地单机使用;如需暴露到网络,必须先接入真实身份系统(数据层的 tenant 过滤结构保留)。
 - worker 为单进程内线程;多副本部署需换真实队列。
 - **Kimi K3 注意点**:思考常开;其官方要求多轮/工具循环回传完整 assistant 消息(含 reasoning content)。若所用 langchain-openai 版本丢弃该字段,需在 `llm.py` 集中更换适配器。
 - `inspect_image` 的多模态工具返回格式(content blocks)请按实际安装的 deepagents/langchain-openai 版本验证(文档§5.2 实现提示)。
