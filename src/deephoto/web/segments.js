@@ -216,7 +216,76 @@
     return { html: parts.join(""), supplement };
   }
 
+  // ---- 入库进度展示辅助(纯函数;阶段标识与展示名分离)----
+
+  const PROG_STAGE_NAMES = {
+    queued: "排队中", dedup_lookup: "检查已有处理结果", reuse: "复用已有结果",
+    parsing: "云端解析", persist_figures: "保存图片", chunks_and_links: "整理正文与图文关系",
+    describing: "生成图片描述", indexing: "准备检索", finalizing: "完成保存",
+    mineru_split: "读取与拆分", mineru_merge: "合并解析结果", index_prepare: "整理检索内容",
+    embed_batches: "生成语义向量",
+  };
+
+  // 已等待时长显示(不猜测"还需多久");未知为 —
+  function formatElapsed(ms) {
+    if (ms === null || ms === undefined || isNaN(ms)) return "—";
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 60) return `${s} 秒`;
+    const m = Math.floor(s / 60), rs = s % 60;
+    if (m < 60) return rs ? `${m} 分 ${rs} 秒` : `${m} 分`;
+    return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
+  }
+
+  // 列表一行的进度描述;无观测记录返回 null(调用方回退到原状态文案)
+  function progressLine(doc) {
+    const p = doc.progress;
+    if (!p) return null;
+    if (p.state === "queued") return `排队中 · 已等待 ${formatElapsed(p.total_elapsed_ms)}`;
+    if (p.state === "running") {
+      let text = PROG_STAGE_NAMES[p.stage] || "处理中";
+      if (p.total) text += ` · 已处理 ${p.completed || 0}/${p.total}`;
+      if (p.current_item && p.current_item.label) {
+        text += ` · 当前:${p.current_item.label}`;
+        if (p.current_item.elapsed_ms != null) text += `,已等待 ${formatElapsed(p.current_item.elapsed_ms)}`;
+      } else if (p.stage_elapsed_ms != null) {
+        text += ` · 已等待 ${formatElapsed(p.stage_elapsed_ms)}`;
+      }
+      return text;
+    }
+    if (p.state === "succeeded") return `就绪 · 总耗时 ${formatElapsed(p.total_elapsed_ms)}`;
+    if (p.state === "interrupted") return "服务曾重启,未确认自动恢复";
+    if (p.state === "failed") return "处理失败";
+    return null;
+  }
+
+  const PROG_STAGE_STATE = { running: "进行中", succeeded: "已完成", skipped: "跳过",
+    partial: "部分降级", failed: "失败", interrupted: "中断" };
+
+  /* 文档列表轮询器:单一定时器 + 在途标志,连续上传/切换不会叠加循环;
+   * load() 返回 false(全部终态)即停止;失败走 onError,保留上次数据。 */
+  function createDocPoller(opts) {
+    const interval = opts.interval || 3000;
+    const setT = opts.setTimeout || setTimeout;
+    const clearT = opts.clearTimeout || clearTimeout;
+    let timer = null, inflight = false, running = false;
+    async function tick() {
+      if (!running || inflight) return;
+      inflight = true;
+      let cont = true;
+      try { cont = await opts.load(); }
+      catch (e) { if (opts.onError) opts.onError(e); }
+      inflight = false;
+      if (!running) return;
+      if (cont === false) { stop(); return; }
+      timer = setT(tick, interval);
+    }
+    function start() { if (running) return; running = true; tick(); }
+    function stop() { running = false; if (timer !== null) { clearT(timer); timer = null; } }
+    return { start, stop, tick, get running() { return running; } };
+  }
+
   return { esc, figLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
            imageCardHTML, figureDomId, newMessageId, createAssistantMessage,
-           applyStreamEvent, finishStream, restoreMessages };
+           applyStreamEvent, finishStream, restoreMessages,
+           PROG_STAGE_NAMES, PROG_STAGE_STATE, formatElapsed, progressLine, createDocPoller };
 });

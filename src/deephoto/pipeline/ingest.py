@@ -24,6 +24,8 @@ from ..storage import ObjectStore
 from .chunking import chunk_paragraphs
 from .describe import DESC_PROMPT_VERSION, describe_image
 from .linking import resolve_links
+from .progress import NoOpObserver
+from . import progress as pg
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,69 @@ _MIME_BY_PIL_FORMAT = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/
 # MineU 不返回页面尺寸;正文用稳定占位即可(bbox 仅占位,不影响检索)
 _PAGE_W = 612.0
 _PAGE_H = 792.0
+
+
+# 云端已知状态翻译(仅确认含义的才翻;未知状态统一"等待云端结果",不制造百分比)
+_CLOUD_STATE_LABEL = {"pending": "云端排队", "running": "云端解析"}
+
+
+class _MinerUProgressAdapter:
+    """把 MinerUClient 的普通事件翻译成观测器的阶段/单项记录。
+
+    每块按 chunk_start → (申请/上传/轮询/下载) → extract_end 顺序记录;
+    上传、等待、下载耗时分别放在单项 detail,不与 parsing 总耗时重复求和。
+    """
+
+    def __init__(self, observer):
+        self._observer = observer
+        self._download_ms: dict[int, int] = {}
+
+    def __call__(self, event: dict) -> None:
+        kind = event.get("type")
+        index = event.get("index") or 1
+        obs = self._observer
+        if kind == "split":
+            obs.stage_start("mineru_split", parent=pg.STAGE_PARSING)
+            obs.stage_end("mineru_split", counts={
+                "pages": event.get("pages"), "bytes": event.get("bytes"),
+                "chunks": event.get("chunks")})
+        elif kind == "chunk_start":
+            obs.item_start("mineru_chunk", index,
+                           label=f"第 {index} 部分({event.get('pages')} 页)")
+        elif kind == "request_url_end":
+            obs.item_update("mineru_chunk", index, detail={"request_ms": event.get("duration_ms")})
+        elif kind == "upload_end":
+            obs.item_update("mineru_chunk", index, detail={"upload_ms": event.get("duration_ms")})
+        elif kind == "poll":
+            state = str(event.get("state") or "")
+            label = f"第 {index} 部分 · {_CLOUD_STATE_LABEL.get(state, '等待云端结果')}"
+            obs.item_update("mineru_chunk", index, label=label, detail={
+                "last_state": state, "polls": event.get("attempts"),
+                "wait_ms": event.get("elapsed_ms")})
+        elif kind == "download_end":
+            self._download_ms[index] = event.get("duration_ms") or 0
+        elif kind == "extract_end":
+            detail = {
+                "download_ms": self._download_ms.pop(index, None),
+                "extract_ms": event.get("duration_ms"),
+                "elements": event.get("elements"), "figures": event.get("figures"),
+                "fallback": event.get("fallback"),
+            }
+            obs.item_end("mineru_chunk", index, pg.ITEM_OK, detail=detail)
+        elif kind == "merge_end":
+            obs.stage_start("mineru_merge", parent=pg.STAGE_PARSING)
+            obs.stage_end("mineru_merge", counts={
+                "chunks": event.get("chunks"), "pages": event.get("pages")})
+
+
+def _display_label(occ: dict) -> str | None:
+    """图号/表号展示名(给用户看);内部 occurrence ID 只进诊断,不进入口。"""
+    number = occ.get("figure_number")
+    if not number:
+        return None
+    if str(number).startswith("表"):
+        return f"表 {str(number)[1:]}"
+    return f"图 {number}"
 
 
 def _pages_from_texts(page_texts: list[str]) -> ParsedDocument:
@@ -62,62 +127,123 @@ def _pages_from_texts(page_texts: list[str]) -> ParsedDocument:
 
 class IngestService:
     def __init__(self, settings: Settings, store: ObjectStore, parser: LayoutParser,
-                 index_service, chat_model_factory=None):
+                 index_service, chat_model_factory=None, progress_store=None,
+                 mineru_client_factory=None):
         self.settings = settings
         self.store = store
         self.parser = parser
         self.index_service = index_service
         self._chat_model_factory = chat_model_factory
         self._chat_model = None
+        self._progress_store = progress_store            # 观测存储;None 时全部走 NoOpObserver
+        self._mineru_client_factory = mineru_client_factory  # 测试注入假客户端(on_progress) -> client
 
     def ingest(self, document_id: str) -> None:
         conn = connect(self.settings.db_path)
         doc = repo.get_document(conn, document_id)
         if doc is None or doc["status"] not in ("queued", "failed"):
             return
+        observer = self._observer_for(document_id)
         try:
-            self._run(conn, doc)
+            self._run(conn, doc, observer)
+            observer.finish(pg.RESULT_SUCCEEDED)
+            self._log_run_summary(doc)
         except Exception as exc:  # 失败可重试:状态落库,worker 不中断
             logger.exception("ingest failed for %s", document_id)
+            observer.finish(pg.RESULT_FAILED)
             repo.update_document_status(conn, document_id, "failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _observer_for(self, document_id: str):
+        """绑定该文档最新运行的观察器;无观测存储或无登记记录(旧文档)时用空实现。"""
+        if self._progress_store is None:
+            return NoOpObserver()
+        run_id = self._progress_store.latest_run_id(document_id)
+        return self._progress_store.observer(run_id) if run_id else NoOpObserver()
+
+    def _log_run_summary(self, doc: dict) -> None:
+        """任务结束输出一次简短汇总(父子阶段不重复求和)。"""
+        if self._progress_store is None:
+            return
+        detail = self._progress_store.detail(doc["tenant_id"], doc["id"])
+        if not detail:
+            return
+        stages = {s["stage"]: s for s in detail["stages"]}
+
+        def ms(name: str) -> str:
+            value = (stages.get(name) or {}).get("duration_ms")
+            return f"{value / 1000:.1f}s" if value is not None else "未知"
+
+        slow = detail["slowest"][:1]
+        slow_txt = (f", 最慢单项「{slow[0]['label'] or slow[0]['kind']}」"
+                    f" {slow[0]['duration_ms'] / 1000:.1f}s") if slow else ""
+        logger.info(
+            "入库耗时汇总 doc=%s: 排队=%s 解析=%s 描述=%s 索引=%s%s,警告 %d 条",
+            doc["id"], ms(pg.STAGE_QUEUED), ms(pg.STAGE_PARSING), ms(pg.STAGE_DESCRIBING),
+            ms(pg.STAGE_INDEXING), slow_txt, len(detail["summary"]["warnings"]))
 
     # ---- 内部 ----
 
-    def _run(self, conn, doc: dict) -> None:
+    def _run(self, conn, doc: dict, observer) -> None:
         document_id = doc["id"]
         tenant_id = doc["tenant_id"]
         version = doc["ingestion_version"]
 
         # 1) 去重复用:同租户已有同内容同版本的 ready 文档 -> 直接克隆
+        observer.stage_start(pg.STAGE_DEDUP)
         sibling = repo.find_ready_document_by_hash(conn, tenant_id, doc["sha256"], version)
-        if sibling is not None and sibling["id"] != document_id:
+        hit = sibling is not None and sibling["id"] != document_id
+        observer.stage_end(pg.STAGE_DEDUP, detail={"hit": hit})
+        if hit:
+            observer.stage_start(pg.STAGE_REUSE)
             chunk_map, occ_map = repo.clone_document_data(conn, src_document_id=sibling["id"], dst=doc)
             self.index_service.clone_document(conn, src_document_id=sibling["id"], dst=doc,
                                               chunk_id_map=chunk_map, occ_id_map=occ_map)
             repo.update_document_status(conn, document_id, "ready", page_count=sibling["page_count"])
             conn.commit()
+            observer.stage_end(pg.STAGE_REUSE)
             return
 
         # 2) 解析:无论是否扫描版,一律整 PDF 交给 MineU 解析(不本地判扫描/渲染页)
+        observer.stage_start(pg.STAGE_PARSING)
         repo.update_document_status(conn, document_id, "parsing")
         pdf_bytes = self.store.get(doc["pdf_object_key"])
-        parsed = self._parse_with_mineru(doc, pdf_bytes)
+        parsed = self._parse_with_mineru(doc, pdf_bytes, observer)
+        observer.stage_end(pg.STAGE_PARSING, counts={"pages": parsed.page_count})
+
+        observer.stage_start(pg.STAGE_FIGURES)
         occurrences = self._persist_figures(conn, doc, parsed, pdf_bytes)
+        observer.stage_end(pg.STAGE_FIGURES, counts={"figures": len(occurrences)})
+
+        observer.stage_start(pg.STAGE_CHUNKS)
         chunks = self._persist_chunks_and_links(conn, doc, parsed, occurrences)
         conn.commit()
+        observer.stage_end(pg.STAGE_CHUNKS, counts={"chunks": len(chunks)})
 
         # 3) 图片描述(K3 多模态;无 API key 时跳过,仅以图注检索)
         repo.update_document_status(conn, document_id, "describing")
-        self._describe_all(conn, doc, parsed, occurrences, chunks)
+        observer.stage_start(pg.STAGE_DESCRIBING, total=len(occurrences),
+                             detail={"retry_note": "单次调用计时含 SDK 内部重试(已观测次数未知)"})
+        stats = self._describe_all(conn, doc, parsed, occurrences, chunks, observer)
         conn.commit()
+        if stats["model"] is None:
+            observer.stage_end(pg.STAGE_DESCRIBING, pg.RESULT_SKIPPED,
+                               detail={"reason": "未配置 DEEPHOTO_MOONSHOT_API_KEY"})
+        else:
+            result = pg.RESULT_SUCCEEDED if not stats["failed"] else pg.RESULT_PARTIAL
+            observer.stage_end(pg.STAGE_DESCRIBING, result)
 
         # 4) 索引
         repo.update_document_status(conn, document_id, "indexing")
-        self.index_service.upsert_document(conn, document_id)
+        observer.stage_start(pg.STAGE_INDEXING)
+        self.index_service.upsert_document(conn, document_id, observer=observer)
+        observer.stage_end(pg.STAGE_INDEXING)
+
+        observer.stage_start(pg.STAGE_FINALIZING)
         repo.update_document_status(conn, document_id, "ready", page_count=parsed.page_count)
         conn.commit()
+        observer.stage_end(pg.STAGE_FINALIZING)
 
-    def _parse_with_mineru(self, doc: dict, pdf_bytes: bytes) -> ParsedDocument:
+    def _parse_with_mineru(self, doc: dict, pdf_bytes: bytes, observer) -> ParsedDocument:
         """整 PDF 一律交给 MineU 解析,按页文本构造 ParsedDocument。
 
         不本地判扫描、不本地渲染页、不存整页图(600+页扫描版不再产生整页图)。
@@ -125,14 +251,21 @@ class IngestService:
         """
         if not self.settings.mineru_api_key:
             raise MinerUError("未配置 DEEPHOTO_MINERU_API_KEY,无法解析 PDF")
-        result = MinerUClient(
-            api_key=self.settings.mineru_api_key,
-            base_url=self.settings.mineru_base_url or MINERU_DEFAULT_BASE_URL,
-            dump_dir=self.settings.mineru_dump_dir,
-        ).parse_pdf(pdf_bytes, doc.get("filename") or "document.pdf")
+        adapter = _MinerUProgressAdapter(observer)
+        if self._mineru_client_factory is not None:
+            client = self._mineru_client_factory(adapter)
+        else:
+            client = MinerUClient(
+                api_key=self.settings.mineru_api_key,
+                base_url=self.settings.mineru_base_url or MINERU_DEFAULT_BASE_URL,
+                dump_dir=self.settings.mineru_dump_dir,
+                on_progress=adapter,
+            )
+        result = client.parse_pdf(pdf_bytes, doc.get("filename") or "document.pdf")
         if result.elements:
             return build_document(result.elements, page_count=len(result.page_texts))
         logger.warning("MinerU 结果不含 content_list,退回按页纯文本(无图/表/标题)")
+        observer.warn("MinerU 结果不含 content_list,已退回纯文本(无图/表)")
         return _pages_from_texts(result.page_texts)
 
     def _persist_figures(self, conn, doc: dict, parsed: ParsedDocument, pdf_bytes: bytes) -> list[dict]:
@@ -209,14 +342,19 @@ class IngestService:
         return chunks
 
     def _describe_all(self, conn, doc: dict, parsed: ParsedDocument, occurrences: list[dict],
-                      chunks: list[dict]) -> None:
+                      chunks: list[dict], observer) -> dict:
+        """逐张描述并记录进度;返回统计 {model, ok, failed}(failed 含异常与格式失败)。"""
         model = self._get_chat_model()
+        stats = {"model": model, "ok": 0, "failed": 0}
         if model is None:
             logger.warning("未配置 DEEPHOTO_MOONSHOT_API_KEY,跳过图片描述(仅用图注检索)")
-            return
-        for occ in occurrences:
+            return stats
+        for seq, occ in enumerate(occurrences, start=1):
             full = repo.get_occurrence(conn, occ["id"])
             asset = repo.get_asset(conn, full["image_asset_id"])
+            label = _display_label(occ) or f"第 {seq} 张"
+            observer.item_start("image", seq, label=label,
+                                page=occ["page_number"], figure=occ["figure_number"])
             try:
                 image_bytes = self.store.get(asset["original_object_key"])
                 result = describe_image(
@@ -233,6 +371,15 @@ class IngestService:
                     uncertain_details=result["uncertain_details"],
                     description_model=f"{self.settings.chat_model}:{DESC_PROMPT_VERSION}",
                 )
+                diag = (result.get("diagnostic") or {}).get("result", "ok")
+                if diag == "ok":
+                    stats["ok"] += 1
+                    observer.item_end("image", seq, pg.ITEM_OK)
+                else:
+                    # 调用完成但输出不是有效 JSON:按格式失败计数,不能算成功
+                    stats["failed"] += 1
+                    observer.item_end("image", seq, pg.ITEM_PARSE_FAILED)
+                    observer.warn(f"第 {seq} 张({label})描述格式解析失败,已降级")
             except Exception as exc:
                 # 单图失败不阻塞整篇入库(§6:描述漏掉关键内容 -> 检索命中后看原图兜底)
                 logger.exception("describe failed for %s", occ["id"])
@@ -242,6 +389,9 @@ class IngestService:
                     uncertain_details=[f"描述生成失败:{type(exc).__name__}: {exc}"],
                     description_model=f"{self.settings.chat_model}:{DESC_PROMPT_VERSION}",
                 )
+                stats["failed"] += 1
+                observer.item_end("image", seq, pg.ITEM_ERROR, error_kind=type(exc).__name__)
+        return stats
 
     def _get_chat_model(self):
         if self._chat_model is None and self._chat_model_factory is not None:

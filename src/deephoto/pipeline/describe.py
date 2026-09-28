@@ -43,7 +43,12 @@ def describe_image(
     section: str | None,
     context_text: str | None,
 ) -> dict:
-    """返回 {visible_summary, visible_labels, caption, context_summary, uncertain_details}。"""
+    """返回 {visible_summary, ..., uncertain_details, diagnostic}。
+
+    diagnostic["result"]: "ok" 调用完成且 JSON 解析成功;"parse_failed" 调用完成
+    但输出不是有效 JSON(内容降级为空描述,不能按成功计数)。观测据此区分
+    正常描述与格式失败;不根据描述是否为空猜结果(空也可能是合法的"不清楚")。
+    """
     from langchain_core.messages import HumanMessage
 
     meta_lines = []
@@ -61,7 +66,8 @@ def describe_image(
         {"type": "image_url", "image_url": {"url": data_url}},
     ])
     response = chat_model.invoke([message])
-    return parse_description_json(response.content if isinstance(response.content, str) else str(response.content))
+    result = parse_description_json(response.content if isinstance(response.content, str) else str(response.content))
+    return result
 
 
 def parse_description_json(raw: str) -> dict:
@@ -79,6 +85,7 @@ def parse_description_json(raw: str) -> dict:
         "caption": str(data.get("caption") or ""),
         "context_summary": str(data.get("context_summary") or ""),
         "uncertain_details": [str(x) for x in data.get("uncertain_details") or []][:20],
+        "diagnostic": {"result": "ok"},
     }
 
 
@@ -89,4 +96,5 @@ def _fallback(reason: str) -> dict:
         "caption": "",
         "context_summary": "",
         "uncertain_details": [reason],
+        "diagnostic": {"result": "parse_failed"},
     }

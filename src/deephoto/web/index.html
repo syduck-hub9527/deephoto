@@ -49,6 +49,15 @@
   .doc-item:hover .doc-del { visibility: visible; }
   .doc-del:hover { color: #d05858; }
   .doc-err { font-size: 11px; color: #d05858; padding: 0 10px 4px; }
+  .doc-prog { font-size: 11.5px; color: var(--muted); padding: 0 10px 4px 26px; line-height: 1.5; }
+  .doc-prog-toggle { color: var(--accent); text-decoration: none; margin-left: 4px; cursor: pointer; }
+  .doc-prog-detail { margin: 2px 10px 8px 26px; font-size: 11.5px; color: var(--muted); }
+  .prog-table { width: 100%; border-collapse: collapse; }
+  .prog-table td { padding: 3px 6px 3px 0; border-bottom: 1px dashed var(--border); vertical-align: top; }
+  .prog-table td:last-child { text-align: right; white-space: nowrap; }
+  .prog-sub { margin: 6px 0 2px; }
+  .prog-slow { margin: 0; padding-left: 16px; }
+  .doc-warn { margin-top: 4px; color: var(--accent); font-size: 11.5px; }
   #uploadLabel { display: block; margin: 4px 10px 8px; padding: 9px; text-align: center; font-size: 13px;
                  border: 1px dashed var(--border); border-radius: 8px; color: var(--muted); cursor: pointer; }
   #uploadLabel:hover { border-color: var(--accent); color: var(--accent); }
@@ -196,7 +205,7 @@ initTheme();
 messages = SEG.restoreMessages(JSON.parse(localStorage.getItem("deephoto_chat") || "[]"));
 localStorage.setItem("deephoto_chat", JSON.stringify(messages.slice(-60)));   // 持久化补齐的消息 ID
 renderThread();
-loadDocs();
+docPoller.start();
 
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
@@ -220,37 +229,120 @@ function toggleTheme() {
   $("themeBtn").textContent = dark ? "☀️" : "🌙";
 }
 
-// ---- 文档库 ----
-async function loadDocs() {
-  try {
+// ---- 文档库(进度可见:阶段/计数/耗时;轮询由单一调度器维护)----
+let docs = [];               // 最近一次成功获取的数据
+let docsUpdatedAt = null;    // 上次成功刷新时刻(失败时据此提示,不假装实时)
+let docsStale = false;
+let expandedDoc = null;      // 展开了耗时详情的文档 id(每轮刷新时同步更新其详情)
+
+const docPoller = SEG.createDocPoller({
+  interval: 3000,
+  load: async () => {
     const r = await fetch("/api/documents");
-    if (!r.ok) { $("docList").innerHTML = '<div class="doc-err">加载失败</div>'; return; }
-    const docs = (await r.json()).documents;
-    renderDocs(docs);
-    if (docs.some(d => !["ready", "failed"].includes(d.status))) setTimeout(loadDocs, 3000);
-  } catch { /* 服务未就绪时静默 */ }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    docs = (await r.json()).documents;
+    docsUpdatedAt = new Date(); docsStale = false;
+    renderDocs();
+    if (expandedDoc) refreshProgDetail(expandedDoc);   // 只有展开时才额外请求细分项
+    // 有未完成文档才继续轮询;全部终态则停止(详情仍可手动展开查看)
+    return docs.some(d => !["ready", "failed"].includes(d.status));
+  },
+  onError: () => { docsStale = true; renderDocs(); },
+});
+
+function refreshDocs(immediate) {
+  docPoller.start();                 // 已停止(全终态)时重新启动;运行中不叠加
+  if (immediate) docPoller.tick();   // 上传/删除后立即刷新一次
 }
 
-function renderDocs(docs) {
+function renderDocs() {
   const scope = localStorage.getItem("deephoto_scope") || "";
-  $("docList").innerHTML = docs.map(d => {
+  const stale = docsStale
+    ? `<div class="doc-err">进度暂时无法刷新${docsUpdatedAt ? "(上次更新 " + fmtClock(docsUpdatedAt) + ")" : ""}</div>` : "";
+  $("docList").innerHTML = stale + (docs.map(d => {
     const cls = d.status === "ready" ? "ready" : d.status === "failed" ? "failed" : "pending";
+    const line = SEG.progressLine(d);
     return `<div class="doc-item ${scope === d.id ? "active" : ""}" onclick="setScope('${d.id}')" title="${esc(d.filename)} · ${STATUS_LABEL[d.status] || d.status}">
         <span class="dot ${cls}"></span><span class="doc-name">${esc(d.filename)}</span>
         <button class="doc-del" onclick="event.stopPropagation(); delDoc('${d.id}')" title="删除">×</button>
-      </div>${d.error ? `<div class="doc-err">${esc(d.error)}</div>` : ""}`;
-  }).join("") || '<div class="doc-err" style="color:var(--muted)">暂无文档,先上传一份 PDF</div>';
+      </div>
+      ${line ? `<div class="doc-prog">${esc(line)}${d.progress ? ` <a class="doc-prog-toggle" data-prog="${d.id}">${expandedDoc === d.id ? "收起耗时" : "展开耗时"}</a>` : ""}</div>
+      <div class="doc-prog-detail" id="prog-${d.id}" ${expandedDoc === d.id ? "" : "hidden"}></div>` : ""}
+      ${d.error ? `<div class="doc-err">${esc(d.error)}</div>` : ""}`;
+  }).join("") || '<div class="doc-err" style="color:var(--muted)">暂无文档,先上传一份 PDF</div>');
   const ready = docs.filter(d => d.status === "ready");
   $("scope").innerHTML = '<option value="">全部文档</option>' +
     ready.map(d => `<option value="${d.id}" ${scope === d.id ? "selected" : ""}>${esc(d.filename)}</option>`).join("");
 }
 
+function fmtClock(dt) {
+  const p = n => String(n).padStart(2, "0");
+  return `${p(dt.getHours())}:${p(dt.getMinutes())}:${p(dt.getSeconds())}`;
+}
+
+// 展开/收起耗时详情(事件委托;只有展开时才请求细分项)
+$("docList").addEventListener("click", e => {
+  const t = e.target.closest("[data-prog]");
+  if (!t) return;
+  e.stopPropagation();
+  const id = t.dataset.prog;
+  if (expandedDoc === id) { expandedDoc = null; renderDocs(); return; }
+  expandedDoc = id;
+  renderDocs();
+  refreshProgDetail(id);
+});
+
+async function refreshProgDetail(id) {
+  const panel = $("prog-" + id);
+  if (!panel || expandedDoc !== id) return;
+  if (!panel.dataset.loaded) panel.innerHTML = '<div class="doc-err" style="color:var(--muted)">加载中…</div>';
+  try {
+    const r = await fetch("/api/documents/" + id);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    if (expandedDoc !== id) return;
+    panel.dataset.loaded = "1";
+    panel.innerHTML = renderProgDetail(j.progress);
+  } catch {
+    if (expandedDoc === id) panel.innerHTML = '<div class="doc-err">详情加载失败</div>';
+  }
+}
+
+function renderProgDetail(p) {
+  if (!p) return '<div class="doc-err" style="color:var(--muted)">无本次耗时记录</div>';
+  const names = p.stage_names || {};
+  const rows = (p.stages || []).map(s => {
+    const state = SEG.PROG_STAGE_STATE[s.result] || s.result;
+    // 进行中的阶段在浏览器按 started_at 现算已等待;终态用服务端 duration_ms
+    const elapsed = s.duration_ms != null ? s.duration_ms
+      : (s.started_at ? Date.now() - Date.parse(s.started_at) : null);
+    return `<tr><td>${esc(s.display_name || names[s.stage] || s.stage)}</td>
+      <td>${esc(state)}${stageCount(s)}</td><td>${SEG.formatElapsed(elapsed)}</td></tr>`;
+  }).join("");
+  const slow = (p.slowest || []).filter(i => i.kind === "image" || i.kind === "embed_batch");
+  const slowHtml = slow.length
+    ? `<div class="prog-sub">最慢单项:</div><ul class="prog-slow">` + slow.map(i =>
+        `<li>${esc(i.label || i.kind)} · ${SEG.formatElapsed(i.duration_ms)}${i.result !== "ok" ? " · " + esc(SEG.PROG_STAGE_STATE[i.result] || i.result) : ""}</li>`).join("") + `</ul>` : "";
+  const warns = (p.summary && p.summary.warnings || []).map(w => `<div class="doc-warn">⚠ ${esc(w)}</div>`).join("");
+  return `<table class="prog-table">${rows}</table>${slowHtml}${warns}`;
+}
+
+function stageCount(s) {
+  const c = s.counts;
+  if (!c) return "";
+  if (c.total) return `(${c.completed || 0}/${c.total})`;
+  if (c.pages != null) return `(${c.pages} 页)`;
+  if (c.chunks != null) return `(${c.chunks} 块)`;
+  if (c.figures != null) return `(${c.figures} 张)`;
+  return "";
+}
+
 function setScope(id) {
   const cur = localStorage.getItem("deephoto_scope") || "";
   localStorage.setItem("deephoto_scope", cur === id ? "" : id);
-  loadDocs();
+  refreshDocs(true);
 }
-function saveScope() { localStorage.setItem("deephoto_scope", $("scope").value); loadDocs(); }
+function saveScope() { localStorage.setItem("deephoto_scope", $("scope").value); renderDocs(); }
 
 async function upload() {
   const f = $("file").files[0];
@@ -261,7 +353,7 @@ async function upload() {
   const j = await r.json().catch(() => ({}));
   toast(r.ok ? "已上传,后台处理中" : "上传失败:" + (j.detail || r.status));
   $("file").value = "";
-  loadDocs();
+  refreshDocs(true);
 }
 
 async function delDoc(id) {
@@ -269,7 +361,7 @@ async function delDoc(id) {
   const r = await fetch("/api/documents/" + id, { method: "DELETE" });
   if (!r.ok) { const j = await r.json().catch(() => ({})); toast("删除失败:" + (j.detail || r.status)); }
   if ((localStorage.getItem("deephoto_scope") || "") === id) localStorage.removeItem("deephoto_scope");
-  loadDocs();
+  refreshDocs(true);
 }
 
 // ---- 会话 ----

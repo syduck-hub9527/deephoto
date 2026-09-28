@@ -32,18 +32,23 @@ class IndexService:
 
     # ---- 写入 ----
 
-    def upsert_document(self, conn: Connection, document_id: str) -> None:
+    def upsert_document(self, conn: Connection, document_id: str, observer=None) -> None:
         doc = repo.get_document(conn, document_id)
         if doc is None:
             return
+        from ..pipeline.progress import NoOpObserver
+        observer = observer or NoOpObserver()
+        observer.stage_start("index_prepare", parent="indexing")
         tenant_id, version = doc["tenant_id"], doc["ingestion_version"]
         items: list[dict] = []   # {item_id, source_type, source_id, searchable_text}
+        n_chunks = n_images = 0
         for chunk in repo.chunks_for_document(conn, document_id):
             text = (f"[{chunk['section']}]\n" if chunk["section"] else "") + chunk["text"]
             items.append({
                 "item_id": stable_item_id(tenant_id, document_id, version, "chunk", chunk["id"]),
                 "source_type": "chunk", "source_id": chunk["id"], "searchable_text": text,
             })
+            n_chunks += 1
         for occ in repo.occurrences_for_document(conn, document_id):
             text = _image_searchable_text(occ)
             if not text.strip():
@@ -52,6 +57,9 @@ class IndexService:
                 "item_id": stable_item_id(tenant_id, document_id, version, "image", occ["id"]),
                 "source_type": "image", "source_id": occ["id"], "searchable_text": text,
             })
+            n_images += 1
+        observer.stage_end("index_prepare", counts={
+            "chunks": n_chunks, "images": n_images, "vectorizable": len(items) if self.embeddings else 0})
 
         keep_ids = [item["item_id"] for item in items]
         for item in items:
@@ -65,24 +73,43 @@ class IndexService:
         repo.delete_stale_index_items(conn, document_id, keep_ids)
 
         if self.embeddings and items:
-            self._embed_items(conn, items)
+            self._embed_items(conn, items, observer)
+        else:
+            observer.stage_start("embed_batches", parent="indexing")
+            reason = "未启用语义向量,使用关键词检索" if not self.embeddings else "没有待生成的向量"
+            observer.stage_end("embed_batches", result="skipped", detail={"reason": reason})
         conn.commit()
 
-    def _embed_items(self, conn: Connection, items: list[dict]) -> None:
-        for start in range(0, len(items), EMBED_BATCH):
+    def _embed_items(self, conn: Connection, items: list[dict], observer) -> None:
+        from ..pipeline import progress as pg
+        total_batches = (len(items) + EMBED_BATCH - 1) // EMBED_BATCH
+        observer.stage_start("embed_batches", parent="indexing", total=total_batches)
+        degraded = 0
+        for batch_no, start in enumerate(range(0, len(items), EMBED_BATCH), start=1):
             batch = items[start:start + EMBED_BATCH]
+            observer.item_start("embed_batch", batch_no, label=f"第 {batch_no}/{total_batches} 批")
             try:
                 vectors = self.embeddings.embed_documents([i["searchable_text"] for i in batch])
             except Exception as exc:
                 # 嵌入失败降级为纯关键词,索引仍然可用
+                degraded += 1
                 logger.warning("embedding batch failed, keyword only: %s", exc)
                 for item in batch:
                     conn.execute("UPDATE index_items SET index_status = 'keyword_only' WHERE id = ?",
                                  (item["item_id"],))
+                observer.item_end("embed_batch", batch_no, pg.ITEM_DEGRADED,
+                                  count=len(batch), error_kind=type(exc).__name__)
                 continue
             for item, vector in zip(batch, vectors):
                 repo.put_embedding(conn, item["item_id"],
                                    np.asarray(vector, dtype=np.float32).tobytes())
+            observer.item_end("embed_batch", batch_no, pg.ITEM_OK, count=len(batch))
+        if degraded:
+            observer.warn(f"一批或多批向量生成失败({degraded}/{total_batches}),"
+                          "对应内容仅支持关键词检索")
+            observer.stage_end("embed_batches", result=pg.RESULT_PARTIAL)
+        else:
+            observer.stage_end("embed_batches")
 
     def clone_document(self, conn: Connection, *, src_document_id: str, dst: dict,
                        chunk_id_map: dict[str, str], occ_id_map: dict[str, str]) -> None:

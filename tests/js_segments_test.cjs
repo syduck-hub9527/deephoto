@@ -207,5 +207,60 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
   check("F4: 恢复的旧消息按兼容规则渲染", SEG.renderAnswerBody(restored[0]).html.includes("<img"));
 }
 
-console.log(failures ? `\n${failures} 个失败` : "\n全部通过");
-process.exit(failures ? 1 : 0);
+// ---- 入库进度:格式化与轮询器(md文档/deephoto_ingestion_progress_plan.md §11/§14.12)----
+{
+  check("formatElapsed 秒/分/小时", SEG.formatElapsed(42000) === "42 秒"
+    && SEG.formatElapsed(125000) === "2 分 5 秒"
+    && SEG.formatElapsed(3720000) === "1 小时 2 分"
+    && SEG.formatElapsed(null) === "—");
+  check("formatElapsed 负数防护", SEG.formatElapsed(-5) === "0 秒");
+
+  const running = { status: "describing", progress: { state: "running", stage: "describing",
+    completed: 3, total: 7, stage_elapsed_ms: 120000, total_elapsed_ms: 241200,
+    current_item: { index: 4, label: "图 1.4", elapsed_ms: 42000 } } };
+  check("进度行:阶段+计数+当前项", SEG.progressLine(running) === "生成图片描述 · 已处理 3/7 · 当前:图 1.4,已等待 42 秒");
+  check("进度行:排队", SEG.progressLine({ progress: { state: "queued", total_elapsed_ms: 30000 } }) === "排队中 · 已等待 30 秒");
+  check("进度行:无观测记录为 null", SEG.progressLine({ progress: null }) === null);
+  check("进度行:中断", SEG.progressLine({ progress: { state: "interrupted" } }) === "服务曾重启,未确认自动恢复");
+
+  // 轮询器:连续 start 不叠加定时器;load 返回 false 即停止;失败走 onError 继续
+  const timers = [];
+  const fakeSetTimeout = (fn) => { timers.push(fn); return timers.length; };
+  const fakeClearTimeout = () => { timers.pop(); };
+  (async () => {
+    let loads = 0;
+    const p1 = SEG.createDocPoller({ interval: 10, setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout,
+      load: async () => { loads++; return true; } });
+    p1.start(); p1.start(); p1.start();
+    await new Promise(r => setImmediate(r));
+    check("轮询:重复 start 不叠加", timers.length === 1 && loads === 1);
+    timers.shift()();   // 手动触发下一拍
+    await new Promise(r => setImmediate(r));
+    check("轮询:按间隔继续", loads === 2 && timers.length === 1);
+    p1.stop();
+    check("轮询:stop 后不再调度", timers.length === 0);
+
+    let errors = 0, runs2 = 0;
+    const p2 = SEG.createDocPoller({ interval: 10, setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout,
+      load: async () => { runs2++; if (runs2 === 1) throw new Error("网络抖动"); return runs2 < 3; },
+      onError: () => { errors++; } });
+    p2.start();
+    for (let i = 0; i < 3; i++) { await new Promise(r => setImmediate(r)); if (timers.length) timers.shift()(); }
+    await new Promise(r => setImmediate(r));
+    check("轮询:失败提示后继续,终态停止", errors === 1 && runs2 === 3 && !p2.running);
+
+    // 在途时不并发:load 未返回前 tick 不再触发第二次
+    let resolveBlock, concurrent = 0, maxConcurrent = 0;
+    const p3 = SEG.createDocPoller({ interval: 10, setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout,
+      load: async () => { concurrent++; maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await new Promise(r => { resolveBlock = r; }); concurrent--; return true; } });
+    p3.start();
+    await new Promise(r => setImmediate(r));
+    p3.tick(); p3.tick();
+    check("轮询:在途请求不并发", maxConcurrent === 1);
+    resolveBlock(); p3.stop();
+
+    console.log(failures ? `\n${failures} 个失败` : "\n全部通过");
+    process.exit(failures ? 1 : 0);
+  })();
+}

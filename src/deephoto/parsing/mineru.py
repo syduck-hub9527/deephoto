@@ -14,6 +14,7 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import logging
 import re
 import time
 import zipfile
@@ -26,6 +27,8 @@ from urllib.request import Request, urlopen
 
 from . import pdf_backend
 from .content_list import ContentElement, parse_content_list
+
+logger = logging.getLogger(__name__)
 
 MINERU_DEFAULT_BASE_URL = "https://mineru.net"
 # 默认轮询:最多等待约 5 分钟
@@ -59,7 +62,8 @@ class MinerUClient:
                  max_bytes_per_chunk: int = DEFAULT_MAX_BYTES,
                  opener: Callable[..., Any] | None = None,
                  sleep: Callable[[float], None] = time.sleep,
-                 dump_dir: str | Path | None = None):
+                 dump_dir: str | Path | None = None,
+                 on_progress: Callable[[dict], None] | None = None):
         if not api_key or not api_key.strip():
             raise MinerUError("MineU 需要 API Token")
         self.api_key = api_key.strip()
@@ -73,11 +77,22 @@ class MinerUClient:
         self._opener = opener or urlopen
         self._sleep = sleep
         self.dump_dir = Path(dump_dir) if dump_dir else None
+        self._on_progress = on_progress
+
+    def _emit(self, event: dict) -> None:
+        """可选观测回调:只传普通数据(不含签名地址/密钥/原文),回调异常不打断解析。"""
+        if self._on_progress is None:
+            return
+        try:
+            self._on_progress(event)
+        except Exception:   # noqa: BLE001 - 观测绝不能搞挂业务
+            logger.debug("mineru on_progress callback failed", exc_info=True)
 
     # ---- 对外 ----
 
     def parse_pdf(self, pdf_bytes: bytes, filename: str = "document.pdf") -> MinerUResult:
         """按两个单文件限制拆分 PDF,逐块上传,结果按原页序合并。"""
+        started = time.monotonic()
         try:
             chunks = pdf_backend.chunk_pdf(
                 pdf_bytes, self.max_pages_per_chunk, self.max_bytes_per_chunk,
@@ -85,7 +100,16 @@ class MinerUClient:
             )
         except pdf_backend.PDFBackendError as exc:
             raise MinerUError(f"PDF 拆分失败: {exc}") from exc
+        try:
+            # 页数仅供观测:引擎不可用时为 None,绝不让观测影响解析
+            pages_total = sum(pdf_backend.page_count(c) for c in chunks)
+        except Exception:   # noqa: BLE001
+            pages_total = None
+        self._emit({"type": "split", "pages": pages_total, "bytes": len(pdf_bytes),
+                    "chunks": len(chunks),
+                    "duration_ms": int((time.monotonic() - started) * 1000)})
         if len(chunks) == 1:
+            self._chunk_index = 1   # 经实例属性传递,保持 _parse_chunk 签名兼容(测试替身)
             return self._parse_chunk(chunks[0], filename)
         # 多块:逐块解析,按页序拼接(页与页的相对顺序保持一致)
         page_texts: list[str] = []
@@ -94,23 +118,44 @@ class MinerUClient:
         stem, dot, suffix = filename.rpartition(".")
         for index, chunk in enumerate(chunks):
             chunk_name = f"{stem}_part{index + 1}{dot}{suffix}" if dot else f"{filename}_part{index + 1}"
+            self._chunk_index = index + 1
             result = self._parse_chunk(chunk, chunk_name)
             offset = len(page_texts)          # 每块的 page_idx 都从 0 起,合并时按已有页数平移
             elements.extend(replace(el, page_idx=el.page_idx + offset) for el in result.elements)
             page_texts.extend(result.page_texts)
             raws.append(result.raw)
+        self._emit({"type": "merge_end", "chunks": len(chunks), "pages": len(page_texts),
+                    "duration_ms": int((time.monotonic() - started) * 1000)})
         return MinerUResult(page_texts=page_texts, raw={"chunks": raws}, elements=elements)
 
     # ---- 内部:各步骤 ----
 
     def _parse_chunk(self, pdf_bytes: bytes, filename: str) -> MinerUResult:
         expected_pages = pdf_backend.page_count(pdf_bytes)
+        index = getattr(self, "_chunk_index", 1)
+        self._emit({"type": "chunk_start", "index": index, "pages": expected_pages,
+                    "bytes": len(pdf_bytes)})
+        clock = time.monotonic()
         batch_id, upload_url = self._request_upload_url(filename)
+        self._emit({"type": "request_url_end", "index": index,
+                    "duration_ms": int((time.monotonic() - clock) * 1000)})
+        clock = time.monotonic()
         self._upload_pdf(upload_url, pdf_bytes)
-        extract = self._poll_result(batch_id)
+        self._emit({"type": "upload_end", "index": index, "bytes": len(pdf_bytes),
+                    "duration_ms": int((time.monotonic() - clock) * 1000)})
+        extract = self._poll_result(batch_id, index)
+        clock = time.monotonic()
         zip_bytes = self._download(extract["full_zip_url"])
+        self._emit({"type": "download_end", "index": index, "bytes": len(zip_bytes),
+                    "duration_ms": int((time.monotonic() - clock) * 1000)})
         self._dump(zip_bytes, filename)
+        clock = time.monotonic()
         page_texts, elements = _zip_extract(zip_bytes, expected_pages)
+        self._emit({"type": "extract_end", "index": index,
+                    "duration_ms": int((time.monotonic() - clock) * 1000),
+                    "elements": len(elements),
+                    "figures": sum(1 for el in elements if el.image_bytes),
+                    "fallback": not any(elements)})
         return MinerUResult(page_texts=page_texts, raw=extract, elements=elements)
 
     def _dump(self, zip_bytes: bytes, filename: str) -> None:
@@ -159,13 +204,19 @@ class MinerUClient:
         finally:
             conn.close()
 
-    def _poll_result(self, batch_id: str) -> dict[str, Any]:
+    def _poll_result(self, batch_id: str, index: int = 1) -> dict[str, Any]:
         deadline = time.monotonic() + self.max_wait
+        poll_start = time.monotonic()
+        attempts = 0
         while True:
             data = self._request_json("GET", f"/api/v4/extract-results/batch/{batch_id}", None)
+            attempts += 1
             results = data.get("extract_result")
             first = results[0] if isinstance(results, list) and results else data
             state = str(first.get("state", "")).lower()
+            # 云端状态原样记录(诊断用);含义确认只在观测层翻译,这里不做假设
+            self._emit({"type": "poll", "index": index, "state": state, "attempts": attempts,
+                        "elapsed_ms": int((time.monotonic() - poll_start) * 1000)})
             if state == "done":
                 if not first.get("full_zip_url"):
                     raise MinerUError("MineU 完成但缺少结果下载地址")

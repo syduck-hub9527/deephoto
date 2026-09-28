@@ -54,6 +54,11 @@ class Settings:
         return self.data_dir / "deephoto.db"
 
     @property
+    def progress_db_path(self) -> Path:
+        """入库观测库:与业务库分离,避免业务长事务挡住进度可见性。"""
+        return self.data_dir / "progress.db"
+
+    @property
     def object_dir(self) -> Path:
         return self.data_dir / "objects"
 
