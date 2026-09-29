@@ -241,6 +241,32 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
   check("R7: 重复锚点的引用徽标不含 emoji", rep.includes('class="chip fig"') && !/[\u{1F300}-\u{1FAFF}]/u.test(rep.split('class="chip fig"')[1].split("</a>")[0]));
 }
 
+// ---- M:多格式(位置文案 / 可空页预览 / 长章节胶囊)----
+{
+  // 服务端给 label:章节路径直接显示(渲染层 esc,">" 转义为 &gt;);长路径带 title 供悬停看全文
+  const longLabel = "第1章 引论 > 1.2 存储器容量进展";
+  const escLabel = longLabel.replace(/>/g, "&gt;");
+  const labeled = SEG.renderAnswerBody({ role: "assistant", validated: true, images: [],
+    citations: [{ chunk_id: "chk_1", page: 2, label: longLabel }],
+    content: "结论[chunk:chk_1]" }).html;
+  check("M1: 胶囊显示服务端 label(章节路径)", labeled.includes("出处 " + escLabel));
+  check("M1: 长路径胶囊带 title", labeled.includes(`title="出处 ${escLabel}"`));
+
+  // 旧消息没有 label:回退页码,本地缓存的历史消息不会坏
+  const legacy = SEG.renderAnswerBody({ role: "assistant", validated: true, images: [],
+    citations: [{ chunk_id: "chk_2", page: 7 }], content: "旧[chunk:chk_2]" }).html;
+  check("M2: 无 label 的旧 citation 仍显示页码", legacy.includes("出处 p.7"));
+
+  // source_page_url 为 null(md/txt 等无页预览):不出现"查看原页"链接,位置用 locator_label
+  const mdImg = Object.assign({}, E1, { source_page_url: null, locator_label: "第2章 > 2.1 结构" });
+  const card = SEG.imageCardHTML(mdImg, "m9");
+  check("M3: 无页预览时不渲染查看链接", !card.includes("查看原页"));
+  check("M3: 图片卡片位置用 locator_label", card.includes("第2章 &gt; 2.1 结构"));
+  // 有页预览(PDF)时保留链接
+  check("M4: PDF 仍渲染查看原页链接", SEG.imageCardHTML(E1, "m9").includes("查看原页 ↗"));
+}
+
+
 // ---- 入库进度:格式化与轮询器(md文档/deephoto_ingestion_progress_plan.md §11/§14.12)----
 {
   check("formatElapsed 秒/分/小时", SEG.formatElapsed(42000) === "42 秒"

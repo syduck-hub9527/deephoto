@@ -1,9 +1,9 @@
-"""IngestService 的 MineU 解析结果整理逻辑测试(不拉完整管线)。"""
+"""MinerU 解析结果按页兜底逻辑测试(不拉完整管线)。"""
 
 import unittest
 
 import _bootstrap  # noqa: F401
-from deephoto.pipeline.ingest import _pages_from_texts
+from deephoto.parsing.mineru_parser import pages_from_texts as _pages_from_texts
 
 
 class PagesFromTextsTest(unittest.TestCase):

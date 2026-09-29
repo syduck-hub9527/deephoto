@@ -17,6 +17,7 @@ from ..parsing.captions import find_figure_mentions
 from ..pipeline.linking import CONF_DISPLAY_THRESHOLD
 from ..security import AuthContext
 from ..storage import ObjectStore
+from .locator import locator_label
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,23 @@ _SNIPPET_CHARS = 320
 # 模型可再调用 read_chunk 读取全文。块长有硬上限(MAX_CHARS),预算约可容纳 6 个满长块。
 _FULL_TEXT_BUDGET = 8000
 _MAX_NEIGHBORS = 2
+
+
+def _chunk_entry(c: dict, docs: dict[str, dict]) -> dict:
+    """检索/读块的统一输出:带文件名、格式与位置文案;section 类文档省略页码
+    (页码是虚拟分段号,给了模型会说"第 N 页",§3.9-3)。"""
+    doc = docs.get(c["document_id"]) or {}
+    kind = doc.get("locator_kind", "page")
+    entry = {
+        "chunk_id": c["id"], "document_id": c["document_id"],
+        "document": doc.get("filename"), "source_format": doc.get("source_format"),
+        "section": c["section"],
+        "locator": locator_label(kind, c["page_start"], c["page_end"], c["section"]),
+    }
+    if kind != "section":
+        entry["page_start"] = c["page_start"]
+        entry["page_end"] = c["page_end"]
+    return entry
 
 
 class KnowledgeService:
@@ -93,6 +111,8 @@ class KnowledgeService:
         # 按分数从高到低在预算内给全文;补充进来的关联块(无分数)排最后
         ordered = sorted(chunks.values(),
                          key=lambda c: chunk_hits.get(c["id"], {}).get("score") or 0.0, reverse=True)
+        docs = repo.documents_brief(conn, [c["document_id"] for c in ordered]
+                                    + [o["document_id"] for o in occs.values()])
         budget = _FULL_TEXT_BUDGET
         chunk_entries: list[dict] = []
         for c in ordered:
@@ -101,12 +121,12 @@ class KnowledgeService:
                 budget -= len(text)
             else:
                 text, truncated = text[:_SNIPPET_CHARS] + "…", True
-            chunk_entries.append({
-                "chunk_id": c["id"], "document_id": c["document_id"],
-                "section": c["section"], "page_start": c["page_start"], "page_end": c["page_end"],
+            entry = _chunk_entry(c, docs)
+            entry.update({
                 "score": chunk_hits.get(c["id"], {}).get("score"),
                 "text": text, "truncated": truncated,
             })
+            chunk_entries.append(entry)
 
         return {
             "chunks": chunk_entries,
@@ -114,6 +134,9 @@ class KnowledgeService:
                 {
                     "image_occurrence_id": o["id"], "document_id": o["document_id"],
                     "figure_number": o["figure_number"], "page": o["page_number"],
+                    "locator_label": locator_label(
+                        (docs.get(o["document_id"]) or {}).get("locator_kind", "page"),
+                        o["page_number"]),
                     "caption": o["caption"], "description": o["description"],
                     "relation": chunk_image_rel.get(o["id"], ("matched_image", None))[0],
                     "needs_review": o["needs_review"],
@@ -135,12 +158,10 @@ class KnowledgeService:
         ordered = repo.chunks_in_order(conn, chunk["document_id"])
         index = next((i for i, c in enumerate(ordered) if c["id"] == chunk_id), 0)
         window = ordered[max(0, index - neighbors): index + neighbors + 1]
+        docs = repo.documents_brief(conn, [chunk["document_id"]])
         return {"chunks": [
-            {
-                "chunk_id": c["id"], "document_id": c["document_id"], "section": c["section"],
-                "page_start": c["page_start"], "page_end": c["page_end"], "text": c["text"],
-                "role": "target" if c["id"] == chunk_id else "neighbor",
-            }
+            dict(_chunk_entry(c, docs), text=c["text"],
+                 role="target" if c["id"] == chunk_id else "neighbor")
             for c in window
         ]}
 
@@ -152,9 +173,11 @@ class KnowledgeService:
             return [{"type": "text", "text": f"图片 {occ_id} 不存在或无权限访问"}]
         asset = repo.get_asset(conn, occ["image_asset_id"])
         image_bytes = self.store.get(asset["original_object_key"])
+        doc = repo.documents_brief(conn, [occ["document_id"]]).get(occ["document_id"]) or {}
+        where = locator_label(doc.get("locator_kind", "page"), occ["page_number"])
         header = (
             f"图片 {occ_id}(图号:{occ['figure_number'] or '无'},"
-            f"第 {occ['page_number']} 页)\n图注:{occ['caption'] or '无'}"
+            f"位置:{where})\n图注:{occ['caption'] or '无'}"
         )
         return [
             {"type": "text", "text": header},
@@ -167,9 +190,14 @@ class KnowledgeService:
     def build_image_entries(self, conn: Connection, ctx: AuthContext, occ_ids: list[str],
                             dedupe_assets: bool = True) -> list[dict]:
         """构造图片条目。dedupe_assets=True(默认)按图片资产去重,用于自动补图;
-        正文显式引用路径传 False,让每个有效锚点都保留自己的图号与出处页。"""
+        正文显式引用路径传 False,让每个有效锚点都保留自己的图号与出处页。
+
+        source_page_url 仅当文档有页预览(当前仅 pdf)时给出,否则 None;
+        locator_label 为界面统一的位置文案(§3.9-4)。
+        """
         entries: list[dict] = []
         seen_assets: set[str] = set()
+        docs: dict[str, dict] = {}
         for occ_id in occ_ids:
             occ = repo.get_occurrence(conn, occ_id)
             if occ is None or occ["tenant_id"] != ctx.tenant_id:
@@ -179,13 +207,19 @@ class KnowledgeService:
                     continue    # 同图多处出现时按命中上下文取第一个正确出处
                 seen_assets.add(occ["image_asset_id"])
             doc_id = occ["document_id"]
+            if doc_id not in docs:
+                docs.update(repo.documents_brief(conn, [doc_id]))
+            doc = docs.get(doc_id) or {}
+            kind = doc.get("locator_kind", "page")
+            has_preview = doc.get("source_format") == "pdf"
             entries.append({
                 "image_occurrence_id": occ_id,
                 "document_id": doc_id,
                 "figure_number": occ["figure_number"],
                 "caption": occ["caption"],
                 "page": occ["page_number"],
+                "locator_label": locator_label(kind, occ["page_number"]),
                 "image_url": f"/api/documents/{doc_id}/images/{occ_id}",
-                "source_page_url": f"/api/documents/{doc_id}/pages/{occ['page_number']}",
+                "source_page_url": f"/api/documents/{doc_id}/pages/{occ['page_number']}" if has_preview else None,
             })
         return entries

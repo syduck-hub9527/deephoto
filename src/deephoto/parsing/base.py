@@ -61,6 +61,8 @@ class ParsedPage:
 class ParsedDocument:
     page_count: int
     pages: list[ParsedPage]
+    # page|slide|sheet|section:page_number 的语义(真实页码/幻灯片/工作表/虚拟分段号)
+    locator_kind: str = "page"
 
     def all_paragraphs(self) -> list[ParsedParagraph]:
         return [p for page in self.pages for p in page.paragraphs]

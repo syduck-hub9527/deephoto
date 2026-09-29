@@ -61,6 +61,24 @@ def _get_int(name: str, default: int, *, minimum: int) -> int:
     return value
 
 
+def _get_formats() -> frozenset:
+    """DEEPHOTO_ALLOWED_FORMATS:逗号分隔的格式 key 白名单;空/未设置 -> 默认可用集。
+    未知 key 报错点名变量(与 DESCRIPTION_* 校验同风格)。"""
+    from .parsing.formats import supported_keys
+    raw = _get("ALLOWED_FORMATS")
+    if raw is None or not raw.strip():
+        return frozenset({"pdf", "md", "txt"})
+    keys = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    unknown = keys - set(supported_keys())
+    if unknown:
+        raise ValueError(
+            f"环境变量 {_ENV_PREFIX}ALLOWED_FORMATS 含未知格式: {', '.join(sorted(unknown))}"
+            f"(支持: {', '.join(supported_keys())})")
+    if not keys:
+        raise ValueError(f"环境变量 {_ENV_PREFIX}ALLOWED_FORMATS 为空;请至少保留一种格式")
+    return frozenset(keys)
+
+
 def _description_url_error(url: str) -> str | None:
     """Base URL 校验;只描述问题,不回显任何值(防泄露)。"""
     parsed = urlparse(url.strip())
@@ -111,6 +129,10 @@ class Settings:
     description_max_retries: int = 1
     description_max_tokens: int = 1024
 
+    # 多格式:上传白名单(formats.FormatInfo.key);默认只开当前有可用引擎的格式
+    allowed_formats: frozenset = frozenset({"pdf", "md", "txt"})
+    markdown_data_uri_max_mb: int = 10   # md 内联图(data URI)单张上限
+
     @property
     def embeddings_enabled(self) -> bool:
         return bool(self.embedding_base_url and self.embedding_model)
@@ -154,6 +176,8 @@ def load_settings() -> Settings:
         description_timeout_seconds=_get_float("DESCRIPTION_TIMEOUT_SECONDS", 90.0, minimum=1.0),
         description_max_retries=_get_int("DESCRIPTION_MAX_RETRIES", 1, minimum=0),
         description_max_tokens=_get_int("DESCRIPTION_MAX_TOKENS", 1024, minimum=1),
+        allowed_formats=_get_formats(),
+        markdown_data_uri_max_mb=_get_int("MARKDOWN_DATA_URI_MAX_MB", 10, minimum=1),
     )
     validate_description(settings)
     return settings

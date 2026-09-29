@@ -35,7 +35,7 @@ class InlineImagesTest(unittest.TestCase):
         self.other = AuthContext(tenant_id="tb", user_id="u")
         self.doc = repo.insert_document(
             self.conn, tenant_id="ta", owner_id="u", filename="a.pdf",
-            pdf_object_key="k", sha256="0" * 64, ingestion_version="v1")
+            source_object_key="k", sha256="0" * 64, ingestion_version="v1")
         repo.update_document_status(self.conn, self.doc, "ready", page_count=5)
         # 同一图片资产在不同页的两个 occurrence(复用同一对象键即可)
         self.asset = repo.get_or_create_asset(
@@ -46,7 +46,7 @@ class InlineImagesTest(unittest.TestCase):
         # 另一个租户的图(越权引用目标)
         foreign_doc = repo.insert_document(
             self.conn, tenant_id="tb", owner_id="u", filename="b.pdf",
-            pdf_object_key="k2", sha256="2" * 64, ingestion_version="v1")
+            source_object_key="k2", sha256="2" * 64, ingestion_version="v1")
         foreign_asset = repo.get_or_create_asset(
             self.conn, tenant_id="tb", sha256="3" * 64, object_key="img/3",
             width=10, height=10, mime_type="image/png")
@@ -111,7 +111,8 @@ class InlineImagesTest(unittest.TestCase):
     def test_chunk_citation_still_validated(self):
         result = self._assemble(f"见 [chunk:{self.chunk}]", chunks=(self.chunk,))
         self.assertEqual(result["citations"],
-                         [{"document_id": self.doc, "chunk_id": self.chunk, "page": 3, "page_end": 3}])
+                         [{"document_id": self.doc, "chunk_id": self.chunk, "page": 3, "page_end": 3,
+                           "label": "p.3", "filename": "a.pdf"}])
 
     def test_answer_and_stream_done_consistent(self):
         answer_text = f"看图。\n\n[image:{self.occ_p2}]\n\n解释。"

@@ -201,19 +201,26 @@
       return html.replace(/\[chunk:[A-Za-z0-9_]+\]/g, '<span class="chip cite">出处…</span>');
     }
     return html.replace(/\[chunk:([A-Za-z0-9_]+)\]/g, (_, id) =>
-      citeMap.has(id) ? `<span class="chip cite">出处 p.${esc(citeMap.get(id))}</span>` : "");
+      citeMap.has(id)
+        ? `<span class="chip cite" title="出处 ${esc(citeMap.get(id))}">出处 ${esc(citeMap.get(id))}</span>`
+        : "");
   }
 
   // ---- 图片卡片(正文插图与补充图片区共用)----
 
   // URL 只接受服务端校验条目里的路径;放大走事件委托(data-zoomable),不把 URL 放进内联 JS
+  // locator_label 由服务端按文档类型算好(p.N / 幻灯片 N / 章节路径);旧消息回退"第 N 页"
   function imageCardHTML(im, messageId) {
+    const where = im.locator_label || `第 ${im.page} 页`;
+    // source_page_url 可空:非 PDF 没有页预览,不渲染链接
+    const link = im.source_page_url
+      ? ` <a href="${esc(im.source_page_url)}" target="_blank" rel="noopener">查看原页 ↗</a>` : "";
     return `<figure class="img-card inline" id="${figureDomId(messageId, im.image_occurrence_id)}">` +
       `<img src="${esc(im.image_url)}" alt="${esc(im.caption || "文档配图")}" loading="lazy" data-zoomable="1">` +
       `<div class="img-err" hidden>图片加载失败,可打开来源页查看</div>` +
-      `<figcaption><b>${esc(figLabel(im.figure_number))}</b> · 第 ${esc(im.page)} 页` +
+      `<figcaption><b>${esc(figLabel(im.figure_number))}</b> · ${esc(where)}` +
       `${im.caption ? "<br>" + esc(im.caption) : ""}` +
-      ` <a href="${esc(im.source_page_url)}" target="_blank" rel="noopener">查看 PDF 第 ${esc(im.page)} 页 ↗</a>` +
+      link +
       `</figcaption></figure>`;
   }
 
@@ -233,7 +240,8 @@
     const validated = m.validated === true ||
       (m.validated === undefined && !streaming && !broken && Array.isArray(m.images));
     const entries = new Map((m.images || []).map(im => [im.image_occurrence_id, im]));
-    const citeMap = new Map((m.citations || []).map(c => [c.chunk_id, pageLabel(c)]));
+    // 位置文案由服务端给 label(含 "p." 前缀/章节路径);旧消息没有 label 时回退页码
+    const citeMap = new Map((m.citations || []).map(c => [c.chunk_id, c.label || "p." + pageLabel(c)]));
     const used = new Set();
     const parts = [];
     const segs = splitAnswerSegments(m.content);
@@ -252,7 +260,7 @@
         if (!im) { parts.push(`<div class="img-missing">图片引用不可用</div>`); return; }
         if (used.has(seg.id)) {
           parts.push(`<div class="img-ref"><a class="chip fig" href="#${figureDomId(m.message_id, seg.id)}">` +
-            `${esc(figLabel(im.figure_number))} · p.${esc(im.page)}</a></div>`);
+            `${esc(figLabel(im.figure_number))} · ${esc(im.locator_label || "p." + im.page)}</a></div>`);
           return;
         }
         used.add(seg.id);
@@ -269,7 +277,7 @@
 
   const PROG_STAGE_NAMES = {
     queued: "排队中", dedup_lookup: "检查已有处理结果", reuse: "复用已有结果",
-    parsing: "云端解析", persist_figures: "保存图片", chunks_and_links: "整理正文与图文关系",
+    parsing: "解析文档", persist_figures: "保存图片", chunks_and_links: "整理正文与图文关系",
     describing: "生成图片描述", indexing: "准备检索", finalizing: "完成保存",
     mineru_split: "读取与拆分", mineru_merge: "合并解析结果", index_prepare: "整理检索内容",
     embed_batches: "生成语义向量",

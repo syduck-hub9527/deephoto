@@ -25,15 +25,16 @@ class RepoTestBase(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def _insert_doc(self, ctx, filename="a.pdf"):
+    def _insert_doc(self, ctx, filename="a.pdf", parse_engine="mineru"):
         return repo.insert_document(
             self.conn,
             tenant_id=ctx.tenant_id,
             owner_id=ctx.user_id,
             filename=filename,
-            pdf_object_key="pdfs/00/x.pdf",
+            source_object_key="sources/00/x.pdf",
             sha256="0" * 64,
             ingestion_version="v1",
+            parse_engine=parse_engine,
         )
 
 
@@ -92,25 +93,80 @@ class DedupLookupTest(RepoTestBase):
         # 未 ready 时不命中
         self.assertIsNone(
             repo.find_ready_document_by_hash(
-                self.conn, self.ctx_a.tenant_id, "0" * 64, "v1"
+                self.conn, self.ctx_a.tenant_id, "0" * 64, "v1", "mineru"
             )
         )
         repo.update_document_status(self.conn, doc_id, "ready")
         hit = repo.find_ready_document_by_hash(
-            self.conn, self.ctx_a.tenant_id, "0" * 64, "v1"
+            self.conn, self.ctx_a.tenant_id, "0" * 64, "v1", "mineru"
         )
         self.assertEqual(hit["id"], doc_id)
         # 其他租户/其他版本不命中
         self.assertIsNone(
             repo.find_ready_document_by_hash(
-                self.conn, self.ctx_b.tenant_id, "0" * 64, "v1"
+                self.conn, self.ctx_b.tenant_id, "0" * 64, "v1", "mineru"
             )
         )
         self.assertIsNone(
             repo.find_ready_document_by_hash(
-                self.conn, self.ctx_a.tenant_id, "0" * 64, "v2"
+                self.conn, self.ctx_a.tenant_id, "0" * 64, "v2", "mineru"
             )
         )
+
+    def test_dedup_key_includes_parse_engine(self):
+        # 同一文件切换引擎不命中旧引擎的结果(DEV_multi_format §3.5)
+        doc_id = self._insert_doc(self.ctx_a)
+        repo.update_document_status(self.conn, doc_id, "ready")
+        self.assertIsNone(
+            repo.find_ready_document_by_hash(
+                self.conn, self.ctx_a.tenant_id, "0" * 64, "v1", "local"
+            )
+        )
+        hit = repo.find_ready_document_by_hash(
+            self.conn, self.ctx_a.tenant_id, "0" * 64, "v1", "mineru"
+        )
+        self.assertEqual(hit["id"], doc_id)
+
+
+class MigrationTest(unittest.TestCase):
+    """旧库(列名 pdf_object_key、无新列)经 init_db 自动迁移;幂等(§8 迁移)。"""
+
+    def test_old_db_migrated_with_defaults_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "old.db"
+            import sqlite3
+            raw = sqlite3.connect(str(db_path))
+            raw.execute(
+                "CREATE TABLE documents (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,"
+                " owner_id TEXT NOT NULL, filename TEXT NOT NULL, pdf_object_key TEXT NOT NULL,"
+                " sha256 TEXT NOT NULL, status TEXT NOT NULL, error TEXT,"
+                " ingestion_version TEXT NOT NULL, page_count INTEGER NOT NULL DEFAULT 0,"
+                " created_at TEXT NOT NULL)")
+            raw.execute(
+                "INSERT INTO documents (id, tenant_id, owner_id, filename, pdf_object_key,"
+                " sha256, status, ingestion_version, created_at)"
+                " VALUES ('doc_old', 'tenant_a', 'admin', 'a.pdf', 'pdfs/00/x.pdf',"
+                " 'aaaa', 'ready', 'v1', '2026-01-01T00:00:00Z')")
+            raw.commit()
+            raw.close()
+
+            init_db(db_path)
+            init_db(db_path)   # 重复执行幂等
+            conn = connect(db_path)
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(documents)")}
+            self.assertNotIn("pdf_object_key", columns)
+            for col in ("source_object_key", "source_format", "locator_kind",
+                        "parse_engine", "source_meta"):
+                self.assertIn(col, columns)
+            doc = repo.get_document(conn, "doc_old")
+            self.assertEqual(doc["source_object_key"], "pdfs/00/x.pdf")
+            self.assertEqual((doc["source_format"], doc["locator_kind"], doc["parse_engine"]),
+                             ("pdf", "page", "mineru"))
+            self.assertIsNone(doc["source_meta"])
+            # 迁移后的旧文档可命中去重(回填 mineru)
+            hit = repo.find_ready_document_by_hash(conn, "tenant_a", "aaaa", "v1", "mineru")
+            self.assertEqual(hit["id"], "doc_old")
+            conn.close()
 
 
 if __name__ == "__main__":

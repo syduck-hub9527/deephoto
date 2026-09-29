@@ -31,7 +31,7 @@ class ReadChunkTest(unittest.TestCase):
         self.ctx_b = AuthContext(tenant_id="tb", user_id="u")
         self.doc = repo.insert_document(
             self.conn, tenant_id="ta", owner_id=self.ctx_a.user_id, filename="a.pdf",
-            pdf_object_key="k", sha256="0" * 64, ingestion_version="v1")
+            source_object_key="k", sha256="0" * 64, ingestion_version="v1")
         # 5 个块;第 3 个块的关键信息在 320 字之后
         self.ids = []
         for i in range(5):
@@ -84,7 +84,7 @@ class ReadChunkTest(unittest.TestCase):
         # 去重克隆走 chunks_for_document;相邻块依赖克隆后仍保持阅读顺序
         dst_id = repo.insert_document(
             self.conn, tenant_id="ta", owner_id="u", filename="b.pdf",
-            pdf_object_key="k2", sha256="0" * 64, ingestion_version="v1")
+            source_object_key="k2", sha256="0" * 64, ingestion_version="v1")
         dst = repo.get_document(self.conn, dst_id)
         chunk_map, _ = repo.clone_document_data(self.conn, src_document_id=self.doc, dst=dst)
         cloned = [c["id"] for c in repo.chunks_in_order(self.conn, dst_id)]

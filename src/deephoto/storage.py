@@ -26,11 +26,15 @@ class ObjectStore:
     def sha256_of(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
-    def put(self, data: bytes, prefix: str, mime_type: str) -> tuple[str, str]:
-        """写入并返回 (object_key, sha256)。已存在同内容对象时直接复用。"""
+    def put(self, data: bytes, prefix: str, mime_type: str, ext: str | None = None) -> tuple[str, str]:
+        """写入并返回 (object_key, sha256)。已存在同内容对象时直接复用。
+
+        ext 显式指定扩展名(源文件按 FormatInfo.ext 存,不只看 MIME);
+        缺省回退到 MIME 映射,未知 MIME 落成 .bin。
+        """
         digest = self.sha256_of(data)
-        ext = _EXT_BY_MIME.get(mime_type, "bin")
-        key = f"{prefix}/{digest[:2]}/{digest}.{ext}"
+        suffix = ext or _EXT_BY_MIME.get(mime_type, "bin")
+        key = f"{prefix}/{digest[:2]}/{digest}.{suffix}"
         path = self.root / key
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)

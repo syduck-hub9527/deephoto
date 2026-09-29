@@ -17,7 +17,11 @@ CREATE TABLE IF NOT EXISTS documents (
     tenant_id         TEXT NOT NULL,
     owner_id          TEXT NOT NULL,
     filename          TEXT NOT NULL,
-    pdf_object_key    TEXT NOT NULL,
+    source_object_key TEXT NOT NULL,
+    source_format     TEXT NOT NULL DEFAULT 'pdf',   -- formats.FormatInfo.key
+    locator_kind      TEXT NOT NULL DEFAULT 'page',  -- page|slide|sheet|section
+    parse_engine      TEXT,                          -- mineru|local;旧文档回填 'mineru'
+    source_meta       TEXT,                          -- JSON(pdf_kind、警告数等),可空
     sha256            TEXT NOT NULL,
     status            TEXT NOT NULL,          -- queued|parsing|describing|indexing|ready|failed
     error             TEXT,
@@ -26,8 +30,8 @@ CREATE TABLE IF NOT EXISTS documents (
     created_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_documents_tenant ON documents(tenant_id, status);
--- 去重复用:同租户+同内容+同解析版本
-CREATE INDEX IF NOT EXISTS idx_documents_dedup ON documents(tenant_id, sha256, ingestion_version);
+-- 去重索引(tenant_id, sha256, ingestion_version, parse_engine)由 migrate() 统一创建:
+-- 存量旧表没有 parse_engine 列,SCHEMA 里的 CREATE INDEX 会在 executescript 阶段报错
 
 CREATE TABLE IF NOT EXISTS text_chunks (
     id                    TEXT PRIMARY KEY,
@@ -133,4 +137,34 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def init_db(db_path: Path) -> None:
-    connect(db_path).executescript(SCHEMA)
+    conn = connect(db_path)
+    conn.executescript(SCHEMA)
+    migrate(conn)
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """已有库的幂等迁移:executescript 的 IF NOT EXISTS 对存量表加列无效,逐列判断。
+
+    - pdf_object_key → source_object_key(RENAME COLUMN,需 SQLite ≥ 3.25);
+    - 新增 source_format / locator_kind / parse_engine / source_meta;
+    - 旧文档全是 PDF 且走 MinerU:parse_engine 回填 'mineru';
+    - 去重索引换成含 parse_engine 的版本。
+    """
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(documents)")}
+    if "pdf_object_key" in columns:
+        conn.execute("ALTER TABLE documents RENAME COLUMN pdf_object_key TO source_object_key")
+        columns.discard("pdf_object_key")
+        columns.add("source_object_key")
+    if "source_format" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN source_format TEXT NOT NULL DEFAULT 'pdf'")
+    if "locator_kind" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN locator_kind TEXT NOT NULL DEFAULT 'page'")
+    if "parse_engine" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN parse_engine TEXT")
+        conn.execute("UPDATE documents SET parse_engine = 'mineru' WHERE parse_engine IS NULL")
+    if "source_meta" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN source_meta TEXT")
+    conn.execute("DROP INDEX IF EXISTS idx_documents_dedup")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_dedup"
+                 " ON documents(tenant_id, sha256, ingestion_version, parse_engine)")
+    conn.commit()

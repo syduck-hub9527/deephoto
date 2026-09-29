@@ -9,7 +9,6 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from unittest import mock
 
 import _bootstrap  # noqa: F401
 
@@ -72,6 +71,9 @@ class _FakeClient:
     def __init__(self, **kwargs):
         pass
 
+    def parse_file(self, data, filename, fmt):
+        return self.parse_pdf(data, filename)
+
     def parse_pdf(self, pdf_bytes, filename="document.pdf"):
         page_texts, elements = _zip_extract(_zip_bytes(), expected_pages=2)
         return MinerUResult(page_texts=page_texts, raw={}, elements=elements)
@@ -92,11 +94,11 @@ class IngestFiguresTest(unittest.TestCase):
         pdf_key, digest = self.store.put(b"%PDF-1.4 fake", "pdf", "application/pdf")
         self.doc_id = repo.insert_document(
             self.conn, tenant_id=LOCAL_CTX.tenant_id, owner_id=LOCAL_CTX.user_id, filename="t.pdf",
-            pdf_object_key=pdf_key, sha256=digest, ingestion_version="v2")
+            source_object_key=pdf_key, sha256=digest, ingestion_version="v2")
         self.index = IndexService()
-        service = IngestService(self.settings, self.store, parser=None, index_service=self.index)
-        with mock.patch("deephoto.pipeline.ingest.MinerUClient", _FakeClient):
-            service.ingest(self.doc_id)
+        service = IngestService(self.settings, self.store, parser=None, index_service=self.index,
+                                mineru_client_factory=lambda obs: _FakeClient())
+        service.ingest(self.doc_id)
         self.knowledge = KnowledgeService(self.store, self.index)
 
     def tearDown(self):

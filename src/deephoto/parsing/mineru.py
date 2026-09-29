@@ -27,6 +27,7 @@ from urllib.request import Request, urlopen
 
 from . import pdf_backend
 from .content_list import ContentElement, parse_content_list
+from .formats import FormatInfo
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,22 @@ class MinerUClient:
 
     # ---- 对外 ----
 
+    def parse_file(self, data: bytes, filename: str, fmt: FormatInfo) -> MinerUResult:
+        """按格式解析文件。PDF 走 parse_pdf(行为逐字节等价);其他格式不拆分。
+
+        非 PDF:Office 无法安全拆分,超限直接报可读错误;页数不由 PDF 引擎推断
+        (content_list 的元素 page_idx 兜底,见 _zip_extract),单张图片强制 1 页。
+        """
+        if fmt.key == "pdf":
+            return self.parse_pdf(data, filename)
+        if len(data) > self.max_bytes_per_chunk:
+            raise MinerUError(
+                f"文件超过 MinerU 单文件限制 {self.max_bytes_per_chunk // 1_000_000}MB,"
+                "且该格式不支持拆分")
+        self._chunk_index = 1
+        expected = 1 if fmt.key == "image" else None
+        return self._parse_chunk(data, filename, expected_pages=expected, fmt=fmt)
+
     def parse_pdf(self, pdf_bytes: bytes, filename: str = "document.pdf") -> MinerUResult:
         """按两个单文件限制拆分 PDF,逐块上传,结果按原页序合并。"""
         started = time.monotonic()
@@ -133,13 +150,17 @@ class MinerUClient:
 
     # ---- 内部:各步骤 ----
 
-    def _parse_chunk(self, pdf_bytes: bytes, filename: str) -> MinerUResult:
-        expected_pages = pdf_backend.page_count(pdf_bytes)
+    def _parse_chunk(self, pdf_bytes: bytes, filename: str,
+                     expected_pages: int | None | str = "auto",
+                     fmt: FormatInfo | None = None) -> MinerUResult:
+        # expected_pages="auto":PDF 路径,由本地引擎数页(现状);非 PDF 由调用方显式给(None/1)
+        if expected_pages == "auto":
+            expected_pages = pdf_backend.page_count(pdf_bytes)
         index = getattr(self, "_chunk_index", 1)
         self._emit({"type": "chunk_start", "index": index, "pages": expected_pages,
                     "bytes": len(pdf_bytes)})
         clock = time.monotonic()
-        batch_id, upload_url = self._request_upload_url(filename)
+        batch_id, upload_url = self._request_upload_url(filename, fmt)
         self._emit({"type": "request_url_end", "index": index,
                     "duration_ms": int((time.monotonic() - clock) * 1000)})
         clock = time.monotonic()
@@ -172,12 +193,14 @@ class MinerUClient:
         except OSError:
             pass   # 调试功能,落盘失败不影响解析
 
-    def _request_upload_url(self, filename: str) -> tuple[str, str]:
+    def _request_upload_url(self, filename: str, fmt: FormatInfo | None = None) -> tuple[str, str]:
+        # 参数按格式(§3.4a):HTML 必须 MinerU-HTML;is_ocr 默认沿用 True(Office 是否受益未实测)
+        model_version = "MinerU-HTML" if (fmt and fmt.key == "html") else "vlm"
         payload = {
             "enable_formula": True,
             "enable_table": True,
             "language": "ch",
-            "model_version": "vlm",
+            "model_version": model_version,
             "files": [{"name": filename, "is_ocr": True}],
         }
         data = self._request_json("POST", "/api/v4/file-urls/batch", payload)
@@ -295,7 +318,15 @@ def _zip_extract(zip_bytes: bytes, expected_pages: int | None = None) -> tuple[l
         page_texts = _content_list_to_pages(items, expected_pages)
         images = {n: archive.read(n) for n in names
                   if n.lower().endswith(_IMAGE_EXTS) and not n.endswith("/")}
-        return page_texts, parse_content_list(items, images)
+        elements = parse_content_list(items, images)
+        # 无 expected_pages(非 PDF)时,页数不能只按"有文字的页"推断:
+        # 结尾只有图的页、纯图片输入会被丢掉(build_document 丢弃 page_idx 越界的元素)。
+        # 页数取元素 page_idx 与文字页数的大者;PDF 路径由 expected_pages 兜住,不受影响。
+        if expected_pages is None and elements:
+            inferred = max(el.page_idx for el in elements) + 1
+            if inferred > len(page_texts):
+                page_texts += [""] * (inferred - len(page_texts))
+        return page_texts, elements
 
     md_name = next((n for n in names if n.endswith("full.md")), None) or \
         next((n for n in names if n.endswith(".md")), None)

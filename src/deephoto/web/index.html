@@ -61,6 +61,9 @@
   #uploadLabel { display: block; margin: 4px 10px 8px; padding: 9px; text-align: center; font-size: 13px;
                  border: 1px dashed var(--border); border-radius: 8px; color: var(--muted); cursor: pointer; }
   #uploadLabel:hover { border-color: var(--accent); color: var(--accent); }
+  /* 文件名旁的格式标签;悬停显示解析引擎(让用户知道哪些文件会发往 MinerU 云端) */
+  .doc-fmt { flex: none; font-size: 10px; color: var(--muted); border: 1px solid var(--border);
+             border-radius: 4px; padding: 0 4px; margin-left: 4px; }
   .side-foot { padding: 12px 14px; border-top: 1px solid var(--border); display: flex; gap: 6px; }
   .side-foot input { flex: 1; min-width: 0; padding: 7px 10px; border: 1px solid var(--border);
                      border-radius: 8px; background: var(--card); color: var(--text); font-size: 12px; }
@@ -109,7 +112,8 @@
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .chip { display: inline-block; white-space: nowrap; font-size: 12px; line-height: 1.5; color: var(--muted);
           background: var(--card); border: 1px solid var(--border); border-radius: 999px; padding: 1px 9px;
-          margin: 0 2px; vertical-align: baseline; text-decoration: none; }
+          margin: 0 2px; vertical-align: baseline; text-decoration: none;
+          max-width: 240px; overflow: hidden; text-overflow: ellipsis; }  /* 章节路径可能很长,完整内容在 title */
   .chip.fig { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
   a.chip.fig:hover { text-decoration: none; filter: brightness(1.1); }
 
@@ -178,7 +182,8 @@
   <div class="brand">deep<span>photo</span></div>
   <div class="side-actions"><button id="newChatBtn" onclick="newChat()">＋ 新会话</button></div>
   <div class="side-label">文档库</div>
-  <label id="uploadLabel">上传 PDF…<input type="file" id="file" accept="application/pdf" hidden></label>
+  <!-- accept 与服务端 DEEPHOTO_ALLOWED_FORMATS 默认白名单一致(pdf/md/txt);放开更多格式需同步此处 -->
+  <label id="uploadLabel">上传文档…<input type="file" id="file" accept=".pdf,.md,.markdown,.txt" multiple hidden></label>
   <div id="docList"></div>
   <div class="side-foot">
     <button class="icon-btn" onclick="toggleTheme()" title="切换主题" id="themeBtn">🌙</button>
@@ -273,14 +278,17 @@ function renderDocs() {
   $("docList").innerHTML = stale + (docs.map(d => {
     const cls = d.status === "ready" ? "ready" : d.status === "failed" ? "failed" : "pending";
     const line = SEG.progressLine(d);
+    // 格式标签 + 引擎悬停:云端引擎意味着文件会发往 MinerU
+    const fmt = (d.source_format || "pdf").toUpperCase();
+    const engine = d.parse_engine === "local" ? "本地解析" : "云端解析(MinerU)";
     return `<div class="doc-item ${scope === d.id ? "active" : ""}" onclick="setScope('${d.id}')" title="${esc(d.filename)} · ${STATUS_LABEL[d.status] || d.status}">
-        <span class="dot ${cls}"></span><span class="doc-name">${esc(d.filename)}</span>
+        <span class="dot ${cls}"></span><span class="doc-name">${esc(d.filename)}</span><span class="doc-fmt" title="${engine}">${esc(fmt)}</span>
         <button class="doc-del" onclick="event.stopPropagation(); delDoc('${d.id}')" title="删除">×</button>
       </div>
       ${line ? `<div class="doc-prog">${esc(line)}${d.progress ? ` <a class="doc-prog-toggle" data-prog="${d.id}">${expandedDoc === d.id ? "收起耗时" : "展开耗时"}</a>` : ""}</div>
       <div class="doc-prog-detail" id="prog-${d.id}" ${expandedDoc === d.id ? "" : "hidden"}>${expandedDoc === d.id ? detailInnerHtml(d.id) : ""}</div>` : ""}
       ${d.error ? `<div class="doc-err">${esc(d.error)}</div>` : ""}`;
-  }).join("") || '<div class="doc-err" style="color:var(--muted)">暂无文档,先上传一份 PDF</div>');
+  }).join("") || '<div class="doc-err" style="color:var(--muted)">暂无文档,先上传一份文档</div>');
   const ready = docs.filter(d => d.status === "ready");
   $("scope").innerHTML = '<option value="">全部文档</option>' +
     ready.map(d => `<option value="${d.id}" ${scope === d.id ? "selected" : ""}>${esc(d.filename)}</option>`).join("");
@@ -361,13 +369,23 @@ function setScope(id) {
 function saveScope() { localStorage.setItem("deephoto_scope", $("scope").value); renderDocs(); }
 
 async function upload() {
-  const f = $("file").files[0];
-  if (!f) return;
-  const fd = new FormData(); fd.append("file", f);
-  toast("上传中…");
-  const r = await fetch("/api/documents", { method: "POST", body: fd });
-  const j = await r.json().catch(() => ({}));
-  toast(r.ok ? "已上传,后台处理中" : "上传失败:" + (j.detail || r.status));
+  // multiple:顺序逐个上传,汇总成功/失败数(单文件行为不变)
+  const files = [...$("file").files];
+  if (!files.length) return;
+  toast(files.length > 1 ? `上传 ${files.length} 个文件…` : "上传中…");
+  let ok = 0, failed = 0, lastError = "";
+  for (const f of files) {
+    const fd = new FormData(); fd.append("file", f);
+    try {
+      const r = await fetch("/api/documents", { method: "POST", body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok) ok++;
+      else { failed++; lastError = `${f.name}: ${j.detail || r.status}`; }
+    } catch (e) { failed++; lastError = `${f.name}: ${e.message || e}`; }
+  }
+  toast(failed === 0
+    ? (ok > 1 ? `已上传 ${ok} 个,后台处理中` : "已上传,后台处理中")
+    : `成功 ${ok} 个,失败 ${failed} 个(${lastError})`);
   $("file").value = "";
   refreshDocs(true);
 }
@@ -446,9 +464,9 @@ function renderThread() {
   const box = $("threadInner");
   if (!messages.length) {
     box.innerHTML = `<div class="empty"><div class="logo">📚</div>
-      <h2>向你的 PDF 提问</h2>
-      <p>先在左侧上传图文 PDF,等待状态变为“就绪”<br>
-      回答会附上出处页码,命中配图时在对应段落内嵌完整原图</p></div>`;
+      <h2>向你的文档提问</h2>
+      <p>先在左侧上传文档(PDF / Markdown / 纯文本),等待状态变为“就绪”<br>
+      回答会附上出处,命中配图时在对应段落内嵌完整原图</p></div>`;
     return;
   }
   // 仅当用户原本接近底部时才跟随滚动,图片加载/重渲染不把阅读上文的人拉走

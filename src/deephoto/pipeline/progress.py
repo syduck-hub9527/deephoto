@@ -27,7 +27,7 @@ STAGE_NAMES = {
     STAGE_QUEUED: "排队中",
     STAGE_DEDUP: "检查已有处理结果",
     STAGE_REUSE: "复用已有结果",
-    STAGE_PARSING: "云端解析",
+    STAGE_PARSING: "解析文档",
     STAGE_FIGURES: "保存图片",
     STAGE_CHUNKS: "整理正文与图文关系",
     STAGE_DESCRIBING: "生成图片描述",

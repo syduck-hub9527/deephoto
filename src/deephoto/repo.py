@@ -19,13 +19,16 @@ def _now() -> str:
 # ---- documents ----
 
 def insert_document(conn: Connection, *, tenant_id: str, owner_id: str, filename: str,
-                    pdf_object_key: str, sha256: str, ingestion_version: str) -> str:
+                    source_object_key: str, sha256: str, ingestion_version: str,
+                    source_format: str = "pdf", locator_kind: str = "page",
+                    parse_engine: str | None = None) -> str:
     doc_id = new_id("doc")
     conn.execute(
-        "INSERT INTO documents (id, tenant_id, owner_id, filename, pdf_object_key, sha256,"
-        " status, ingestion_version, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (doc_id, tenant_id, owner_id, filename, pdf_object_key, sha256,
-         "queued", ingestion_version, _now()),
+        "INSERT INTO documents (id, tenant_id, owner_id, filename, source_object_key, sha256,"
+        " status, ingestion_version, source_format, locator_kind, parse_engine, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (doc_id, tenant_id, owner_id, filename, source_object_key, sha256,
+         "queued", ingestion_version, source_format, locator_kind, parse_engine, _now()),
     )
     conn.commit()
     return doc_id
@@ -43,10 +46,22 @@ def get_owned_document(conn: Connection, document_id: str, tenant_id: str) -> di
 
 def list_documents(conn: Connection, tenant_id: str) -> list[dict]:
     rows = conn.execute(
-        "SELECT id, filename, status, error, page_count, created_at FROM documents"
+        "SELECT id, filename, status, error, page_count, created_at,"
+        " source_format, locator_kind, parse_engine FROM documents"
         " WHERE tenant_id = ? ORDER BY created_at DESC", (tenant_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def find_ready_document_by_hash(conn: Connection, tenant_id: str, sha256: str, ingestion_version: str,
+                                parse_engine: str | None) -> dict | None:
+    """去重复用键:同租户+同内容哈希+同入库版本+同解析引擎(切引擎不命中旧结果)。"""
+    row = conn.execute(
+        "SELECT * FROM documents WHERE tenant_id = ? AND sha256 = ? AND ingestion_version = ?"
+        " AND parse_engine IS ? AND status = 'ready' ORDER BY created_at ASC LIMIT 1",
+        (tenant_id, sha256, ingestion_version, parse_engine),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def update_document_status(conn: Connection, doc_id: str, status: str,
@@ -59,18 +74,21 @@ def update_document_status(conn: Connection, doc_id: str, status: str,
     conn.commit()
 
 
-def find_ready_document_by_hash(conn: Connection, tenant_id: str, sha256: str, ingestion_version: str) -> dict | None:
-    row = conn.execute(
-        "SELECT * FROM documents WHERE tenant_id = ? AND sha256 = ? AND ingestion_version = ?"
-        " AND status = 'ready' ORDER BY created_at ASC LIMIT 1",
-        (tenant_id, sha256, ingestion_version),
-    ).fetchone()
-    return dict(row) if row else None
-
-
 def next_queued_document(conn: Connection) -> dict | None:
     row = conn.execute("SELECT * FROM documents WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1").fetchone()
     return dict(row) if row else None
+
+
+def documents_brief(conn: Connection, document_ids) -> dict[str, dict]:
+    """批量取文档的展示字段(文件名/格式/位置语义),供检索与问答组装位置文案。"""
+    ids = list(dict.fromkeys(document_ids))
+    if not ids:
+        return {}
+    marks = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, filename, source_format, locator_kind FROM documents WHERE id IN ({marks})",
+        ids).fetchall()
+    return {r["id"]: dict(r) for r in rows}
 
 
 # ---- text chunks ----
@@ -143,14 +161,16 @@ def get_asset(conn: Connection, asset_id: str) -> dict | None:
 def insert_occurrence(conn: Connection, *, occ_id: str | None = None, tenant_id: str, document_id: str,
                       ingestion_version: str, image_asset_id: str, page_number: int,
                       bbox: list[float] | None, figure_number: str | None, caption: str | None,
-                      extraction_method: str, needs_review: bool) -> str:
+                      extraction_method: str, needs_review: bool,
+                      bbox_coord: str = "pdf_points") -> str:
     oid = occ_id or new_id("occ")
     conn.execute(
         "INSERT INTO image_occurrences (id, tenant_id, document_id, ingestion_version, image_asset_id,"
-        " page_number, bbox, figure_number, caption, extraction_method, needs_review)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        " page_number, bbox, bbox_coord, figure_number, caption, extraction_method, needs_review)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (oid, tenant_id, document_id, ingestion_version, image_asset_id, page_number,
-         json.dumps(bbox) if bbox else None, figure_number, caption, extraction_method, int(needs_review)),
+         json.dumps(bbox) if bbox else None, bbox_coord, figure_number, caption,
+         extraction_method, int(needs_review)),
     )
     return oid
 
@@ -286,12 +306,12 @@ def clone_document_data(conn: Connection, *, src_document_id: str, dst: dict) ->
         occ_id_map[occ["id"]] = new_occ
         conn.execute(
             "INSERT INTO image_occurrences (id, tenant_id, document_id, ingestion_version, image_asset_id,"
-            " page_number, bbox, figure_number, caption, description, visible_labels, context_summary,"
+            " page_number, bbox, bbox_coord, figure_number, caption, description, visible_labels, context_summary,"
             " uncertain_details, description_model, extraction_method, needs_review)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (new_occ, tenant, dst_id, version, occ["image_asset_id"], occ["page_number"],
-             json.dumps(occ["bbox"]) if occ["bbox"] else None, occ["figure_number"], occ["caption"],
-             occ["description"], json.dumps(occ["visible_labels"], ensure_ascii=False),
+             json.dumps(occ["bbox"]) if occ["bbox"] else None, occ["bbox_coord"], occ["figure_number"],
+             occ["caption"], occ["description"], json.dumps(occ["visible_labels"], ensure_ascii=False),
              occ["context_summary"], json.dumps(occ["uncertain_details"], ensure_ascii=False),
              occ["description_model"], occ["extraction_method"], int(occ["needs_review"])),
         )
@@ -343,10 +363,10 @@ def delete_document(conn: Connection, document_id: str, tenant_id: str) -> dict 
             conn.execute("DELETE FROM image_assets WHERE id = ?", (asset_id,))
             if asset:
                 orphan_asset_keys.append(asset["original_object_key"])
-    pdf_still_used = conn.execute(
-        "SELECT 1 FROM documents WHERE pdf_object_key = ? LIMIT 1", (doc["pdf_object_key"],)).fetchone()
+    source_still_used = conn.execute(
+        "SELECT 1 FROM documents WHERE source_object_key = ? LIMIT 1", (doc["source_object_key"],)).fetchone()
     conn.commit()
     object_keys = list(orphan_asset_keys)
-    if not pdf_still_used:
-        object_keys.append(doc["pdf_object_key"])
+    if not source_still_used:
+        object_keys.append(doc["source_object_key"])
     return {"object_keys": object_keys}

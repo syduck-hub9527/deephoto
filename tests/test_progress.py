@@ -72,6 +72,10 @@ class _FakeMinerU:
         self.chunks = chunks
         self.fail = fail
 
+    def parse_file(self, data, filename, fmt):
+        # 注册表协议(P0-5);测试只用 PDF,行为与 parse_pdf 相同
+        return self.parse_pdf(data, filename)
+
     def parse_pdf(self, pdf_bytes, filename="document.pdf"):
         e = self.on_progress
         e({"type": "split", "pages": 2, "bytes": len(pdf_bytes), "chunks": self.chunks, "duration_ms": 5})
@@ -126,7 +130,7 @@ class _FakeEmbeddings:
 @unittest.skipUnless(HAVE_DEPS, "需要 numpy 与 pillow")
 class ProgressTestBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)  # 观测库连接由其他线程持有,Windows 下清理允许残留
         root = Path(self.tmp.name)
         self.clock = _Clock()
         self.settings = Settings(
@@ -147,7 +151,7 @@ class ProgressTestBase(unittest.TestCase):
         pdf_key, digest = self.store.put(content, "pdf", "application/pdf")
         return repo.insert_document(
             self.conn, tenant_id=LOCAL_CTX.tenant_id, owner_id=LOCAL_CTX.user_id,
-            filename="t.pdf", pdf_object_key=pdf_key, sha256=sha or digest,
+            filename="t.pdf", source_object_key=pdf_key, sha256=sha or digest,
             ingestion_version="v2")
 
     def _ingest(self, doc_id, *, chunks=1, embeddings=None, describe=None, mineru_fail=False,
@@ -447,7 +451,7 @@ class LateFixesTest(ProgressTestBase):
         self.prog.register_run("run_1", doc_id, LOCAL_CTX.tenant_id)
         observer = self.prog.observer("run_1")
         observer.stage_start(pg.STAGE_PARSING)
-        from deephoto.pipeline.ingest import _MinerUProgressAdapter
+        from deephoto.parsing.mineru_parser import _MinerUProgressAdapter
         adapter = _MinerUProgressAdapter(observer)
         adapter({"type": "split", "pages": 7, "bytes": 1000, "chunks": 1, "duration_ms": 8000})
         stages = self._stages(doc_id)
@@ -598,7 +602,7 @@ class LateFixesTest(ProgressTestBase):
         pdf_key, digest = self.store.put(b"%PDF-1.4 fake", "pdf", "application/pdf")
         newer = repo.insert_document(                         # 同内容、新入库版本 -> 真正重新描述
             self.conn, tenant_id=LOCAL_CTX.tenant_id, owner_id=LOCAL_CTX.user_id,
-            filename="t.pdf", pdf_object_key=pdf_key, sha256=digest,
+            filename="t.pdf", source_object_key=pdf_key, sha256=digest,
             ingestion_version="v2-description-omni-test1")
         self._ingest(newer, describe=counting)
         self.assertGreater(calls["n"], after_first)

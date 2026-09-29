@@ -6,10 +6,12 @@ import zipfile
 import _bootstrap  # noqa: F401
 
 from deephoto.parsing import pdf_backend
+from deephoto.parsing.content_list import build_document, parse_content_list
 from deephoto.parsing.mineru import (
     MinerUClient,
     MinerUError,
     _content_list_to_pages,
+    _zip_extract,
     _zip_to_page_texts,
 )
 
@@ -57,6 +59,39 @@ class ContentListPagingTest(unittest.TestCase):
     def test_zip_falls_back_to_full_md(self):
         zb = _make_zip({"full.md": "整篇文本"})
         self.assertEqual(_zip_to_page_texts(zb), ["整篇文本"])
+
+    def test_image_only_trailing_page_not_dropped(self):
+        # 回归(DEV_multi_format §4.1): 非 PDF 没有 expected_pages,页数按"有文字的页"
+        # 推断会把结尾纯图页丢掉(build_document 丢弃 page_idx >= page_count 的元素)
+        items = [
+            {"type": "text", "text": "第一页正文", "page_idx": 0},
+            {"type": "image", "img_path": "images/a.png", "image_caption": ["图 1 示例"], "page_idx": 1},
+        ]
+        zb = _make_zip({"x_content_list.json": json.dumps(items, ensure_ascii=False),
+                        "images/a.png": b"\x89PNG-fake"})
+        page_texts, elements = _zip_extract(zb, None)
+        self.assertEqual(len(page_texts), 2)                     # 纯图页计入总页数
+        doc = build_document(parse_content_list(items, {"images/a.png": b"\x89PNG-fake"}),
+                             page_count=len(page_texts))
+        self.assertEqual(doc.page_count, 2)
+        self.assertEqual(len(doc.all_figures()), 1)              # 图不再被丢
+
+    def test_image_only_input_yields_one_page(self):
+        # 回归: 只含一张图、OCR 无文字的输入,修复前 _content_list_to_pages 返回 [](0 页)
+        items = [{"type": "image", "img_path": "images/a.png", "page_idx": 0}]
+        zb = _make_zip({"x_content_list.json": json.dumps(items, ensure_ascii=False),
+                        "images/a.png": b"\x89PNG-fake"})
+        page_texts, elements = _zip_extract(zb, None)
+        self.assertEqual(len(page_texts), 1)
+        self.assertEqual(len(elements), 1)
+
+    def test_expected_pages_path_unchanged(self):
+        # PDF 路径(有 expected_pages)行为不变:以 expected_pages 为准,不做元素推断
+        items = [{"type": "image", "img_path": "images/a.png", "page_idx": 5}]
+        zb = _make_zip({"x_content_list.json": json.dumps(items, ensure_ascii=False),
+                        "images/a.png": b"\x89PNG-fake"})
+        page_texts, _ = _zip_extract(zb, 3)
+        self.assertEqual(len(page_texts), 3)
 
     def test_preserves_trailing_blank_pages_for_original_page_numbers(self):
         zb = _make_zip(

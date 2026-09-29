@@ -16,10 +16,9 @@ from ..parsing.base import (
     KIND_PAGE_FALLBACK,
     LayoutParser,
     ParsedDocument,
-    ParsedParagraph,
 )
-from ..parsing.content_list import build_document
-from ..parsing.mineru import MINERU_DEFAULT_BASE_URL, MinerUClient, MinerUError
+from ..parsing.formats import format_by_key
+from ..parsing.registry import SourceFile, create_parser, validate_parsed
 from ..sanitize import error_summary
 from ..storage import ObjectStore
 from .chunking import chunk_paragraphs
@@ -32,65 +31,6 @@ logger = logging.getLogger(__name__)
 
 _MIME_BY_PIL_FORMAT = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
 
-# MineU 不返回页面尺寸;正文用稳定占位即可(bbox 仅占位,不影响检索)
-_PAGE_W = 612.0
-_PAGE_H = 792.0
-
-
-# 云端已知状态翻译(仅确认含义的才翻;未知状态统一"等待云端结果",不制造百分比)
-_CLOUD_STATE_LABEL = {"pending": "云端排队", "running": "云端解析"}
-
-
-class _MinerUProgressAdapter:
-    """把 MinerUClient 的普通事件翻译成观测器的阶段/单项记录。
-
-    每块按 chunk_start → (申请/上传/轮询/下载) → extract_end 顺序记录;
-    上传、等待、下载耗时分别放在单项 detail,不与 parsing 总耗时重复求和。
-    """
-
-    def __init__(self, observer):
-        self._observer = observer
-        self._download_ms: dict[int, int] = {}
-
-    def __call__(self, event: dict) -> None:
-        kind = event.get("type")
-        index = event.get("index") or 1
-        obs = self._observer
-        if kind == "split":
-            obs.stage_start("mineru_split", parent=pg.STAGE_PARSING)
-            # 拆分/合并事件自带真实耗时(客户端已计时),不能让 stage_start/end 连记成 0
-            obs.stage_end("mineru_split", duration_ms=event.get("duration_ms"), counts={
-                "pages": event.get("pages"), "bytes": event.get("bytes"),
-                "chunks": event.get("chunks")})
-        elif kind == "chunk_start":
-            obs.item_start("mineru_chunk", index,
-                           label=f"第 {index} 部分({event.get('pages')} 页)")
-        elif kind == "request_url_end":
-            obs.item_update("mineru_chunk", index, detail={"request_ms": event.get("duration_ms")})
-        elif kind == "upload_end":
-            obs.item_update("mineru_chunk", index, detail={"upload_ms": event.get("duration_ms")})
-        elif kind == "poll":
-            state = str(event.get("state") or "")
-            label = f"第 {index} 部分 · {_CLOUD_STATE_LABEL.get(state, '等待云端结果')}"
-            obs.item_update("mineru_chunk", index, label=label, detail={
-                "last_state": state, "polls": event.get("attempts"),
-                "wait_ms": event.get("elapsed_ms")})
-        elif kind == "download_end":
-            self._download_ms[index] = event.get("duration_ms") or 0
-        elif kind == "extract_end":
-            detail = {
-                "download_ms": self._download_ms.pop(index, None),
-                "extract_ms": event.get("duration_ms"),
-                "elements": event.get("elements"), "figures": event.get("figures"),
-                "fallback": event.get("fallback"),
-            }
-            obs.item_end("mineru_chunk", index, pg.ITEM_OK, detail=detail)
-        elif kind == "merge_end":
-            obs.stage_start("mineru_merge", parent=pg.STAGE_PARSING)
-            # 只含实际合并操作耗时(客户端逐块拼接时累计),用事件自带值
-            obs.stage_end("mineru_merge", duration_ms=event.get("duration_ms"), counts={
-                "chunks": event.get("chunks"), "pages": event.get("pages")})
-
 
 def _display_label(occ: dict) -> str | None:
     """图号/表号展示名(给用户看);内部 occurrence ID 只进诊断,不进入口。"""
@@ -100,32 +40,6 @@ def _display_label(occ: dict) -> str | None:
     if str(number).startswith("表"):
         return f"表 {str(number)[1:]}"
     return f"图 {number}"
-
-
-def _pages_from_texts(page_texts: list[str]) -> ParsedDocument:
-    """兜底:结果里没有 content_list 时,把 MineU 按页文本构造成 ParsedDocument(整页一段,无图形)。"""
-    from ..parsing.base import ParsedPage
-
-    pages: list[ParsedPage] = []
-    for index, text in enumerate(page_texts):
-        page_number = index + 1
-        page = ParsedPage(
-            page_number=page_number,
-            width=_PAGE_W,
-            height=_PAGE_H,
-            is_scanned=False,
-        )
-        clean = text.strip()
-        if clean:
-            page.paragraphs.append(ParsedParagraph(
-                id=f"p{page_number}_mineru",
-                text=clean,
-                page_number=page_number,
-                bbox=(0.0, 0.0, _PAGE_W, _PAGE_H),
-                section=None,
-            ))
-        pages.append(page)
-    return ParsedDocument(page_count=len(pages), pages=pages)
 
 
 class IngestService:
@@ -195,7 +109,8 @@ class IngestService:
 
         # 1) 去重复用:同租户已有同内容同版本的 ready 文档 -> 直接克隆
         observer.stage_start(pg.STAGE_DEDUP)
-        sibling = repo.find_ready_document_by_hash(conn, tenant_id, doc["sha256"], version)
+        sibling = repo.find_ready_document_by_hash(conn, tenant_id, doc["sha256"], version,
+                                                   doc.get("parse_engine"))
         hit = sibling is not None and sibling["id"] != document_id
         observer.stage_end(pg.STAGE_DEDUP, detail={"hit": hit})
         if hit:
@@ -208,15 +123,17 @@ class IngestService:
             observer.stage_end(pg.STAGE_REUSE)
             return
 
-        # 2) 解析:无论是否扫描版,一律整 PDF 交给 MineU 解析(不本地判扫描/渲染页)
-        observer.stage_start(pg.STAGE_PARSING)
+        # 2) 解析:按文档记录的格式与引擎分发(PDF→MinerU;md/txt→本地;见 parsing/registry)
+        observer.stage_start(pg.STAGE_PARSING, detail={
+            "engine": doc.get("parse_engine"), "format": doc.get("source_format")})
         repo.update_document_status(conn, document_id, "parsing")
-        pdf_bytes = self.store.get(doc["pdf_object_key"])
-        parsed = self._parse_with_mineru(doc, pdf_bytes, observer)
+        source_bytes = self.store.get(doc["source_object_key"])
+        parsed = self._parse(doc, source_bytes, observer)
         observer.stage_end(pg.STAGE_PARSING, counts={"pages": parsed.page_count})
 
         observer.stage_start(pg.STAGE_FIGURES)
-        occurrences = self._persist_figures(conn, doc, parsed, pdf_bytes)
+        occurrences = self._persist_figures(
+            conn, doc, parsed, source_bytes if doc.get("source_format") == "pdf" else None, observer)
         observer.stage_end(pg.STAGE_FIGURES, counts={"figures": len(occurrences)})
 
         observer.stage_start(pg.STAGE_CHUNKS)
@@ -224,7 +141,7 @@ class IngestService:
         conn.commit()
         observer.stage_end(pg.STAGE_CHUNKS, counts={"chunks": len(chunks)})
 
-        # 3) 图片描述(K3 多模态;无 API key 时跳过,仅以图注检索)
+        # 3) 图片描述(描述模型多模态;未启用时跳过,仅以图注检索)
         repo.update_document_status(conn, document_id, "describing")
         observer.stage_start(pg.STAGE_DESCRIBING, total=len(occurrences),
                              detail={"retry_note": "单次调用计时含 SDK 内部重试(已观测次数未知)"})
@@ -248,45 +165,45 @@ class IngestService:
         conn.commit()
         observer.stage_end(pg.STAGE_FINALIZING)
 
-    def _parse_with_mineru(self, doc: dict, pdf_bytes: bytes, observer) -> ParsedDocument:
-        """整 PDF 一律交给 MineU 解析,按页文本构造 ParsedDocument。
+    def _parse(self, doc: dict, data: bytes, observer) -> ParsedDocument:
+        """按文档记录的格式与引擎分发解析;结果统一过不变量校验(不静默 ready 空文档)。
 
-        不本地判扫描、不本地渲染页、不存整页图(600+页扫描版不再产生整页图)。
-        MineU 失败时按异常上抛,由 ingest() 标记文档 failed 供重试。
+        解析器失败按异常上抛,由 ingest() 标记文档 failed 供重试。
         """
-        if not self.settings.mineru_api_key:
-            raise MinerUError("未配置 DEEPHOTO_MINERU_API_KEY,无法解析 PDF")
-        adapter = _MinerUProgressAdapter(observer)
-        if self._mineru_client_factory is not None:
-            client = self._mineru_client_factory(adapter)
-        else:
-            client = MinerUClient(
-                api_key=self.settings.mineru_api_key,
-                base_url=self.settings.mineru_base_url or MINERU_DEFAULT_BASE_URL,
-                dump_dir=self.settings.mineru_dump_dir,
-                on_progress=adapter,
-            )
-        result = client.parse_pdf(pdf_bytes, doc.get("filename") or "document.pdf")
-        if result.elements:
-            return build_document(result.elements, page_count=len(result.page_texts))
-        logger.warning("MinerU 结果不含 content_list,退回按页纯文本(无图/表/标题)")
-        observer.warn("MinerU 结果不含 content_list,已退回纯文本(无图/表)")
-        return _pages_from_texts(result.page_texts)
+        fmt = format_by_key(doc["source_format"])
+        parser = create_parser(fmt, self.settings, engine=doc.get("parse_engine"),
+                               mineru_client_factory=self._mineru_client_factory)
+        parsed = parser.parse(
+            SourceFile(data=data, filename=doc.get("filename") or f"document.{fmt.ext}", fmt=fmt),
+            observer)
+        validate_parsed(parsed)
+        return parsed
 
-    def _persist_figures(self, conn, doc: dict, parsed: ParsedDocument, pdf_bytes: bytes) -> list[dict]:
-        """保存图片资产与出现位置;返回 [{id, page_number, figure_number, caption, parsed_figure}]。"""
+    def _persist_figures(self, conn, doc: dict, parsed: ParsedDocument,
+                         source_bytes: bytes | None, observer) -> list[dict]:
+        """保存图片资产与出现位置;返回 [{id, page_number, figure_number, caption, parsed_figure}]。
+
+        source_bytes 仅 PDF 传入(用于整页/区域回退渲染);非 PDF 没有可渲染的源,
+        既无 image_bytes 又无法回退的 figure 跳过并告警,不抛。
+        """
         from PIL import Image
 
+        is_pdf = doc.get("source_format") == "pdf" and source_bytes is not None
         records: list[dict] = []
         for page in parsed.pages:
             captions_by_id = {c.id: c for c in page.captions}
             for figure in page.figures:
-                if figure.image_bytes:            # 嵌入位图,或解析器(MinerU)已裁好的图
+                if figure.image_bytes:            # 嵌入位图,或解析器(MinerU/本地)提供的图
                     image_bytes = figure.image_bytes
+                elif not is_pdf:
+                    # 非 PDF 没有可渲染的源:跳过并告警,不能抛(§3.8)
+                    logger.warning("figure %s has no bytes and no renderable source, skipped", figure.id)
+                    observer.warn(f"第 {page.page_number} 个位置的一张图片没有可取的字节,已跳过")
+                    continue
                 elif figure.kind == KIND_PAGE_FALLBACK:
-                    image_bytes = self.parser.render_page(pdf_bytes, page.page_number)
+                    image_bytes = self.parser.render_page(source_bytes, page.page_number)
                 else:
-                    image_bytes = self.parser.render_region(pdf_bytes, page.page_number, figure.bbox)
+                    image_bytes = self.parser.render_region(source_bytes, page.page_number, figure.bbox)
                 try:
                     with Image.open(io.BytesIO(image_bytes)) as im:
                         width, height = im.size
@@ -297,6 +214,7 @@ class IngestService:
                 except Exception:
                     # 无法识别的嵌入图:统一转 PNG 失败则跳过该图
                     logger.warning("unreadable figure image %s, skipped", figure.id)
+                    observer.warn(f"一张图片格式无法识别(第 {page.page_number} 个位置),已跳过")
                     continue
                 object_key, digest = self.store.put(image_bytes, "images", mime_type)
                 asset_id = repo.get_or_create_asset(
@@ -312,6 +230,7 @@ class IngestService:
                     caption=caption.text if caption else None,
                     extraction_method=figure.kind,
                     needs_review=figure.kind == KIND_PAGE_FALLBACK,
+                    bbox_coord="pdf_points" if is_pdf else "none",
                 )
                 records.append({
                     "id": occ_id, "page_number": page.page_number,
