@@ -60,9 +60,10 @@ def _blank(prs):
     return prs.slides.add_slide(prs.slide_layouts[6])   # 空白版式
 
 
-def _textbox(slide, text, top_in, left_in):
+def _textbox(slide, text, top_in, left_in, height_in=0.5, width_in=4):
     from pptx.util import Inches
-    box = slide.shapes.add_textbox(Inches(left_in), Inches(top_in), Inches(4), Inches(0.5))
+    box = slide.shapes.add_textbox(Inches(left_in), Inches(top_in),
+                                   Inches(width_in), Inches(height_in))
     box.text_frame.text = text
     return box
 
@@ -115,6 +116,30 @@ class PptxParserTest(unittest.TestCase):
         texts = [p.text for p in doc.pages[0].paragraphs]
         self.assertEqual(texts, ["左栏第一行", "右栏第一行", "左栏第二行", "右栏第二行"])
 
+    def test_reading_order_bucket_boundary_still_one_row(self):
+        # 回归:固定格子分桶的缺陷——两栏只错位 0.02 英寸但恰跨格子边界(0.89/0.91)
+        # 仍被交错;按形状高度相对比较后归同一排
+        def build(prs):
+            s = _blank(prs)
+            _textbox(s, "左栏第一行", 0.91, 1)
+            _textbox(s, "右栏第一行", 0.89, 5)
+            _textbox(s, "左栏第二行", 2.0, 1)
+            _textbox(s, "右栏第二行", 1.98, 5)
+        doc = _parse(_pptx(build))
+        texts = [p.text for p in doc.pages[0].paragraphs]
+        self.assertEqual(texts, ["左栏第一行", "右栏第一行", "左栏第二行", "右栏第二行"])
+
+    def test_reading_order_stacked_small_boxes_not_sorted_by_left(self):
+        # 回归:上下堆叠的小文本框(相距 0.1 英寸,高 0.2 英寸)不算同一排——
+        # 固定分桶会归一桶并按 left 把靠左的下方框排到上方框前面
+        def build(prs):
+            s = _blank(prs)
+            _textbox(s, "上方框", 1.0, 5, height_in=0.2, width_in=2)
+            _textbox(s, "下方框", 1.1, 1, height_in=0.2, width_in=2)
+        doc = _parse(_pptx(build))
+        texts = [p.text for p in doc.pages[0].paragraphs]
+        self.assertEqual(texts, ["上方框", "下方框"])
+
     def test_notes_prefixed(self):
         def build(prs):
             s = _blank(prs)
@@ -130,7 +155,7 @@ class PptxParserTest(unittest.TestCase):
         def build(prs):
             s = _blank(prs)
             s.shapes.add_picture(io.BytesIO(_png()), Inches(1), Inches(1))
-            _textbox(s, "图 2.1 容量与尺寸", 2.5, 1)
+            _textbox(s, "图 2.1 容量与尺寸", 1.2, 1)   # 紧贴图片下方(图高约 0.06")
         doc = _parse(_pptx(build))
         figs = doc.all_figures()
         self.assertEqual(len(figs), 1)
@@ -142,6 +167,23 @@ class PptxParserTest(unittest.TestCase):
         texts = [p.text for p in doc.all_paragraphs()]
         self.assertEqual(texts.count("图 2.1 容量与尺寸"), 1)
         validate_parsed(doc)
+
+    def test_caption_too_far_below_not_paired(self):
+        # 回归:图注配对没有距离上限时,6.5 英寸外一句以"图 3"开头的正文会被
+        # 误配为图注(置信度 1.0 的错误关联);1 英寸上限后落为普通文本
+        from pptx.util import Inches
+
+        def build(prs):
+            s = _blank(prs)
+            s.shapes.add_picture(io.BytesIO(_png()), Inches(0.5), Inches(1))
+            _textbox(s, "图 3 只是正文里的一句", 7.0, 1)
+        doc = _parse(_pptx(build))
+        figs = doc.all_figures()
+        self.assertEqual(len(figs), 1)
+        self.assertIsNone(figs[0].caption_id)
+        self.assertEqual(doc.all_captions(), [])
+        texts = [p.text for p in doc.all_paragraphs()]
+        self.assertEqual(texts.count("图 3 只是正文里的一句"), 1)   # 文本不丢
 
     def test_caption_above_image_not_paired(self):
         # 图注样式的文本框在图片上方:位置约束拒绝配对,落为普通文本
@@ -168,8 +210,8 @@ class PptxParserTest(unittest.TestCase):
             s = _blank(prs)
             s.shapes.add_picture(io.BytesIO(_png("red")), Inches(1), Inches(1))
             s.shapes.add_picture(io.BytesIO(_png("blue")), Inches(5), Inches(1))
-            _textbox(s, "图 1.1 左图", 2.5, 1)
-            _textbox(s, "图 1.2 右图", 2.5, 5)
+            _textbox(s, "图 1.1 左图", 1.2, 1)
+            _textbox(s, "图 1.2 右图", 1.2, 5)
         doc = _parse(_pptx(build))
         figs = doc.all_figures()
         self.assertEqual(len(figs), 2)
@@ -227,7 +269,10 @@ class PptxParserTest(unittest.TestCase):
         validate_parsed(doc)
 
     def test_unreadable_shape_warns_not_silent(self):
-        # 连接线等读不到内容的形状:记告警(带形状类型),不再静默跳过
+        # 图表等确有内容但读不到的形状:记告警(带形状类型与页号),不再静默跳过;
+        # 连接线/直线是纯装饰,不告警
+        from pptx.chart.data import CategoryChartData
+        from pptx.enum.chart import XL_CHART_TYPE
         from pptx.enum.shapes import MSO_CONNECTOR
         from pptx.util import Inches
 
@@ -235,12 +280,19 @@ class PptxParserTest(unittest.TestCase):
             s = _blank(prs)
             _textbox(s, "正文保留", 1, 1)
             s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT,
-                                   Inches(1), Inches(3), Inches(2), Inches(4))
+                                   Inches(1), Inches(6), Inches(2), Inches(6.5))
+            data = CategoryChartData()
+            data.categories = ["甲", "乙"]
+            data.add_series("S1", (1, 2))
+            s.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED,
+                               Inches(1), Inches(2), Inches(4), Inches(3), data)
         observer = _Recorder()
         doc = _parse(_pptx(build), observer)
         self.assertIn("正文保留", [p.text for p in doc.all_paragraphs()])
-        self.assertTrue(any("跳过暂不支持的形状" in w and "LINE" in w
-                            for w in observer.warnings))
+        self.assertEqual(len(observer.warnings), 1)                 # 连接线不告警
+        self.assertIn("跳过暂不支持的形状", observer.warnings[0])
+        self.assertIn("CHART", observer.warnings[0])
+        self.assertIn("幻灯片 1", observer.warnings[0])             # 带页号,用户找得到
 
     def test_group_shape_recursive(self):
         from pptx.util import Inches

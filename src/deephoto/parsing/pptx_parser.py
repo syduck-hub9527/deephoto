@@ -4,21 +4,22 @@
 - 标题占位符 -> 该页 section("幻灯片 N:标题");标题文字本身仍按阅读顺序落为段落
   (标题可检索,与 docx/md 的标题处理一致);
 - 形状按"先上后下、同排先左后右"排阅读顺序(python-pptx 返回的是层叠顺序);
-  top 按 0.3 英寸分桶当同一排(手工拖放的形状常有微小纵向错位);
-  位置缺失(None)按 0 处理,同位置保持层叠序(sorted 稳定);
+  同排判定按形状高度相对比较(纵向错位 ≤ 0.3 × 较矮形状高度),容忍手工拖放
+  的微小错位;不用固定格子分桶(跨桶界仍交错、同桶内上下堆叠会按 left 排错);
 - 文本框/占位符/自选形状的文字经 text_frame 提取;组合形状递归展开;
   页脚/页码/日期/页眉占位符跳过(版式套话,入索引会污染检索排序);
 - 图片占位符(PlaceholderPicture,内置"图片+说明"版式)与普通图片同样取图;
   图片经 a:blip 的 r:embed 直取图片 part 字节(含 content_type,不经格式识别);
   EMF/WMF/SVG 跳过并告警(与 docx 同约定),其余格式由入库处统一转 PNG;
-- 图注:阅读顺序上图片之后第一条 match_caption 命中、位置在图片下方且水平重叠
-  的未配对文本(跳过普通段落与同排的图;遇下一行的图/表格/位置不符的图注即停);
-  配对后不再单独出文本段落;位置信息缺失时退化为纯邻接判断;
+- 图注:阅读顺序上图片之后第一条 match_caption 命中、位置在图片下方、水平重叠
+  且距图片底边不超过 1 英寸的未配对文本(跳过普通段落与同排的图;遇下一行的
+  图/表格/位置不符的图注即停);配对后不再单独出文本段落;
+  位置信息缺失时退化为纯邻接判断;
 - 表格按行展平(" | " 连接),复用 content_list._table_paragraphs(续段重复表头);
   被合并的格子(is_spanned)跳过,不重复输出;
 - 讲者备注:该页最后一个段落,前缀"备注:";
-- SmartArt/图表/OLE 嵌入对象 python-pptx 读不到(无文字无字节可取):跳过并记告警;
-  整篇无任何文字与图时由 validate_parsed 报可读错误。
+- 连接线/直线是纯装饰,静默跳过;图表/SmartArt/OLE 等确有内容但读不到的形状
+  记告警并带幻灯片页号;整篇无任何文字与图时由 validate_parsed 报可读错误。
 """
 
 from __future__ import annotations
@@ -54,16 +55,43 @@ class _Item:
     image_bytes: bytes | None = None
 
 
-_ROW_TOL_EMU = 274320      # 0.3 英寸:同排容差(手工拖放的形状很少精确对齐)
+_ROW_HEIGHT_RATIO = 0.3      # 同排判定:纵向错位不超过较矮形状高度的 0.3 倍(估值)
+_ROW_FALLBACK_EMU = 274320   # 高度缺失时的固定同排容差(0.3 英寸)
+# 图注顶边距图片底边的最大距离(1 英寸):图注应紧邻图片下方;无上限会把远处
+# 以"图 N"开头的正文误配成图注(错误关联的置信度却是 1.0)
+_CAPTION_MAX_GAP_EMU = 914400
 
 
-def _reading_key(shape):
-    """阅读顺序:先上后下、同排先左后右。top 按 0.3 英寸分桶——肉眼同一行但略有
-    纵向错位的形状归为一排,桶内按 left(严格 (top, left) 排序会把两栏错位形状
-    交错读);位置缺失按 0(同位置保持原层叠序,sorted 稳定)。"""
-    top = shape.top if shape.top is not None else 0
-    left = shape.left if shape.left is not None else 0
-    return (top // _ROW_TOL_EMU, left)
+def _reading_order(shapes) -> list:
+    """阅读顺序:先上后下、同排先左后右。
+
+    按 top 排序后贪心分行:与当前行的锚形状(行内最上方)比较,纵向错位
+    ≤ 0.3 × min(两者高度) 归入同一排,否则另起一排;排内按 left。
+    不用固定格子分桶:错位恰跨格子边界仍会交错;同格内上下堆叠的小文本框
+    会被按 left 把下方框排到上方框前面。位置缺失按 0;高度缺失退回固定容差。
+    """
+    def top_of(shape) -> int:
+        return shape.top if shape.top is not None else 0
+
+    def left_of(shape) -> int:
+        return shape.left if shape.left is not None else 0
+
+    rows: list[tuple[object, list]] = []     # (锚形状, 行成员)
+    for shape in sorted(shapes, key=lambda sh: (top_of(sh), left_of(sh))):
+        if rows:
+            anchor, members = rows[-1]
+            if anchor.height is not None and shape.height is not None:
+                limit = _ROW_HEIGHT_RATIO * min(anchor.height, shape.height)
+            else:
+                limit = _ROW_FALLBACK_EMU
+            if top_of(shape) - top_of(anchor) <= limit:
+                members.append(shape)
+                continue
+        rows.append((shape, [shape]))
+    out: list = []
+    for _, members in rows:
+        out.extend(sorted(members, key=left_of))
+    return out
 
 
 def _is_chrome_placeholder(shape) -> bool:
@@ -79,15 +107,19 @@ def _is_chrome_placeholder(shape) -> bool:
     }
 
 
-def _below_overlaps(img, cap) -> bool:
-    """图注位置约束:文本框在图片下方(顶边不低于图片顶边)且水平区间有重叠;
-    任一位置信息缺失时放行(退化为纯邻接判断)。"""
+def _caption_position_ok(img, cap) -> bool:
+    """图注位置约束:文本框在图片下方(顶边不低于图片顶边)、水平区间有重叠、
+    且顶边距图片底边不超过 1 英寸(图注应紧邻图片下方,无距离上限会把远处
+    以"图 N"开头的正文误配为图注)。任一位置信息缺失时放行(退化为纯邻接)。"""
     values = (img.top, img.left, img.width, cap.top, cap.left, cap.width)
     if any(v is None for v in values):
         return True
     if cap.top < img.top:
         return False
-    return cap.left < img.left + img.width and img.left < cap.left + cap.width
+    if not (cap.left < img.left + img.width and img.left < cap.left + cap.width):
+        return False
+    bottom = img.top + (img.height if img.height is not None else 0)
+    return cap.top - bottom <= _CAPTION_MAX_GAP_EMU
 
 
 def _table_text(table) -> str:
@@ -135,7 +167,7 @@ class PptxParser:
             title = (title_shape.text or "").strip() if title_shape is not None else ""
             section = f"幻灯片 {number}:{title}" if title else f"幻灯片 {number}"
 
-            items = self._walk_shapes(slide.shapes, observer)
+            items = self._walk_shapes(slide.shapes, observer, number)
             consumed: set[int] = set()      # 已配对为图注的文本 item 下标
             for i, item in enumerate(items):
                 if i in consumed:
@@ -177,12 +209,12 @@ class PptxParser:
 
         return ParsedDocument(page_count=len(pages), pages=pages, locator_kind="slide")
 
-    def _walk_shapes(self, shapes, observer) -> list[_Item]:
+    def _walk_shapes(self, shapes, observer, page_number: int) -> list[_Item]:
         """形状按阅读顺序展平:文本、图片、表格;组合形状递归(组内同样按阅读顺序)。"""
         from pptx.enum.shapes import MSO_SHAPE_TYPE
 
         out: list[_Item] = []
-        for shape in sorted(shapes, key=_reading_key):
+        for shape in _reading_order(shapes):
             if _is_chrome_placeholder(shape):
                 continue
             try:
@@ -190,11 +222,11 @@ class PptxParser:
             except NotImplementedError:
                 shape_type = None           # 无预设几何等未识别形状:按文本/表格兜底
             if shape_type == MSO_SHAPE_TYPE.GROUP:
-                out.extend(self._walk_shapes(shape.shapes, observer))
+                out.extend(self._walk_shapes(shape.shapes, observer, page_number))
             # 图片占位符(PlaceholderPicture)shape_type 是 PLACEHOLDER 而非 PICTURE,
             # 但同样有 _pic;只认 PICTURE 会静默丢图(内置"图片+说明"版式很常见)
             elif shape_type == MSO_SHAPE_TYPE.PICTURE or hasattr(shape, "_pic"):
-                blob = self._image_bytes(shape, observer)
+                blob = self._image_bytes(shape, observer, page_number)
                 if blob:
                     out.append(_Item("image", shape, image_bytes=blob))
             elif getattr(shape, "has_table", False) and shape.has_table:
@@ -206,13 +238,15 @@ class PptxParser:
                 if text:
                     out.append(_Item("text", shape, text=text))
                 # 空文本的形状(装饰用矩形等)极常见,不告警
+            elif shape_type == MSO_SHAPE_TYPE.LINE:
+                continue                    # 连接线/直线是纯装饰:没有可入库内容,不告警
             else:
-                # 图表/SmartArt/OLE/连接线等读不到内容的形状:记告警,不再静默
+                # 图表/SmartArt/OLE 等确有内容但读不到的形状:记告警(带页号),不再静默
                 label = str(shape_type) if shape_type is not None else "未识别"
-                observer.warn(f"跳过暂不支持的形状({label}),其内容未入库,其余内容不受影响")
+                observer.warn(f"幻灯片 {page_number}:跳过暂不支持的形状({label}),其内容未入库")
         return out
 
-    def _image_bytes(self, shape, observer) -> bytes | None:
+    def _image_bytes(self, shape, observer, page_number: int) -> bytes | None:
         """图片字节:经 a:blip 的 r:embed 直取图片 part(与 docx 同法,不经 python-pptx 的
         格式识别,未知格式不会炸);链接图(r:link,无嵌入字节)跳过;
         EMF/WMF/SVG 跳过并告警(Pillow 支持依平台而异,与 docx 同约定)。"""
@@ -225,7 +259,7 @@ class PptxParser:
         part = shape.part.related_part(rid)
         content_type = (getattr(part, "content_type", "") or "").lower()
         if content_type in _NON_RASTER_MIMES:
-            observer.warn(f"跳过暂不支持的图片格式({content_type}),其余内容不受影响")
+            observer.warn(f"幻灯片 {page_number}:跳过暂不支持的图片格式({content_type}),其余内容不受影响")
             return None
         return part.blob
 
@@ -254,7 +288,7 @@ def _find_caption(items: list[_Item], after: int, consumed: set[int], img) -> in
             return None
         if match_caption(item.text)[0] is None:
             continue                           # 普通段落:跳过,继续找
-        if _below_overlaps(img, item.shape):
+        if _caption_position_ok(img, item.shape):
             return j
         return None                            # 图注样式但位置不符:是别人的图注
     return None
