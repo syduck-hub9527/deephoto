@@ -67,7 +67,7 @@ def _get_formats() -> frozenset:
     from .parsing.formats import supported_keys
     raw = _get("ALLOWED_FORMATS")
     if raw is None or not raw.strip():
-        return frozenset({"pdf", "md", "txt", "docx", "pptx"})
+        return frozenset({"pdf", "md", "txt", "docx", "pptx", "doc", "ppt", "xls", "image"})
     keys = {part.strip().lower() for part in raw.split(",") if part.strip()}
     unknown = keys - set(supported_keys())
     if unknown:
@@ -76,6 +76,22 @@ def _get_formats() -> frozenset:
             f"(支持: {', '.join(supported_keys())})")
     if not keys:
         raise ValueError(f"环境变量 {_ENV_PREFIX}ALLOWED_FORMATS 为空;请至少保留一种格式")
+    return frozenset(keys)
+
+
+def _get_no_ocr_formats() -> frozenset:
+    """DEEPHOTO_MINERU_NO_OCR:逗号分隔的格式 key,这些格式走 MinerU 时 is_ocr=False。
+    默认空(全部 True,沿用 PDF 现状);born-digital 的 Office 是否受益未实测(§3.4a)。"""
+    from .parsing.formats import supported_keys
+    raw = _get("MINERU_NO_OCR")
+    if raw is None or not raw.strip():
+        return frozenset()
+    keys = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    unknown = keys - set(supported_keys())
+    if unknown:
+        raise ValueError(
+            f"环境变量 {_ENV_PREFIX}MINERU_NO_OCR 含未知格式: {', '.join(sorted(unknown))}"
+            f"(支持: {', '.join(supported_keys())})")
     return frozenset(keys)
 
 
@@ -142,11 +158,13 @@ class Settings:
     description_max_tokens: int = 1024
 
     # 多格式:上传白名单(formats.FormatInfo.key);默认只开当前有可用引擎的格式
-    allowed_formats: frozenset = frozenset({"pdf", "md", "txt", "docx", "pptx"})
+    allowed_formats: frozenset = frozenset(
+        {"pdf", "md", "txt", "docx", "pptx", "doc", "ppt", "xls", "image"})
     markdown_data_uri_max_mb: int = 10   # md 内联图(data URI)单张上限
     docx_parser: str = "local"           # local(python-docx)| mineru(云端,耗额度)
     pptx_parser: str = "local"           # local(python-pptx)| mineru(云端,耗额度)
     max_zip_uncompressed_mb: int = 500   # OOXML(zip)解压总量上限(防压缩炸弹)
+    mineru_no_ocr_formats: frozenset = frozenset()  # 这些格式走 MinerU 时 is_ocr=False(§3.4a)
 
     @property
     def embeddings_enabled(self) -> bool:
@@ -195,6 +213,7 @@ def load_settings() -> Settings:
         markdown_data_uri_max_mb=_get_int("MARKDOWN_DATA_URI_MAX_MB", 10, minimum=1),
         docx_parser=_get_choice("DOCX_PARSER", "local", ("local", "mineru")),
         pptx_parser=_get_choice("PPTX_PARSER", "local", ("local", "mineru")),
+        mineru_no_ocr_formats=_get_no_ocr_formats(),
         max_zip_uncompressed_mb=_get_int("MAX_ZIP_UNCOMPRESSED_MB", 500, minimum=1),
     )
     validate_description(settings)

@@ -192,7 +192,7 @@ class KnowledgeService:
         """构造图片条目。dedupe_assets=True(默认)按图片资产去重,用于自动补图;
         正文显式引用路径传 False,让每个有效锚点都保留自己的图号与出处页。
 
-        source_page_url 仅当文档有页预览(当前仅 pdf)时给出,否则 None;
+        source_page_url 仅当文档有页预览(pdf/image)时给出,否则 None;
         locator_label 为界面统一的位置文案(§3.9-4)。
         """
         entries: list[dict] = []
@@ -211,7 +211,7 @@ class KnowledgeService:
                 docs.update(repo.documents_brief(conn, [doc_id]))
             doc = docs.get(doc_id) or {}
             kind = doc.get("locator_kind", "page")
-            has_preview = doc.get("source_format") == "pdf"
+            has_preview = doc.get("source_format") in ("pdf", "image")
             entries.append({
                 "image_occurrence_id": occ_id,
                 "document_id": doc_id,

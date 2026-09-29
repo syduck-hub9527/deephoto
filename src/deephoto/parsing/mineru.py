@@ -64,7 +64,8 @@ class MinerUClient:
                  opener: Callable[..., Any] | None = None,
                  sleep: Callable[[float], None] = time.sleep,
                  dump_dir: str | Path | None = None,
-                 on_progress: Callable[[dict], None] | None = None):
+                 on_progress: Callable[[dict], None] | None = None,
+                 ocr_disabled: frozenset = frozenset()):
         if not api_key or not api_key.strip():
             raise MinerUError("MineU 需要 API Token")
         self.api_key = api_key.strip()
@@ -79,6 +80,7 @@ class MinerUClient:
         self._sleep = sleep
         self.dump_dir = Path(dump_dir) if dump_dir else None
         self._on_progress = on_progress
+        self.ocr_disabled = ocr_disabled   # 这些格式上传时 is_ocr=False(§3.4a,默认全 True)
 
     def _emit(self, event: dict) -> None:
         """可选观测回调:只传普通数据(不含签名地址/密钥/原文),回调异常不打断解析。"""
@@ -194,14 +196,16 @@ class MinerUClient:
             pass   # 调试功能,落盘失败不影响解析
 
     def _request_upload_url(self, filename: str, fmt: FormatInfo | None = None) -> tuple[str, str]:
-        # 参数按格式(§3.4a):HTML 必须 MinerU-HTML;is_ocr 默认沿用 True(Office 是否受益未实测)
+        # 参数按格式(§3.4a):HTML 必须 MinerU-HTML;is_ocr 默认 True(样本实测 png/doc/ppt
+        # 均正常),born-digital 的 Office 是否需要 OCR 未实测,用 ocr_disabled 按格式关
         model_version = "MinerU-HTML" if (fmt and fmt.key == "html") else "vlm"
+        is_ocr = fmt.key not in self.ocr_disabled if fmt else True
         payload = {
             "enable_formula": True,
             "enable_table": True,
             "language": "ch",
             "model_version": model_version,
-            "files": [{"name": filename, "is_ocr": True}],
+            "files": [{"name": filename, "is_ocr": is_ocr}],
         }
         data = self._request_json("POST", "/api/v4/file-urls/batch", payload)
         batch_id = data.get("batch_id")

@@ -100,13 +100,38 @@ class MinerUParser:
                 base_url=settings.mineru_base_url or MINERU_DEFAULT_BASE_URL,
                 dump_dir=settings.mineru_dump_dir,
                 on_progress=adapter,
+                ocr_disabled=settings.mineru_no_ocr_formats,
             )
         result = client.parse_file(src.data, src.filename, src.fmt)
         if result.elements:
-            return build_document(result.elements, page_count=len(result.page_texts))
-        logger.warning("MinerU 结果不含 content_list,退回按页纯文本(无图/表/标题)")
-        observer.warn("MinerU 结果不含 content_list,已退回纯文本(无图/表)")
-        return pages_from_texts(result.page_texts)
+            doc = build_document(result.elements, page_count=len(result.page_texts))
+        else:
+            logger.warning("MinerU 结果不含 content_list,退回按页纯文本(无图/表/标题)")
+            observer.warn("MinerU 结果不含 content_list,已退回纯文本(无图/表)")
+            doc = pages_from_texts(result.page_texts)
+        if src.fmt.key == "image":
+            _attach_original_figure(doc, src)
+        return doc
+
+
+def _attach_original_figure(doc: ParsedDocument, src: SourceFile) -> None:
+    """图片格式:整图本身就是唯一配图,补到第 1 页(图片来源=原图本身,§2 矩阵;
+    MinerU 对图片输入只回 OCR 文本,不回裁图——样本实测 elements 里无 image 元素)。"""
+    from io import BytesIO
+
+    from PIL import Image
+
+    from .base import KIND_EMBEDDED_BITMAP, ParsedFigure
+
+    try:
+        with Image.open(BytesIO(src.data)) as img:
+            width, height = img.size
+    except Exception:                # 魔数已过但解码失败:占位尺寸,字节照常入库
+        width, height = int(PAGE_W), int(PAGE_H)
+    doc.pages[0].figures.append(ParsedFigure(
+        id="p1_fig_orig", page_number=1, bbox=(0.0, 0.0, float(width), float(height)),
+        kind=KIND_EMBEDDED_BITMAP, image_bytes=src.data,
+    ))
 
 
 def pages_from_texts(page_texts: list[str]) -> ParsedDocument:

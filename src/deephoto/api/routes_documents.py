@@ -147,7 +147,13 @@ def get_page_preview(request: Request, document_id: str, page_number: int):
     if doc is None or page_number < 1 or (doc["page_count"] and page_number > doc["page_count"]):
         raise HTTPException(status_code=404, detail="页面不存在")
     if doc.get("source_format") != "pdf":
-        # 非 PDF 没有可渲染的页(虚拟分段/幻灯片等);图片格式走 P3 再说
+        # 图片的"页"就是原图本身(§3.9-6);其余格式(虚拟分段/幻灯片等)没有可渲染的页
+        if doc.get("source_format") == "image":
+            store = request.app.state.store
+            data = store.get(doc["source_object_key"])
+            mime = detect_format(data, doc["filename"]).mime   # 按真实魔数取 MIME
+            return Response(content=data, media_type=mime,
+                            headers={"Cache-Control": "private, max-age=600"})
         raise HTTPException(status_code=404, detail="该格式不提供页预览")
     store = request.app.state.store
     pdf_bytes = store.get(doc["source_object_key"])

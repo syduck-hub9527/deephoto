@@ -85,6 +85,49 @@ class UploadRouteTest(unittest.TestCase):
         self.assertEqual((row["source_format"], row["locator_kind"], row["parse_engine"]),
                          ("pptx", "slide", "local"))
 
+    def _cfb(self) -> bytes:
+        return bytes.fromhex("D0CF11E0A1B11AE1") + b"\x00" * 64
+
+    def _png(self) -> bytes:
+        return b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    def test_legacy_office_and_image_accepted_with_token(self):
+        # 默认 _settings 带 mineru_api_key:旧版 Office 与图片走 MinerU 云端
+        resp = self._upload(self._cfb(), "a.doc")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["source_format"], "doc")
+        from deephoto import repo
+        row = repo.get_document(self._conn(), resp.json()["document_id"])
+        self.assertEqual((row["locator_kind"], row["parse_engine"]), ("page", "mineru"))
+        resp = self._upload(self._png(), "a.png")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["source_format"], "image")
+        row = repo.get_document(self._conn(), resp.json()["document_id"])
+        self.assertEqual((row["locator_kind"], row["parse_engine"]), ("page", "mineru"))
+
+    def test_legacy_office_and_image_415_without_token(self):
+        # 无 Token 且未开描述模型:给可读原因(415),不静默排队
+        from deephoto.api.app import create_app
+        app = create_app(_settings(Path(self.tmp.name) / "sub", mineru_api_key=None))
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post("/api/documents", files={"file": ("a.doc", self._cfb())})
+        self.assertEqual(resp.status_code, 415)
+        self.assertIn("DEEPHOTO_MINERU_API_KEY", resp.json()["detail"])
+        resp = client.post("/api/documents", files={"file": ("a.png", self._png())})
+        self.assertEqual(resp.status_code, 415)
+        self.assertIn("DEEPHOTO_MINERU_API_KEY", resp.json()["detail"])
+
+    def test_image_page_preview_returns_original(self):
+        # 图片格式的"页预览"即原图本身(§3.9-6)
+        png = self._png()
+        resp = self._upload(png, "a.png")
+        self.assertEqual(resp.status_code, 200)
+        doc_id = resp.json()["document_id"]
+        page = self.client.get(f"/api/documents/{doc_id}/pages/1")
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(page.content, png)
+        self.assertEqual(page.headers["content-type"], "image/png")
+
     def test_mismatch_is_400(self):
         resp = self._upload(b"%PDF-1.4 fake", "a.md")
         self.assertEqual(resp.status_code, 400)      # 内容与扩展名不符:400
@@ -123,8 +166,13 @@ class UploadRouteTest(unittest.TestCase):
         # 前端 accept 的唯一来源:与服务端白名单一致,不走硬编码
         resp = self.client.get("/api/documents/upload-config")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["accept"], [".docx", ".markdown", ".md", ".pdf", ".pptx", ".txt"])
-        self.assertEqual(resp.json()["formats"], ["docx", "md", "pdf", "pptx", "txt"])
+        self.assertEqual(resp.json()["accept"], [
+            ".bmp", ".doc", ".docx", ".gif", ".jp2", ".jpeg", ".jpg",
+            ".markdown", ".md", ".pdf", ".png", ".ppt", ".pptx", ".txt",
+            ".webp", ".xls",
+        ])
+        self.assertEqual(resp.json()["formats"],
+                         ["doc", "docx", "image", "md", "pdf", "ppt", "pptx", "txt", "xls"])
 
     def test_upload_config_follows_custom_whitelist(self):
         from deephoto.api.app import create_app

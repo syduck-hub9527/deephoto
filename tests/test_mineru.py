@@ -116,6 +116,36 @@ class ContentListPagingTest(unittest.TestCase):
         )
 
 
+class OcrFlagByFormatTest(unittest.TestCase):
+    """is_ocr 按格式开关(§3.4a):默认全 True(样本实测 png/doc/ppt 均正常);
+    ocr_disabled 里的格式上传时 is_ocr=False。"""
+
+    def _is_ocr_sent(self, client: MinerUClient, fmt_key: str) -> bool:
+        from deephoto.parsing.formats import format_by_key
+        captured = {}
+
+        def opener(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return _Response({"success": True,
+                              "data": {"batch_id": "b1", "file_urls": ["https://oss/u"]}})
+
+        client._opener = opener
+        client._request_upload_url(f"a.{fmt_key}", format_by_key(fmt_key))
+        return captured["body"]["files"][0]["is_ocr"]
+
+    def test_default_true_for_all_formats(self):
+        client = MinerUClient(api_key="tok")
+        for key in ("pdf", "doc", "ppt", "image"):
+            self.assertTrue(self._is_ocr_sent(client, key), key)
+
+    def test_disabled_per_format(self):
+        client = MinerUClient(api_key="tok", ocr_disabled=frozenset({"doc", "ppt"}))
+        self.assertFalse(self._is_ocr_sent(client, "doc"))
+        self.assertFalse(self._is_ocr_sent(client, "ppt"))
+        self.assertTrue(self._is_ocr_sent(client, "image"))
+        self.assertTrue(self._is_ocr_sent(client, "pdf"))
+
+
 class MinerUClientFlowTest(unittest.TestCase):
     """用注入的 opener 走完 申请->轮询->下载 流程(上传走 http.client,单独 mock)。"""
 

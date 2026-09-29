@@ -1,8 +1,9 @@
 """解析器注册表:按格式与配置选择引擎,产出统一的 ParsedDocument。
 
 下游(分块/图文关联/索引/问答)只依赖 ParsedDocument,与具体引擎解耦。
-引擎选择:PDF→MinerU;md/txt→本地;其余格式的引擎在后续阶段落地(P2/P3),
-现在给出可读原因而不是默默失败。
+引擎选择:PDF/旧版 Office→MinerU;md/txt/docx/pptx→本地(可切云端);
+图片→MinerU OCR,无 Token 且开了描述模型时降级为本地整图入库(§3.4f);
+xlsx/html 在后续阶段落地,现在给出可读原因而不是默默失败。
 """
 
 from __future__ import annotations
@@ -40,10 +41,6 @@ class DocumentParser(Protocol):
 
 _UNAVAILABLE = {
     "xlsx": "Excel(xlsx)本地解析器将在后续版本提供",
-    "doc": "旧版 Word(doc)需要 MinerU 云端解析,将在后续版本提供",
-    "ppt": "旧版 PPT(ppt)需要 MinerU 云端解析,将在后续版本提供",
-    "xls": "旧版 Excel(xls)需要 MinerU 云端解析,将在后续版本提供",
-    "image": "图片文件需要 MinerU OCR 或描述模型降级路径,将在后续版本提供",
     "html": "HTML 需要 MinerU-HTML 引擎,将在后续版本提供",
 }
 
@@ -58,6 +55,20 @@ def engine_for(fmt: FormatInfo, settings: Settings) -> str:
         return settings.docx_parser     # local(默认)| mineru(切云端需 Token)
     if fmt.key == "pptx":
         return settings.pptx_parser     # local(默认)| mineru(切云端需 Token)
+    if fmt.key in ("doc", "ppt", "xls"):
+        # 旧版 Office(CFB 容器)无本地解析器,只能 MinerU 云端
+        if not settings.mineru_api_key:
+            raise EngineUnavailable(
+                f"旧版 Office(.{fmt.key})需要 MinerU 云端解析:请配置 DEEPHOTO_MINERU_API_KEY")
+        return "mineru"
+    if fmt.key == "image":
+        if settings.mineru_api_key:
+            return "mineru"             # OCR(默认)
+        if settings.description_enabled:
+            return "local"              # 降级:整图入库,靠描述模型检索(§3.4f)
+        raise EngineUnavailable(
+            "图片文件需要 MinerU OCR(配置 DEEPHOTO_MINERU_API_KEY)"
+            "或图片描述模型(配置 DEEPHOTO_DESCRIPTION_* 并启用 DESCRIPTION_ENABLED)")
     raise EngineUnavailable(_UNAVAILABLE.get(fmt.key, f"暂不支持 {fmt.key} 格式"))
 
 
@@ -82,6 +93,9 @@ def create_parser(fmt: FormatInfo, settings: Settings, *, engine: str | None = N
     if fmt.key == "pptx":
         from .pptx_parser import PptxParser
         return PptxParser(settings)
+    if fmt.key == "image":
+        from .image_parser import ImageParser
+        return ImageParser(settings)
     raise EngineUnavailable(_UNAVAILABLE.get(fmt.key, f"暂不支持 {fmt.key} 格式"))
 
 
