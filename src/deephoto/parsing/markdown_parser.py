@@ -45,8 +45,11 @@ _TAG_ATTR = r"(?:\s+[a-zA-Z_:][\w:.-]*(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'>]+
 _HTML_TAG_RE = re.compile(r"</?(?:" + "|".join(_KNOWN_TAGS) + r")" + _TAG_ATTR + r"\s*/?>",
                           re.IGNORECASE)
 _IMG_TAG_RE = re.compile(r"<img" + _TAG_ATTR + r"\s*/?>", re.IGNORECASE)
-_IMG_ALT_RE = re.compile(r"\balt\s*=\s*\"([^\"]*)\"", re.IGNORECASE)
+_IMG_ALT_RE = re.compile(r"\balt\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.IGNORECASE)
 _CONTAINER_CODE_RE = re.compile(r"`[^`\n]*`")   # 容器原文里的行内代码(示例文本,不清理)
+# 成对的 <script>/<style> 整块(标签+内容)移除,与顶层 HTML 块语义一致
+# (顶层由 _HtmlTextExtractor 丢弃其内容);不配对的孤立标签由白名单规则原样保留
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\s*\1\s*>", re.IGNORECASE | re.DOTALL)
 
 
 def _strip_front_matter(text: str) -> str:
@@ -69,25 +72,32 @@ def _strip_image_syntax(text: str) -> str:
 
 
 def _strip_inline_html(text: str) -> str:
-    """行内 HTML 去标签:<img> 保留 alt;其余已知标签整体移除(属性随标签,
-    含 src="data:..." 长串)。非标签的尖括号内容(泛型/比较符/自动链接)原样保留。"""
+    """行内 HTML 去标签:<img> 保留 alt(双引号/单引号/无引号写法都认);其余已知标签
+    整体移除(属性随标签,含 src="data:..." 长串)。非标签的尖括号内容原样保留。"""
     def img_alt(m: re.Match) -> str:
         alt = _IMG_ALT_RE.search(m.group(0))
-        return (alt.group(1).strip() if alt else "")
+        if not alt:
+            return ""
+        value = next((g for g in alt.groups() if g is not None), "")
+        return value.strip()
     return _HTML_TAG_RE.sub("", _IMG_TAG_RE.sub(img_alt, text))
 
 
 def _strip_container_markup(text: str) -> str:
-    """容器块(列表/表格/引用)原文清理:图片语法/行内 HTML 只留 alt;
-    反引号行内代码里是示例文本,原样保留不做替换。"""
+    """容器块(列表/表格/引用)原文清理:成对的 <script>/<style> 整块移除(与顶层
+    HTML 块一致);图片语法/行内 HTML 只留 alt;反引号行内代码里是示例文本,原样保留。"""
+
+    def clean(part: str) -> str:
+        return _strip_inline_html(_strip_image_syntax(_SCRIPT_STYLE_RE.sub("", part)))
+
     parts: list[str] = []
     last = 0
     for m in _CONTAINER_CODE_RE.finditer(text):
         if m.start() > last:
-            parts.append(_strip_inline_html(_strip_image_syntax(text[last:m.start()])))
+            parts.append(clean(text[last:m.start()]))
         parts.append(m.group(0))
         last = m.end()
-    parts.append(_strip_inline_html(_strip_image_syntax(text[last:])))
+    parts.append(clean(text[last:]))
     return "".join(parts)
 
 

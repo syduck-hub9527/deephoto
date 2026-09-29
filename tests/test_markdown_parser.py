@@ -207,6 +207,15 @@ class MarkdownParseTest(unittest.TestCase):
         self.assertIn("流程示意", blob)
         self.assertNotIn("base64", blob)
 
+    def test_img_alt_single_quoted_and_unquoted(self):
+        # 回归:alt 只认双引号,单引号/无引号写法会丢 alt
+        doc = _md("看 <img alt='图A' src='data:image/png;base64,AAAA'> 与 "
+                  "<img alt=图B src=\"data:image/png;base64,AAAA\">\n")
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("图A", blob)
+        self.assertIn("图B", blob)
+        self.assertNotIn("base64", blob)
+
     def test_img_tag_inside_list_stripped(self):
         big = "A" * 2000
         doc = _md(f'- 条目 <img src="data:image/png;base64,{big}"> 尾巴\n')
@@ -247,6 +256,24 @@ class MarkdownParseTest(unittest.TestCase):
         self.assertIn("`<b>x</b>`", blob)      # 行内代码原样
         self.assertNotIn("base64", blob)       # 代码外的图片语法仍只留 alt
         self.assertIn("图", blob)
+
+    def test_script_style_in_container_dropped_like_top_level(self):
+        # 一致性:容器内的 <script>/<style> 与顶层 HTML 块一样整块丢弃(前端全转义,
+        # 无安全风险,只是两处行为需一致)
+        doc = _md("- 说明 <script>alert(1)</script> 完\n\n| 列 |\n| --- |\n| <style>body{}</style> 单元 |\n")
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("说明", blob)
+        self.assertIn("单元", blob)
+        self.assertNotIn("alert", blob)
+        self.assertNotIn("body{}", blob)
+        self.assertNotIn("<script", blob)
+        self.assertNotIn("<style", blob)
+
+    def test_script_inside_inline_code_kept(self):
+        # 行内代码里的 script 是示例文本,不丢
+        doc = _md("- 写法 `<script>x()</script>` 如上\n")
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("`<script>x()</script>`", blob)
 
 
 class TextParserTest(unittest.TestCase):
