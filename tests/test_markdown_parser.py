@@ -221,6 +221,33 @@ class MarkdownParseTest(unittest.TestCase):
         blob = "\n".join(p.text for p in doc.all_paragraphs())
         self.assertIn('<img src="data:image/png;base64,AAAA">', blob)
 
+    def test_angle_brackets_that_are_not_tags_survive(self):
+        # 回归:容器原文一刀切 <[^>]+>,泛型/比较符被当标签误删
+        doc = _md("- std::vector<int> 与 a<b 且 c>d\n\n| 列 |\n| --- |\n| Map<K,V> |\n")
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("std::vector<int>", blob)
+        self.assertIn("a<b 且 c>d", blob)
+        self.assertIn("Map<K,V>", blob)
+
+    def test_top_level_generics_survive(self):
+        # 顶层段落同规则(markdown-it 会把 <int> 当 html_inline,白名单不放行)
+        doc = _md("正文 std::vector<int> 后文\n")
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("std::vector<int>", blob)
+
+    def test_autolink_kept(self):
+        doc = _md("- 见 <https://example.com/a> 即可\n")
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("<https://example.com/a>", blob)
+
+    def test_inline_code_in_container_kept_raw(self):
+        # 容器内的行内代码是示例文本:其中的标签/图片语法都不动
+        doc = _md("- 示例 `<b>x</b>` 与 ![图](data:image/png;base64,AAAA)\n")
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("`<b>x</b>`", blob)      # 行内代码原样
+        self.assertNotIn("base64", blob)       # 代码外的图片语法仍只留 alt
+        self.assertIn("图", blob)
+
 
 class TextParserTest(unittest.TestCase):
     def test_blank_line_segments(self):

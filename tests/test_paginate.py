@@ -93,6 +93,24 @@ class SplitOversizeTest(unittest.TestCase):
         for p in doc.all_paragraphs():
             self.assertNotIn("---", p.text)
 
+    def test_overwide_table_header_never_hangs(self):
+        # 回归(严重):表头接近/超过 1500 字时 room <= 0,while 零进展死循环耗尽内存。
+        # 1400 正常;1499(room=0)与 1600(room<0)修前挂死
+        for width, header_kept in ((1400, True), (1499, True), (1600, False)):
+            sep = "| --- |"
+            head_row = "| " + "h" * (width - 12) + " |"       # head 总长恰好 width
+            table = "\n".join([head_row, sep] + [f"| row{i} 内容 |" for i in range(80)])
+            doc = build_local_document([LocalBlock("text", table)])
+            texts = [p.text for p in doc.all_paragraphs()]
+            self.assertGreater(len(texts), 1, width)
+            self.assertIn("row79", "\n".join(texts), width)   # 内容不丢
+            if header_kept:
+                # 表头放得下:每个续块仍重复表头
+                self.assertTrue(all(t.startswith(head_row) for t in texts), width)
+            else:
+                # 表头自身超预算:不重复(退化为普通拆分);表头行作为内容硬切,前缀仍在首块
+                self.assertTrue(texts[0].startswith(head_row[:100]), width)
+
 
 class BuildLocalDocumentTest(unittest.TestCase):
     def test_sections_and_caption_linkage(self):

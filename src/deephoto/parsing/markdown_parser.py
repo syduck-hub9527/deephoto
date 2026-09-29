@@ -31,10 +31,22 @@ _REMOTE_RE = re.compile(r"\Ahttps?://", re.IGNORECASE)
 # 容器块(列表/表格/引用)整块切原文后,把 ![alt](...) 换成 alt;
 # data URI 的 base64 长串随之抹掉,不污染检索与分块
 _IMG_SYNTAX_RE = re.compile(r"!\[([^\]]*)\]\(\s*[^)\s]+(?:\s+\"[^\"]*\")?\s*\)")
-# 行内 HTML 去标签:<img> 保留 alt 文本,其余属性(含 src="data:..." 长串)随标签抹掉
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_IMG_TAG_RE = re.compile(r"<img\b[^>]*?>", re.IGNORECASE)
+# 行内 HTML 去标签:<img> 保留 alt 文本,其余属性(含 src="data:..." 长串)随标签抹掉。
+# 只匹配真正的标签:已知标签名 + 合法属性语法(属性名须 ASCII 字母/_/: 开头,值可引号);
+# std::vector<int>、a<b 且 c>d、Map<K,V>、<https://...> 都不是标签,原样保留
+_KNOWN_TAGS = (
+    "img", "br", "hr", "a", "b", "i", "em", "strong", "code", "span", "sup", "sub",
+    "u", "s", "del", "ins", "mark", "small", "kbd", "samp", "var", "abbr", "cite", "q",
+    "table", "thead", "tbody", "tr", "td", "th", "ul", "ol", "li", "dl", "dt", "dd",
+    "p", "div", "section", "article", "figure", "figcaption", "details", "summary",
+    "font", "center", "h1", "h2", "h3", "h4", "h5", "h6",
+)
+_TAG_ATTR = r"(?:\s+[a-zA-Z_:][\w:.-]*(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'>]+))?)*"
+_HTML_TAG_RE = re.compile(r"</?(?:" + "|".join(_KNOWN_TAGS) + r")" + _TAG_ATTR + r"\s*/?>",
+                          re.IGNORECASE)
+_IMG_TAG_RE = re.compile(r"<img" + _TAG_ATTR + r"\s*/?>", re.IGNORECASE)
 _IMG_ALT_RE = re.compile(r"\balt\s*=\s*\"([^\"]*)\"", re.IGNORECASE)
+_CONTAINER_CODE_RE = re.compile(r"`[^`\n]*`")   # 容器原文里的行内代码(示例文本,不清理)
 
 
 def _strip_front_matter(text: str) -> str:
@@ -57,11 +69,26 @@ def _strip_image_syntax(text: str) -> str:
 
 
 def _strip_inline_html(text: str) -> str:
-    """行内 HTML 去标签:<img> 保留 alt;其余标签(含 <img> 的 src="data:..." 长串)整体移除。"""
+    """行内 HTML 去标签:<img> 保留 alt;其余已知标签整体移除(属性随标签,
+    含 src="data:..." 长串)。非标签的尖括号内容(泛型/比较符/自动链接)原样保留。"""
     def img_alt(m: re.Match) -> str:
         alt = _IMG_ALT_RE.search(m.group(0))
         return (alt.group(1).strip() if alt else "")
     return _HTML_TAG_RE.sub("", _IMG_TAG_RE.sub(img_alt, text))
+
+
+def _strip_container_markup(text: str) -> str:
+    """容器块(列表/表格/引用)原文清理:图片语法/行内 HTML 只留 alt;
+    反引号行内代码里是示例文本,原样保留不做替换。"""
+    parts: list[str] = []
+    last = 0
+    for m in _CONTAINER_CODE_RE.finditer(text):
+        if m.start() > last:
+            parts.append(_strip_inline_html(_strip_image_syntax(text[last:m.start()])))
+        parts.append(m.group(0))
+        last = m.end()
+    parts.append(_strip_inline_html(_strip_image_syntax(text[last:])))
+    return "".join(parts)
 
 
 class _HtmlTextExtractor(HTMLParser):
@@ -170,10 +197,10 @@ class MarkdownParser:
                 end = tokens[j].map[1] if j < len(tokens) and tokens[j].map else \
                     (tok.map[1] if tok.map else None)
                 raw = self._slice(lines, (tok.map[0], end)) if tok.map and end is not None else ""
-                # 容器内的图片语法/行内 HTML 只留 alt;围栏代码原样保留仅对顶层围栏成立:
-                # 容器(列表/表格/引用)内嵌套的围栏不做二次识别,其中若有示例图片语法
-                # 也会被替换成 alt——只影响示例文本的展示,不进检索的图不存在于此
-                raw = _strip_inline_html(_strip_image_syntax(raw))
+                # 容器内的图片语法/行内 HTML 只留 alt(真标签才动;行内代码原样);
+                # 围栏代码原样保留仅对顶层围栏成立:容器内嵌套的围栏不做二次识别,
+                # 其中若有示例图片语法也会被替换成 alt——只影响示例文本的展示
+                raw = _strip_container_markup(raw)
                 if raw.strip():
                     blocks.append(LocalBlock("text", text=raw))
                 i = j + 1

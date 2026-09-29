@@ -70,11 +70,17 @@ def paginate(blocks: list[LocalBlock]) -> list[int]:
 
 def _split_text_block(block: LocalBlock) -> list[LocalBlock]:
     """超长文本块按行拆开(单行超长硬切);markdown 表格块的每个续块重复表头两行,
-    检索命中后段时不丢列含义(与 content_list._table_paragraphs 的续段表头同约定)。"""
+    检索命中后段时不丢列含义(与 content_list._table_paragraphs 的续段表头同约定)。
+
+    防线(表头过宽死循环):表头自身 >= 预算时不重复表头(退化为普通拆分);
+    room 永远 >= 200,保证硬切每轮都缩短 line,不会零进展空转。
+    """
     lines = block.text.split("\n")
     header = _table_header(lines)
     head = "\n".join(header)
-    room = _BLOCK_SPLIT_CHARS - (len(head) + 1 if head else 0)
+    if head and len(head) >= _BLOCK_SPLIT_CHARS:
+        header, head = [], ""        # 表头自身超长:重复它没有意义也放不下,放弃重复
+    room = max(_BLOCK_SPLIT_CHARS - (len(head) + 1 if head else 0), 200)
     pieces: list[str] = []
     buf = ""
 
