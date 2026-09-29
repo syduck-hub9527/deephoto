@@ -67,7 +67,7 @@ def _get_formats() -> frozenset:
     from .parsing.formats import supported_keys
     raw = _get("ALLOWED_FORMATS")
     if raw is None or not raw.strip():
-        return frozenset({"pdf", "md", "txt", "docx"})
+        return frozenset({"pdf", "md", "txt", "docx", "pptx"})
     keys = {part.strip().lower() for part in raw.split(",") if part.strip()}
     unknown = keys - set(supported_keys())
     if unknown:
@@ -142,9 +142,10 @@ class Settings:
     description_max_tokens: int = 1024
 
     # 多格式:上传白名单(formats.FormatInfo.key);默认只开当前有可用引擎的格式
-    allowed_formats: frozenset = frozenset({"pdf", "md", "txt", "docx"})
+    allowed_formats: frozenset = frozenset({"pdf", "md", "txt", "docx", "pptx"})
     markdown_data_uri_max_mb: int = 10   # md 内联图(data URI)单张上限
     docx_parser: str = "local"           # local(python-docx)| mineru(云端,耗额度)
+    pptx_parser: str = "local"           # local(python-pptx)| mineru(云端,耗额度)
     max_zip_uncompressed_mb: int = 500   # OOXML(zip)解压总量上限(防压缩炸弹)
 
     @property
@@ -193,6 +194,7 @@ def load_settings() -> Settings:
         allowed_formats=_get_formats(),
         markdown_data_uri_max_mb=_get_int("MARKDOWN_DATA_URI_MAX_MB", 10, minimum=1),
         docx_parser=_get_choice("DOCX_PARSER", "local", ("local", "mineru")),
+        pptx_parser=_get_choice("PPTX_PARSER", "local", ("local", "mineru")),
         max_zip_uncompressed_mb=_get_int("MAX_ZIP_UNCOMPRESSED_MB", 500, minimum=1),
     )
     validate_description(settings)
