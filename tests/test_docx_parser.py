@@ -296,6 +296,48 @@ class DocxParserTest(unittest.TestCase):
         self.assertEqual(blob.count("总标题合并"), 1)          # 合并文字只出现一次
         self.assertIn("甲 | 乙 | 丙", blob)                    # 普通行不受影响
 
+    def test_textbox_alternate_content_not_duplicated(self):
+        # 回归:文本框在 mc:AlternateContent 里存了 Choice/Fallback 两份,修前读两遍;
+        # 框内多个段落之间补换行,不粘连
+        from docx.oxml import OxmlElement
+        from lxml import etree
+        _MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+        def _mc(tag):   # python-docx 的 nsmap 没有 mc 前缀,用 Clark 记法直接建
+            return etree.Element(f"{{{_MC}}}{tag}")
+
+        def _txbx(parent_tag):
+            holder = OxmlElement("w:drawing" if parent_tag == "mc:Choice" else "w:pict")
+            txbx = OxmlElement("w:txbxContent")
+            for line in ("文本框里的重要内容", "文本框第二段"):
+                tp, tr, tt = OxmlElement("w:p"), OxmlElement("w:r"), OxmlElement("w:t")
+                tt.text = line
+                tr.append(tt)
+                tp.append(tr)
+                txbx.append(tp)
+            holder.append(txbx)
+            return holder
+
+        def build(d):
+            d.add_paragraph("这份文档的正文内容足够长,超过了五十个字的回退阈值,本地解析可以正常进行,不回退。")
+            p = d.add_paragraph("锚点段落 ")
+            r = OxmlElement("w:r")
+            ac = _mc("AlternateContent")
+            choice = _mc("Choice")
+            choice.append(_txbx("mc:Choice"))
+            fallback = _mc("Fallback")
+            fallback.append(_txbx("mc:Fallback"))
+            ac.append(choice)
+            ac.append(fallback)
+            r.append(ac)
+            p._p.append(r)
+
+        doc = _parse(_docx(build))
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertEqual(blob.count("文本框里的重要内容"), 1)      # Choice/Fallback 只读一份
+        self.assertIn("文本框里的重要内容\n文本框第二段", blob)     # 框内段间有分隔
+        self.assertIn("锚点段落", blob)
+
     def test_table_rows_with_header_repeat_on_continuation(self):
         def build(d):
             d.add_paragraph("参数表:")     # 充字数,避免触发回退

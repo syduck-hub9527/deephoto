@@ -37,6 +37,8 @@ _HEADING_CN_RE = re.compile(r"^标题\s*(\d+)$")
 _NON_RASTER_MIMES = {"image/x-emf", "image/x-wmf", "image/svg+xml", "image/emf", "image/wmf"}
 # 本地解析正文的最低字数;低于此且含绘图对象时判定内容在文本框/形状里,回退 MinerU
 _MIN_TEXT_CHARS = 50
+# markup-compatibility 命名空间(mc:AlternateContent 的 Choice/Fallback 双份内容)
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 
 
 class DocxParser:
@@ -225,9 +227,13 @@ def _paragraph_text(para, qn) -> str:
     python-docx 的 Paragraph.text 只覆盖 w:r / w:hyperlink 直接子节点,不含 w:ins
     里的 run(开着修订的合同/评审稿会丢改动内容)。本实现递归遍历,顺带覆盖
     行级 w:sdt/w:smartTag 与文本框(w:txbxContent)里的文字;域指令(w:instrText)跳过。
+    文本框/形状在 mc:AlternateContent 里同时存 mc:Choice 与 mc:Fallback 两份内容,
+    只读第一个 mc:Choice(否则文字重复两遍);文本框内嵌套段落之间补换行,防粘连。
     """
     parts: list[str] = []
     _SKIP = {qn("w:del"), qn("w:delText"), qn("w:instrText")}
+    # markup-compatibility 命名空间直接写 Clark 形式,不依赖 qn() 的 nsmap
+    _AC, _CHOICE = ("{%s}AlternateContent" % _MC_NS, "{%s}Choice" % _MC_NS)
 
     def walk(el) -> None:
         for node in el.iterchildren():
@@ -240,6 +246,13 @@ def _paragraph_text(para, qn) -> str:
                 parts.append("\t")
             elif tag in (qn("w:br"), qn("w:cr")):
                 parts.append("\n")
+            elif tag == _AC:
+                choice = node.find(_CHOICE)     # 只取第一个 Choice;Fallback 是同一内容的另一份
+                if choice is not None:
+                    walk(choice)
+            elif tag == qn("w:p"):
+                walk(node)
+                parts.append("\n")              # 文本框/形状内的嵌套段落:段间补换行
             else:
                 walk(node)
 
