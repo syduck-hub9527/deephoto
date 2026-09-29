@@ -102,6 +102,19 @@ class PptxParserTest(unittest.TestCase):
         texts = [p.text for p in doc.pages[0].paragraphs]
         self.assertEqual(texts, ["上方的段落", "同排右侧", "下方的段落"])
 
+    def test_reading_order_tolerates_slight_misalignment(self):
+        # 回归:两栏布局,右栏比左栏高 0.05 英寸(肉眼同一行)——严格 (top, left)
+        # 排序会把两栏交错读;0.3 英寸分桶后同排先左后右
+        def build(prs):
+            s = _blank(prs)
+            _textbox(s, "左栏第一行", 1.0, 1)
+            _textbox(s, "右栏第一行", 0.95, 5)   # 错位 0.05",肉眼同一行
+            _textbox(s, "左栏第二行", 2.0, 1)
+            _textbox(s, "右栏第二行", 1.95, 5)
+        doc = _parse(_pptx(build))
+        texts = [p.text for p in doc.pages[0].paragraphs]
+        self.assertEqual(texts, ["左栏第一行", "右栏第一行", "左栏第二行", "右栏第二行"])
+
     def test_notes_prefixed(self):
         def build(prs):
             s = _blank(prs)
@@ -164,6 +177,70 @@ class PptxParserTest(unittest.TestCase):
         self.assertEqual(caps[figs[0].caption_id].figure_number, "1.1")
         self.assertEqual(caps[figs[1].caption_id].figure_number, "1.2")
         validate_parsed(doc)
+
+    def test_chrome_placeholders_skipped(self):
+        # 回归:页脚/页码/日期/页眉占位符修前当正文入库,每页多出"1"、日期、
+        # 公司页脚等文本进索引,污染检索排序(python-pptx 加页不克隆这类占位符,
+        # fixture 用 XML 注入)
+        from pptx.oxml import parse_xml
+        from pptx.oxml.ns import nsdecls
+
+        def inject(slide, ph_type, text, shape_id):
+            sp = parse_xml(
+                f'<p:sp {nsdecls("p", "a")}>'
+                f'<p:nvSpPr><p:cNvPr id="{shape_id}" name="ph{shape_id}"/>'
+                f'<p:cNvSpPr/><p:nvPr><p:ph type="{ph_type}"/></p:nvPr></p:nvSpPr>'
+                '<p:spPr/>'
+                f'<p:txBody><a:bodyPr/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody>'
+                '</p:sp>')
+            slide.shapes._spTree.append(sp)
+
+        def build(prs):
+            s = prs.slides.add_slide(prs.slide_layouts[5])   # Title Only
+            s.shapes.title.text = "标题"
+            _textbox(s, "正文要点", 2, 1)
+            inject(s, "dt", "2026-09-29", 100)
+            inject(s, "ftr", "某公司内部资料 请勿外传", 101)
+            inject(s, "sldNum", "1", 102)
+            inject(s, "hdr", "页眉文字", 103)
+        doc = _parse(_pptx(build))
+        texts = [p.text for p in doc.all_paragraphs()]
+        self.assertEqual(texts, ["标题", "正文要点"])
+
+    def test_picture_placeholder_inserted_image_kept(self):
+        # 回归:版式"图片+说明"里 ph.insert_picture 的形状是 PlaceholderPicture
+        # (shape_type=PLACEHOLDER 而非 PICTURE),修前四个分支全落空,静默丢图
+        def build(prs):
+            s = prs.slides.add_slide(prs.slide_layouts[8])   # Picture with Caption
+            s.shapes.title.text = "标题"
+            s.placeholders[1].insert_picture(io.BytesIO(_png()))
+            s.placeholders[2].text_frame.text = "图 3.1 占位符插图"
+        observer = _Recorder()
+        doc = _parse(_pptx(build), observer)
+        figs = doc.all_figures()
+        self.assertEqual(len(figs), 1)
+        caps = {c.id: c for c in doc.all_captions()}
+        self.assertEqual(caps[figs[0].caption_id].figure_number, "3.1")   # 图注照常配对
+        texts = [p.text for p in doc.all_paragraphs()]
+        self.assertEqual(texts.count("图 3.1 占位符插图"), 1)
+        self.assertEqual(observer.warnings, [])
+        validate_parsed(doc)
+
+    def test_unreadable_shape_warns_not_silent(self):
+        # 连接线等读不到内容的形状:记告警(带形状类型),不再静默跳过
+        from pptx.enum.shapes import MSO_CONNECTOR
+        from pptx.util import Inches
+
+        def build(prs):
+            s = _blank(prs)
+            _textbox(s, "正文保留", 1, 1)
+            s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT,
+                                   Inches(1), Inches(3), Inches(2), Inches(4))
+        observer = _Recorder()
+        doc = _parse(_pptx(build), observer)
+        self.assertIn("正文保留", [p.text for p in doc.all_paragraphs()])
+        self.assertTrue(any("跳过暂不支持的形状" in w and "LINE" in w
+                            for w in observer.warnings))
 
     def test_group_shape_recursive(self):
         from pptx.util import Inches

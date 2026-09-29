@@ -3,17 +3,21 @@
 - 一张幻灯片 = 一个 ParsedPage(locator_kind='slide',页码即幻灯片序号,天然有位置);
 - 标题占位符 -> 该页 section("幻灯片 N:标题");标题文字本身仍按阅读顺序落为段落
   (标题可检索,与 docx/md 的标题处理一致);
-- 形状按 (top, left) 排序当阅读顺序(python-pptx 返回的是层叠顺序,不是阅读顺序);
+- 形状按"先上后下、同排先左后右"排阅读顺序(python-pptx 返回的是层叠顺序);
+  top 按 0.3 英寸分桶当同一排(手工拖放的形状常有微小纵向错位);
   位置缺失(None)按 0 处理,同位置保持层叠序(sorted 稳定);
 - 文本框/占位符/自选形状的文字经 text_frame 提取;组合形状递归展开;
-- 图片经 a:blip 的 r:embed 直取图片 part 字节(含 content_type,不经格式识别);
+  页脚/页码/日期/页眉占位符跳过(版式套话,入索引会污染检索排序);
+- 图片占位符(PlaceholderPicture,内置"图片+说明"版式)与普通图片同样取图;
+  图片经 a:blip 的 r:embed 直取图片 part 字节(含 content_type,不经格式识别);
   EMF/WMF/SVG 跳过并告警(与 docx 同约定),其余格式由入库处统一转 PNG;
-- 图注:阅读顺序上图片之后最近一条未配对文本,match_caption 命中且位置在图片下方、
-  水平有重叠则配对(配对后不再单独出文本段落;位置信息缺失时退化为纯邻接判断);
+- 图注:阅读顺序上图片之后第一条 match_caption 命中、位置在图片下方且水平重叠
+  的未配对文本(跳过普通段落与同排的图;遇下一行的图/表格/位置不符的图注即停);
+  配对后不再单独出文本段落;位置信息缺失时退化为纯邻接判断;
 - 表格按行展平(" | " 连接),复用 content_list._table_paragraphs(续段重复表头);
   被合并的格子(is_spanned)跳过,不重复输出;
 - 讲者备注:该页最后一个段落,前缀"备注:";
-- SmartArt/图表/OLE 嵌入对象 python-pptx 读不到(无文字无字节可取):跳过;
+- SmartArt/图表/OLE 嵌入对象 python-pptx 读不到(无文字无字节可取):跳过并记告警;
   整篇无任何文字与图时由 validate_parsed 报可读错误。
 """
 
@@ -50,11 +54,29 @@ class _Item:
     image_bytes: bytes | None = None
 
 
+_ROW_TOL_EMU = 274320      # 0.3 英寸:同排容差(手工拖放的形状很少精确对齐)
+
+
 def _reading_key(shape):
-    """阅读顺序:先上后下、同排先左后右;位置缺失按 0(同位置保持原层叠序)。"""
+    """阅读顺序:先上后下、同排先左后右。top 按 0.3 英寸分桶——肉眼同一行但略有
+    纵向错位的形状归为一排,桶内按 left(严格 (top, left) 排序会把两栏错位形状
+    交错读);位置缺失按 0(同位置保持原层叠序,sorted 稳定)。"""
     top = shape.top if shape.top is not None else 0
     left = shape.left if shape.left is not None else 0
-    return (top, left)
+    return (top // _ROW_TOL_EMU, left)
+
+
+def _is_chrome_placeholder(shape) -> bool:
+    """页脚/页码/日期/页眉占位符:版式套话不是正文,跳过——否则每页多出几条无意义
+    文本("1"、"2026-09-29"、公司页脚)进索引,页脚文字还会在几乎每个块里命中,
+    污染 BM25 排序。标题/正文/图片占位符不在此列。"""
+    if not getattr(shape, "is_placeholder", False):
+        return False
+    from pptx.enum.shapes import PP_PLACEHOLDER
+    return shape.placeholder_format.type in {
+        PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER,
+        PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.HEADER,
+    }
 
 
 def _below_overlaps(img, cap) -> bool:
@@ -125,9 +147,8 @@ class PptxParser:
                         add_paragraph(page, section, piece)
                 else:                        # image
                     caption: str | None = None
-                    j = _next_text(items, i, consumed)
-                    if j is not None and match_caption(items[j].text)[0] is not None \
-                            and _below_overlaps(item.shape, items[j].shape):
+                    j = _find_caption(items, i, consumed, item.shape)
+                    if j is not None:
                         caption = items[j].text
                         consumed.add(j)
                     caption_id = None
@@ -162,13 +183,17 @@ class PptxParser:
 
         out: list[_Item] = []
         for shape in sorted(shapes, key=_reading_key):
+            if _is_chrome_placeholder(shape):
+                continue
             try:
                 shape_type = shape.shape_type
             except NotImplementedError:
                 shape_type = None           # 无预设几何等未识别形状:按文本/表格兜底
             if shape_type == MSO_SHAPE_TYPE.GROUP:
                 out.extend(self._walk_shapes(shape.shapes, observer))
-            elif shape_type == MSO_SHAPE_TYPE.PICTURE:
+            # 图片占位符(PlaceholderPicture)shape_type 是 PLACEHOLDER 而非 PICTURE,
+            # 但同样有 _pic;只认 PICTURE 会静默丢图(内置"图片+说明"版式很常见)
+            elif shape_type == MSO_SHAPE_TYPE.PICTURE or hasattr(shape, "_pic"):
                 blob = self._image_bytes(shape, observer)
                 if blob:
                     out.append(_Item("image", shape, image_bytes=blob))
@@ -180,6 +205,11 @@ class PptxParser:
                 text = shape.text_frame.text.strip()
                 if text:
                     out.append(_Item("text", shape, text=text))
+                # 空文本的形状(装饰用矩形等)极常见,不告警
+            else:
+                # 图表/SmartArt/OLE/连接线等读不到内容的形状:记告警,不再静默
+                label = str(shape_type) if shape_type is not None else "未识别"
+                observer.warn(f"跳过暂不支持的形状({label}),其内容未入库,其余内容不受影响")
         return out
 
     def _image_bytes(self, shape, observer) -> bytes | None:
@@ -200,10 +230,31 @@ class PptxParser:
         return part.blob
 
 
-def _next_text(items: list[_Item], after: int, consumed: set[int]) -> int | None:
-    """图片之后第一条未配对的文本 item 下标(跳过图/表与已配对的图注);
-    找到的这条若配不上(非图注或位置不符)也不再往后找,避免抢走远处图注。"""
+def _find_caption(items: list[_Item], after: int, consumed: set[int], img) -> int | None:
+    """图片的图注:阅读顺序上其后第一条 match_caption 命中、位于图片下方且水平重叠
+    的未配对文本。扫描规则:
+    - 跳过普通文本段落("图片+说明"版式的标题就位于图片与图注之间);
+    - 跳过同排/上方的图片(并排双图各自配对,互不抢注);
+    - 遇到明确位于图片下方的下一张图、或表格:停止(不抢下一行内容的图注);
+    - 遇到图注样式但位置不符的文本:停止(那是别人的图注,不越过去找更远的)。
+    """
+    bottom = None
+    if img.top is not None and img.height is not None:
+        bottom = img.top + img.height
     for j in range(after + 1, len(items)):
-        if items[j].kind == "text" and j not in consumed:
+        if j in consumed:
+            continue
+        item = items[j]
+        if item.kind == "image":
+            top = item.shape.top
+            if bottom is not None and top is not None and top >= bottom:
+                return None                    # 下一行的图:本图的图注不会再出现
+            continue
+        if item.kind == "table":
+            return None
+        if match_caption(item.text)[0] is None:
+            continue                           # 普通段落:跳过,继续找
+        if _below_overlaps(img, item.shape):
             return j
+        return None                            # 图注样式但位置不符:是别人的图注
     return None
