@@ -25,6 +25,7 @@ from ..db import connect
 from ..llm import build_chat_model
 from ..parsing.captions import asks_for_images
 from ..security import AuthContext
+from .answer_format import normalize_image_anchors
 from .knowledge import KnowledgeService
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,8 @@ SYSTEM_PROMPT = (
     "不要只凭图片的文字描述下结论。\n"
     "4. 引用证据必须使用固定格式:正文 [chunk:chunk_id],图片 [image:image_occurrence_id];"
     "只能引用工具返回过的 ID,不得编造页码、图号或图片。\n"
-    "5. 回答中注明出处页码(证据里的 page_start / page 字段)。\n"
+    "5. 出处页码由界面根据 [chunk:ID] 自动标注:不要在正文里再手写“(第 N 页)”或“p.N”,\n"
+    "   除非用户问的就是页码。每个事实只引用一次,不要把同一结论在不同小节里重复表述。\n"
     "6. 检索不到可靠依据时明确说明不知道,不要编造内容。\n"
     "7. 需要展示证据图片时,在解释到该图的位置插入 [image:image_occurrence_id]:标记独占一行、"
     "前后各空一行,它将被界面替换为 PDF 原图;多张图分别放在各自相关的段落之间,"
@@ -193,6 +195,9 @@ class QAService:
         allowed_chunks = tracker["chunks"] | extra_chunk_ids
         allowed_images = tracker["images"] | extra_image_ids
 
+        # 先规整图片锚点(独占一段、同 ID 只留首次),后续校验与前端渲染都基于规整后的正文
+        answer_text = normalize_image_anchors(answer_text)
+
         cited_chunks = [c for c in dict.fromkeys(_CITE_CHUNK_RE.findall(answer_text)) if c in allowed_chunks]
         cited_images = [i for i in dict.fromkeys(_CITE_IMAGE_RE.findall(answer_text)) if i in allowed_images]
         dropped = [i for i in _CITE_IMAGE_RE.findall(answer_text) if i not in allowed_images]
@@ -203,7 +208,8 @@ class QAService:
         for chunk in repo.get_chunks(conn, cited_chunks):
             if chunk["tenant_id"] == ctx.tenant_id:
                 citations.append({"document_id": chunk["document_id"], "chunk_id": chunk["id"],
-                                  "page": chunk["page_start"]})
+                                  "page": chunk["page_start"],
+                                  "page_end": chunk["page_end"] or chunk["page_start"]})
 
         # 用户明确要求看图而模型未引用时,附带本轮证据中的图片候选(稳定排序,保持资产去重)
         fallback = not cited_images and asks_for_images(question)

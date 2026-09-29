@@ -101,10 +101,17 @@ class InlineImagesTest(unittest.TestCase):
         result = self._assemble("纯文字回答", question="什么是光刻", images=(self.occ_p2,))
         self.assertEqual(result["images"], [])
 
+    def test_assemble_normalizes_anchor_placement_and_duplicates(self):
+        raw = (f"呈指数增长[image:{self.occ_p2}](第 2 页)。\n\n中间。\n\n[image:{self.occ_p2}]\n\n结尾。")
+        result = self._assemble(raw, images=(self.occ_p2,))
+        self.assertEqual(result["answer"],
+                         f"呈指数增长(第 2 页)。\n\n[image:{self.occ_p2}]\n\n中间。\n\n结尾。")
+        self.assertEqual([e["image_occurrence_id"] for e in result["images"]], [self.occ_p2])
+
     def test_chunk_citation_still_validated(self):
         result = self._assemble(f"见 [chunk:{self.chunk}]", chunks=(self.chunk,))
         self.assertEqual(result["citations"],
-                         [{"document_id": self.doc, "chunk_id": self.chunk, "page": 3}])
+                         [{"document_id": self.doc, "chunk_id": self.chunk, "page": 3, "page_end": 3}])
 
     def test_answer_and_stream_done_consistent(self):
         answer_text = f"看图。\n\n[image:{self.occ_p2}]\n\n解释。"

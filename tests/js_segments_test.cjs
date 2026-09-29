@@ -207,6 +207,40 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
   check("F4: 恢复的旧消息按兼容规则渲染", SEG.renderAnswerBody(restored[0]).html.includes("<img"));
 }
 
+// ---- R:回答渲染(Markdown 子集 / 徽标 / 页码范围)----
+{
+  const h = SEG.renderAnswerBody(done("## 标题\n\n正文一行\n第二行\n\n- 甲\n- 乙\n\n1. 一\n2. 二", [])).html;
+  check("R1: 标题不露 ##", !h.includes("##") && h.includes('class="md-h'));
+  check("R1: 无序列表渲染为 ul,不露行首 -", h.includes("<ul") && (h.match(/<li>/g) || []).length === 4 && !/>\s*- /.test(h));
+  check("R1: 有序列表渲染为 ol", h.includes("<ol"));
+  check("R1: 段内换行用 br", h.includes("正文一行<br>第二行"));
+  check("R1: 空行不产生空段落", !h.includes("<p class=\"md-p\"></p>"));
+  check("R1: 仍是单个文字块 div", (h.match(/<div class="text">/g) || []).length === 1);
+
+  const bold = SEG.renderAnswerBody(done("**核心规律:**\n- 每三年**增加四倍**", [])).html;
+  check("R2: 粗体在标题行与列表项内都生效", (bold.match(/<strong>/g) || []).length === 2);
+
+  const fence = SEG.renderAnswerBody(done("示例:\n```\n## 不是标题\n- 不是列表\n```\n后文", [])).html;
+  check("R3: 围栏代码内的 ## 与 - 不被解释", fence.includes("md-code") && !fence.includes("<li>") && !fence.includes("md-h"));
+
+  const xss = SEG.renderAnswerBody(done("- <img src=x onerror=alert(1)>\n## <b>x</b>", [])).html;
+  check("R4: 列表/标题内 HTML 仍被转义", !xss.includes("<img") && !xss.includes("<b>"));
+
+  check("R5: pageLabel 单页/跨页/缺省", SEG.pageLabel({ page: 3 }) === "3"
+    && SEG.pageLabel({ page: 1, page_end: 2 }) === "1\u20132"
+    && SEG.pageLabel({ page: 4, page_end: 4 }) === "4");
+  const cite = SEG.renderAnswerBody({ role: "assistant", validated: true, images: [],
+    citations: [{ chunk_id: "chk_1", page: 1, page_end: 2 }, { chunk_id: "chk_2", page: 7 }],
+    content: "甲[chunk:chk_1]乙[chunk:chk_2]" }).html;
+  check("R5: 跨页块徽标显示 p.1–2,单页显示 p.7", cite.includes("出处 p.1\u20132") && cite.includes("出处 p.7"));
+  check("R6: 徽标不含 emoji 图标", !/[\u{1F300}-\u{1FAFF}]/u.test(cite));
+
+  const m = { role: "assistant", validated: true, message_id: "m1", images: [E1], citations: [],
+              content: "看图\n\n[image:occ_a]\n\n再看\n\n[image:occ_a]\n\n结束" };
+  const rep = SEG.renderAnswerBody(m).html;
+  check("R7: 重复锚点的引用徽标不含 emoji", rep.includes('class="chip fig"') && !/[\u{1F300}-\u{1FAFF}]/u.test(rep.split('class="chip fig"')[1].split("</a>")[0]));
+}
+
 // ---- 入库进度:格式化与轮询器(md文档/deephoto_ingestion_progress_plan.md §11/§14.12)----
 {
   check("formatElapsed 秒/分/小时", SEG.formatElapsed(42000) === "42 秒"

@@ -126,33 +126,82 @@
     return isCandidate ? text.slice(0, i) : text;
   }
 
-  // ---- 文字片段渲染 ----
+  // ---- 文字片段渲染(受限 Markdown:标题 / 列表 / 段落 / 粗体 / 代码)----
 
-  const CODE_RE = /(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g;
+  const INLINE_CODE_RE = /(`[^`\n]*`)/g;
+  const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*)$/;
+  const LIST_RE = /^\s*([-*\u2022]|\d+[.)])\s+(.*)$/;
 
-  // 代码区域剔出后再做 markdown/徽标替换:示例里的标记保持文字,不换徽标
+  // 引用页码标签:跨页块显示 "1–2",单页显示 "1"
+  function pageLabel(c) {
+    const s = c && c.page, e = c && c.page_end;
+    return e && s && e !== s ? `${s}\u2013${e}` : String(s ?? "");
+  }
+
+  // 行内:代码区剔出后再做粗体/徽标替换,示例里的标记保持文字
+  function renderInline(text, citeMap, opts) {
+    return text.split(INLINE_CODE_RE).map((part, i) => {
+      if (i % 2 === 1) return `<code>${esc(part.slice(1, -1))}</code>`;
+      return renderPlain(part, citeMap, opts);
+    }).join("");
+  }
+
   function renderTextFragment(text, citeMap, opts) {
-    let html = "";
-    let last = 0;
-    for (const m of text.matchAll(CODE_RE)) {
-      html += renderPlain(text.slice(last, m.index), citeMap, opts);
-      const code = m[1];
-      html += code.startsWith("```")
-        ? esc(code)                                          // 围栏:原样转义展示
-        : `<code>${esc(code.slice(1, -1))}</code>`;
-      last = m.index + code.length;
+    const lines = String(text).split("\n");
+    const out = [];
+    let para = [];          // 连续普通行:段内换行用 <br>
+    let list = null;        // { tag, items }
+    const flushPara = () => {
+      if (para.length) out.push(`<p class="md-p">${para.join("<br>")}</p>`);
+      para = [];
+    };
+    const flushList = () => {
+      if (list) out.push(`<${list.tag} class="md-list">${list.items.map(x => `<li>${x}</li>`).join("")}</${list.tag}>`);
+      list = null;
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.trimStart().startsWith("```")) {           // 围栏代码:原样转义展示,到闭合围栏或文末
+        flushPara(); flushList();
+        const buf = [line];
+        while (++i < lines.length) {
+          buf.push(lines[i]);
+          if (lines[i].trimStart().startsWith("```")) break;
+        }
+        out.push(`<pre class="md-code">${esc(buf.join("\n"))}</pre>`);
+        continue;
+      }
+      if (!line.trim()) { flushPara(); flushList(); continue; }
+      const h = HEADING_RE.exec(line);
+      if (h) {
+        flushPara(); flushList();
+        out.push(`<div class="md-h md-h${Math.min(h[1].length, 3)}">${renderInline(h[2], citeMap, opts)}</div>`);
+        continue;
+      }
+      const li = LIST_RE.exec(line);
+      if (li) {
+        flushPara();
+        const tag = /\d/.test(li[1]) ? "ol" : "ul";
+        if (list && list.tag !== tag) flushList();
+        if (!list) list = { tag, items: [] };
+        list.items.push(renderInline(li[2], citeMap, opts));
+        continue;
+      }
+      flushList();
+      para.push(renderInline(line.trim(), citeMap, opts));
     }
-    return html + renderPlain(text.slice(last), citeMap, opts);
+    flushPara(); flushList();
+    return out.join("");
   }
 
   function renderPlain(text, citeMap, opts) {
     const html = esc(text).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     if (opts.streaming) {
       // 流式期间 chunk 标记只显示中性徽标,避免裸 ID 闪烁
-      return html.replace(/\[chunk:[A-Za-z0-9_]+\]/g, '<span class="chip">📄 出处…</span>');
+      return html.replace(/\[chunk:[A-Za-z0-9_]+\]/g, '<span class="chip cite">出处…</span>');
     }
     return html.replace(/\[chunk:([A-Za-z0-9_]+)\]/g, (_, id) =>
-      citeMap.has(id) ? `<span class="chip" style="margin:0 2px">📄 出处 p.${esc(citeMap.get(id))}</span>` : "");
+      citeMap.has(id) ? `<span class="chip cite">出处 p.${esc(citeMap.get(id))}</span>` : "");
   }
 
   // ---- 图片卡片(正文插图与补充图片区共用)----
@@ -184,7 +233,7 @@
     const validated = m.validated === true ||
       (m.validated === undefined && !streaming && !broken && Array.isArray(m.images));
     const entries = new Map((m.images || []).map(im => [im.image_occurrence_id, im]));
-    const citeMap = new Map((m.citations || []).map(c => [c.chunk_id, c.page]));
+    const citeMap = new Map((m.citations || []).map(c => [c.chunk_id, pageLabel(c)]));
     const used = new Set();
     const parts = [];
     const segs = splitAnswerSegments(m.content);
@@ -202,7 +251,7 @@
         const im = entries.get(seg.id);
         if (!im) { parts.push(`<div class="img-missing">图片引用不可用</div>`); return; }
         if (used.has(seg.id)) {
-          parts.push(`<div class="img-ref"><a class="chip fig" href="#${figureDomId(m.message_id, seg.id)}">🖼 ` +
+          parts.push(`<div class="img-ref"><a class="chip fig" href="#${figureDomId(m.message_id, seg.id)}">` +
             `${esc(figLabel(im.figure_number))} · p.${esc(im.page)}</a></div>`);
           return;
         }
@@ -369,7 +418,7 @@
              get inflightCount() { return inflight.size; } };
   }
 
-  return { esc, figLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
+  return { esc, figLabel, pageLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
            imageCardHTML, figureDomId, newMessageId, createAssistantMessage,
            applyStreamEvent, finishStream, restoreMessages,
            PROG_STAGE_NAMES, PROG_STAGE_STATE, formatElapsed, progressLine, createDocPoller,
