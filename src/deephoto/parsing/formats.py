@@ -82,6 +82,25 @@ def format_by_key(key: str) -> FormatInfo:
     return _info(key)
 
 
+# 上传 accept 的扩展名映射(key → 文件后缀);服务端白名单是唯一事实来源,
+# 前端经 GET /api/documents/upload-config 读取,不再硬编码
+_ACCEPT_EXTS = {
+    "pdf": ("pdf",),
+    "docx": ("docx",), "doc": ("doc",),
+    "pptx": ("pptx",), "ppt": ("ppt",),
+    "xlsx": ("xlsx",), "xls": ("xls",),
+    "md": ("md", "markdown"),
+    "txt": ("txt",),
+    "html": ("html", "htm"),
+    "image": ("png", "jpg", "jpeg", "jp2", "webp", "gif", "bmp"),
+}
+
+
+def accept_extensions(keys) -> list[str]:
+    """白名单 key 集 → accept 扩展名列表(带点,稳定排序;未知 key 忽略)。"""
+    return sorted(f".{ext}" for key in keys for ext in _ACCEPT_EXTS.get(key, ()))
+
+
 def decode_text(data: bytes) -> str:
     """文本类解码:UTF-16 BOM → utf-8-sig → gb18030;都失败抛 UnsupportedFormat。
     检测与解析共用同一顺序。"""

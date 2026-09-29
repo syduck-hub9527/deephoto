@@ -74,6 +74,25 @@ class SplitOversizeTest(unittest.TestCase):
         self.assertEqual(doc.all_paragraphs()[0].text, long_heading)   # 标题不拆
         self.assertEqual(len(doc.all_figures()), 1)                    # 图不拆
 
+    def test_table_split_repeats_header_on_every_piece(self):
+        # 回归:60 行表格拆成多块后,续块以数据行开头、丢表头,检索命中后段不知列含义
+        header = "| 元素 | 类型 |\n| --- | --- |"
+        rows = "\n".join(f"| 元素{i} | 类型类型类型填充填充填充填充 |" for i in range(60))
+        doc = build_local_document([LocalBlock("text", f"{header}\n{rows}")])
+        paras = [p.text for p in doc.all_paragraphs()]
+        self.assertGreater(len(paras), 1)
+        for text in paras:
+            self.assertTrue(text.startswith(header), text[:40])
+        for p in paras:
+            self.assertLessEqual(len(p), 1600)
+
+    def test_non_table_split_has_no_synthetic_header(self):
+        # 非表格(围栏/普通文本)拆分不加任何东西
+        text = "\n".join("行" * 100 for _ in range(60))
+        doc = build_local_document([LocalBlock("text", text)])
+        for p in doc.all_paragraphs():
+            self.assertNotIn("---", p.text)
+
 
 class BuildLocalDocumentTest(unittest.TestCase):
     def test_sections_and_caption_linkage(self):

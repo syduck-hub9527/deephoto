@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 
 from .base import (
@@ -28,6 +29,16 @@ _HEADING_LEVEL = 2                 # 只有 <=2 级标题触发"标题分段"
 # 超过此长度的文本块先在行边界拆开(单行超长则硬切),再参与分页;
 # 否则一份单换行 txt / 超大围栏会整份落在一个分段里,nearby 失去局部性
 _BLOCK_SPLIT_CHARS = 1500
+
+# markdown 表格分隔行:| --- | --- |(容忍空格与对齐冒号)
+_TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|[\s:|-]*$")
+
+
+def _table_header(lines: list[str]) -> list[str]:
+    """markdown 表格块返回表头两行(表头行+分隔行),否则 []。"""
+    if len(lines) >= 2 and lines[0].lstrip().startswith("|") and _TABLE_SEP_RE.match(lines[1]):
+        return lines[:2]
+    return []
 
 
 @dataclass
@@ -57,6 +68,34 @@ def paginate(blocks: list[LocalBlock]) -> list[int]:
     return numbers
 
 
+def _split_text_block(block: LocalBlock) -> list[LocalBlock]:
+    """超长文本块按行拆开(单行超长硬切);markdown 表格块的每个续块重复表头两行,
+    检索命中后段时不丢列含义(与 content_list._table_paragraphs 的续段表头同约定)。"""
+    lines = block.text.split("\n")
+    header = _table_header(lines)
+    head = "\n".join(header)
+    room = _BLOCK_SPLIT_CHARS - (len(head) + 1 if head else 0)
+    pieces: list[str] = []
+    buf = ""
+
+    def emit() -> None:
+        nonlocal buf
+        if buf.strip():
+            pieces.append(f"{head}\n{buf}" if head else buf)
+        buf = ""
+
+    for line in lines[len(header):]:
+        while len(line) > room:            # 单行超长:硬切;表格时硬切片也带表头
+            emit()
+            pieces.append(f"{head}\n{line[:room]}" if head else line[:room])
+            line = line[room:]
+        if buf and len(buf) + len(line) + 1 > room:
+            emit()
+        buf = f"{buf}\n{line}" if buf else line
+    emit()
+    return [replace(block, text=piece) for piece in pieces]
+
+
 def _split_oversize(blocks: list[LocalBlock]) -> list[LocalBlock]:
     """超过 _BLOCK_SPLIT_CHARS 的文本块按行边界拆开(单行超长硬切);标题/图片不动。"""
     out: list[LocalBlock] = []
@@ -64,22 +103,7 @@ def _split_oversize(blocks: list[LocalBlock]) -> list[LocalBlock]:
         if block.kind != "text" or len(block.text) <= _BLOCK_SPLIT_CHARS:
             out.append(block)
             continue
-        buf = ""
-        for line in block.text.split("\n"):
-            while len(line) > _BLOCK_SPLIT_CHARS:
-                if buf.strip():
-                    out.append(replace(block, text=buf))
-                buf = ""
-                out.append(replace(block, text=line[:_BLOCK_SPLIT_CHARS]))
-                line = line[_BLOCK_SPLIT_CHARS:]
-            candidate = f"{buf}\n{line}" if buf else line
-            if buf and len(candidate) > _BLOCK_SPLIT_CHARS:
-                out.append(replace(block, text=buf))
-                buf = line
-            else:
-                buf = candidate
-        if buf.strip():
-            out.append(replace(block, text=buf))
+        out.extend(_split_text_block(block))
     return out
 
 

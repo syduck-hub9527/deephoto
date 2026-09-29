@@ -31,6 +31,10 @@ _REMOTE_RE = re.compile(r"\Ahttps?://", re.IGNORECASE)
 # 容器块(列表/表格/引用)整块切原文后,把 ![alt](...) 换成 alt;
 # data URI 的 base64 长串随之抹掉,不污染检索与分块
 _IMG_SYNTAX_RE = re.compile(r"!\[([^\]]*)\]\(\s*[^)\s]+(?:\s+\"[^\"]*\")?\s*\)")
+# 行内 HTML 去标签:<img> 保留 alt 文本,其余属性(含 src="data:..." 长串)随标签抹掉
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*?>", re.IGNORECASE)
+_IMG_ALT_RE = re.compile(r"\balt\s*=\s*\"([^\"]*)\"", re.IGNORECASE)
 
 
 def _strip_front_matter(text: str) -> str:
@@ -50,6 +54,14 @@ def _strip_front_matter(text: str) -> str:
 
 def _strip_image_syntax(text: str) -> str:
     return _IMG_SYNTAX_RE.sub(lambda m: m.group(1), text)
+
+
+def _strip_inline_html(text: str) -> str:
+    """行内 HTML 去标签:<img> 保留 alt;其余标签(含 <img> 的 src="data:..." 长串)整体移除。"""
+    def img_alt(m: re.Match) -> str:
+        alt = _IMG_ALT_RE.search(m.group(0))
+        return (alt.group(1).strip() if alt else "")
+    return _HTML_TAG_RE.sub("", _IMG_TAG_RE.sub(img_alt, text))
 
 
 class _HtmlTextExtractor(HTMLParser):
@@ -158,7 +170,10 @@ class MarkdownParser:
                 end = tokens[j].map[1] if j < len(tokens) and tokens[j].map else \
                     (tok.map[1] if tok.map else None)
                 raw = self._slice(lines, (tok.map[0], end)) if tok.map and end is not None else ""
-                raw = _strip_image_syntax(raw)     # 容器内的图片语法只留 alt(围栏代码不动)
+                # 容器内的图片语法/行内 HTML 只留 alt;围栏代码原样保留仅对顶层围栏成立:
+                # 容器(列表/表格/引用)内嵌套的围栏不做二次识别,其中若有示例图片语法
+                # 也会被替换成 alt——只影响示例文本的展示,不进检索的图不存在于此
+                raw = _strip_inline_html(_strip_image_syntax(raw))
                 if raw.strip():
                     blocks.append(LocalBlock("text", text=raw))
                 i = j + 1
@@ -184,8 +199,10 @@ class MarkdownParser:
                 blocks.append(self._image_block(child, observer))
             elif child.type == "code_inline":
                 buf.append(f"`{child.content}`")
-            elif child.type in ("text", "html_inline"):
+            elif child.type == "text":
                 buf.append(child.content)
+            elif child.type == "html_inline":
+                buf.append(_strip_inline_html(child.content))   # 去标签;<img> 只留 alt
             elif child.type in ("softbreak", "hardbreak"):
                 buf.append("\n")
         if "".join(buf).strip():

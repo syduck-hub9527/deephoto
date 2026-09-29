@@ -131,24 +131,28 @@ class DedupLookupTest(RepoTestBase):
 class MigrationTest(unittest.TestCase):
     """旧库(列名 pdf_object_key、无新列)经 init_db 自动迁移;幂等(§8 迁移)。"""
 
+    @staticmethod
+    def _build_old_db(db_path: Path) -> None:
+        import sqlite3
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            "CREATE TABLE documents (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,"
+            " owner_id TEXT NOT NULL, filename TEXT NOT NULL, pdf_object_key TEXT NOT NULL,"
+            " sha256 TEXT NOT NULL, status TEXT NOT NULL, error TEXT,"
+            " ingestion_version TEXT NOT NULL, page_count INTEGER NOT NULL DEFAULT 0,"
+            " created_at TEXT NOT NULL)")
+        raw.execute(
+            "INSERT INTO documents (id, tenant_id, owner_id, filename, pdf_object_key,"
+            " sha256, status, ingestion_version, created_at)"
+            " VALUES ('doc_old', 'tenant_a', 'admin', 'a.pdf', 'pdfs/00/x.pdf',"
+            " 'aaaa', 'ready', 'v1', '2026-01-01T00:00:00Z')")
+        raw.commit()
+        raw.close()
+
     def test_old_db_migrated_with_defaults_and_idempotent(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             db_path = Path(tmp) / "old.db"
-            import sqlite3
-            raw = sqlite3.connect(str(db_path))
-            raw.execute(
-                "CREATE TABLE documents (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,"
-                " owner_id TEXT NOT NULL, filename TEXT NOT NULL, pdf_object_key TEXT NOT NULL,"
-                " sha256 TEXT NOT NULL, status TEXT NOT NULL, error TEXT,"
-                " ingestion_version TEXT NOT NULL, page_count INTEGER NOT NULL DEFAULT 0,"
-                " created_at TEXT NOT NULL)")
-            raw.execute(
-                "INSERT INTO documents (id, tenant_id, owner_id, filename, pdf_object_key,"
-                " sha256, status, ingestion_version, created_at)"
-                " VALUES ('doc_old', 'tenant_a', 'admin', 'a.pdf', 'pdfs/00/x.pdf',"
-                " 'aaaa', 'ready', 'v1', '2026-01-01T00:00:00Z')")
-            raw.commit()
-            raw.close()
+            self._build_old_db(db_path)
 
             init_db(db_path)
             init_db(db_path)   # 重复执行幂等
@@ -166,6 +170,22 @@ class MigrationTest(unittest.TestCase):
             # 迁移后的旧文档可命中去重(回填 mineru)
             hit = repo.find_ready_document_by_hash(conn, "tenant_a", "aaaa", "v1", "mineru")
             self.assertEqual(hit["id"], "doc_old")
+            conn.close()
+
+    def test_rename_requires_sqlite_325_readable_error(self):
+        # RENAME COLUMN 需要 SQLite ≥ 3.25;版本不足时给可读报错,不抛底层 OperationalError
+        from unittest import mock
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "old.db"
+            self._build_old_db(db_path)
+            with mock.patch("sqlite3.sqlite_version_info", (3, 24, 0)):
+                with self.assertRaisesRegex(RuntimeError, "SQLite ≥ 3.25"):
+                    init_db(db_path)
+            # 版本足够时重跑同一库可恢复(迁移步骤按列存在判断,幂等)
+            init_db(db_path)
+            conn = connect(db_path)
+            self.assertEqual(repo.get_document(conn, "doc_old")["source_object_key"],
+                             "pdfs/00/x.pdf")
             conn.close()
 
 

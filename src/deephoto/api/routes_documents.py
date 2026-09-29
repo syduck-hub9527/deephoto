@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 
 from .. import repo
-from ..parsing.formats import UnsupportedFormat, detect_format
+from ..parsing.formats import UnsupportedFormat, accept_extensions, detect_format
 from ..parsing.registry import EngineUnavailable, engine_for
 from ..security import AuthContext, new_id
 from .deps import CtxDep, conn_for
@@ -29,6 +29,11 @@ def _sanitize_filename(raw: str | None) -> str:
     return name[:200] or "document"
 
 
+# 内容-level 拒绝(扩展名与内容不符/加密/损坏/空/二进制/不可解码)-> 400;
+# 其余(格式本身不支持:未知扩展名、非 OOXML 的 zip 等)-> 415 Unsupported Media Type
+_FORMAT_400_CODES = {"empty", "mismatch", "encrypted", "corrupt", "binary", "undecodable"}
+
+
 @router.post("")
 async def upload_document(request: Request, file: UploadFile, ctx: AuthContext = CtxDep):
     settings = request.app.state.settings
@@ -41,8 +46,8 @@ async def upload_document(request: Request, file: UploadFile, ctx: AuthContext =
     try:
         fmt = detect_format(data, filename)
     except UnsupportedFormat as exc:
-        # 内容与扩展名不符 / 加密损坏 / 无法识别:400(可读原因)
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400 if exc.code in _FORMAT_400_CODES else 415,
+                            detail=str(exc))
     if fmt.key not in settings.allowed_formats:
         raise HTTPException(status_code=415, detail=f"该格式({fmt.key})不在允许上传的白名单内")
     try:
@@ -77,6 +82,15 @@ def list_documents(request: Request, ctx: AuthContext = CtxDep):
         for doc in docs:
             doc["progress"] = None
     return {"documents": docs}
+
+
+@router.get("/upload-config")
+def upload_config(request: Request):
+    """上传白名单(accept 扩展名列表):前端启动时读取,与服务端 ALLOWED_FORMATS 一致。
+    注册在 /{document_id} 之前,避免被文档详情路由捕获。"""
+    settings = request.app.state.settings
+    return {"accept": accept_extensions(settings.allowed_formats),
+            "formats": sorted(settings.allowed_formats)}
 
 
 @router.get("/{document_id}")

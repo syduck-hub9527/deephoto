@@ -191,6 +191,36 @@ class MarkdownParseTest(unittest.TestCase):
         blob = "\n".join(p.text for p in doc.all_paragraphs())
         self.assertIn("![a](data:image/png;base64,AAAA)", blob)
 
+    def test_inline_img_tag_data_uri_not_in_body(self):
+        # 回归:行内 <img src="data:..."> 的 base64 长串进正文(与 ![](...) 同类)
+        big = "A" * 2000
+        doc = _md(f'正文 <img src="data:image/png;base64,{big}"> 后文\n')
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("正文", blob)
+        self.assertIn("后文", blob)
+        self.assertNotIn("base64", blob)
+        self.assertNotIn("<img", blob)
+
+    def test_inline_img_tag_keeps_alt(self):
+        doc = _md(f'看 <img alt="流程示意" src="data:image/png;base64,AAAA"> 这里\n')
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("流程示意", blob)
+        self.assertNotIn("base64", blob)
+
+    def test_img_tag_inside_list_stripped(self):
+        big = "A" * 2000
+        doc = _md(f'- 条目 <img src="data:image/png;base64,{big}"> 尾巴\n')
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("条目", blob)
+        self.assertIn("尾巴", blob)
+        self.assertNotIn("base64", blob)
+        self.assertNotIn("<img", blob)
+
+    def test_fence_keeps_img_tag_raw(self):
+        doc = _md('```\n<img src="data:image/png;base64,AAAA">\n```\n')
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn('<img src="data:image/png;base64,AAAA">', blob)
+
 
 class TextParserTest(unittest.TestCase):
     def test_blank_line_segments(self):

@@ -182,8 +182,8 @@
   <div class="brand">deep<span>photo</span></div>
   <div class="side-actions"><button id="newChatBtn" onclick="newChat()">＋ 新会话</button></div>
   <div class="side-label">文档库</div>
-  <!-- accept 与服务端 DEEPHOTO_ALLOWED_FORMATS 默认白名单一致(pdf/md/txt);放开更多格式需同步此处 -->
-  <label id="uploadLabel">上传文档…<input type="file" id="file" accept=".pdf,.md,.markdown,.txt" multiple hidden></label>
+  <!-- accept 由服务端 GET /api/documents/upload-config 下发(白名单的单一事实来源);拉取失败则不设 accept,由服务端把关 -->
+  <label id="uploadLabel">上传文档…<input type="file" id="file" multiple hidden></label>
   <div id="docList"></div>
   <div class="side-foot">
     <button class="icon-btn" onclick="toggleTheme()" title="切换主题" id="themeBtn">🌙</button>
@@ -531,6 +531,10 @@ function toast(text) {
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 
 // 全部定义之后再启动轮询(const 暂时性死区:load 会访问 renderDocs/detailLoader)
+// 上传 accept 由服务端白名单接口下发,避免前后端两份列表漂移
+fetch("/api/documents/upload-config").then(r => r.ok ? r.json() : null)
+  .then(cfg => { if (cfg && cfg.accept && cfg.accept.length) $("file").accept = cfg.accept.join(","); })
+  .catch(() => {});
 docPoller.start();
 </script>
 </body>

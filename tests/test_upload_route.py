@@ -76,7 +76,7 @@ class UploadRouteTest(unittest.TestCase):
 
     def test_mismatch_is_400(self):
         resp = self._upload(b"%PDF-1.4 fake", "a.md")
-        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.status_code, 400)      # 内容与扩展名不符:400
 
     def test_oversize_is_413(self):
         app_settings = self.app.state.settings
@@ -91,9 +91,35 @@ class UploadRouteTest(unittest.TestCase):
         row = repo.get_document(self._conn(), resp.json()["document_id"])
         self.assertEqual(row["filename"], "报告.pdf")
 
-    def test_unknown_extension_400(self):
-        resp = self._upload(b"hello", "a.xyz")
-        self.assertEqual(resp.status_code, 400)
+    def test_unsupported_formats_are_415(self):
+        # 格式本身不支持(未知扩展名/无扩展名/非 OOXML 的 zip):415,不是 400
+        import io
+        import zipfile
+        self.assertEqual(self._upload(b"MZ\x90\x00", "a.exe").status_code, 415)
+        self.assertEqual(self._upload(b'{"a": 1}', "a.json").status_code, 415)
+        self.assertEqual(self._upload(b"a,b\n1,2\n", "a.csv").status_code, 415)
+        self.assertEqual(self._upload(b"hello", "README").status_code, 415)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("META-INF/MANIFEST.MF", "x")
+        self.assertEqual(self._upload(buf.getvalue(), "a.zip").status_code, 415)
+
+    def test_empty_and_binary_are_400(self):
+        self.assertEqual(self._upload(b"", "a.pdf").status_code, 400)
+        self.assertEqual(self._upload(b"ab\x00cd", "a.txt").status_code, 400)
+
+    def test_upload_config_serves_accept_list(self):
+        # 前端 accept 的唯一来源:与服务端白名单一致,不走硬编码
+        resp = self.client.get("/api/documents/upload-config")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["accept"], [".markdown", ".md", ".pdf", ".txt"])
+        self.assertEqual(resp.json()["formats"], ["md", "pdf", "txt"])
+
+    def test_upload_config_follows_custom_whitelist(self):
+        from deephoto.api.app import create_app
+        custom = create_app(_settings(Path(self.tmp.name) / "sub", allowed_formats=frozenset({"txt"})))
+        resp = TestClient(custom, raise_server_exceptions=False).get("/api/documents/upload-config")
+        self.assertEqual(resp.json()["accept"], [".txt"])
 
 
 if __name__ == "__main__":

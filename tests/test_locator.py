@@ -34,8 +34,10 @@ class LocatorLabelTest(unittest.TestCase):
         self.assertEqual(locator_label("sheet", 2), "工作表 2")
 
     def test_section_kind(self):
-        self.assertEqual(locator_label("section", 5, 5, "第1章 > 1.2 节"), "第1章 > 1.2 节")
-        self.assertEqual(locator_label("section", 5), "全文")          # 无章节时不说"第 5 页"
+        # 章节路径 + 分段号:同一章节跨多个虚拟分段时可区分;无章节显示"第 N 段"而非"全文"
+        self.assertEqual(locator_label("section", 5, 5, "第1章 > 1.2 节"), "第1章 > 1.2 节 · 第 5 段")
+        self.assertEqual(locator_label("section", 5), "第 5 段")
+        self.assertEqual(locator_label("section", None), "全文")       # 最后的兜底(无章节无段号)
 
 
 @unittest.skipUnless(HAVE_NUMPY, "需要 numpy(索引服务依赖)")
@@ -70,7 +72,7 @@ class SectionDocumentToolOutputTest(unittest.TestCase):
         hit = next(c for c in result["chunks"] if c["chunk_id"] == self.chunk)
         self.assertNotIn("page_start", hit)                  # 虚拟分段号不给模型,避免说"第 2 页"
         self.assertNotIn("page_end", hit)
-        self.assertEqual(hit["locator"], "安装 > 依赖")
+        self.assertEqual(hit["locator"], "安装 > 依赖 · 第 2 段")   # 章节路径 + 分段号
         self.assertEqual(hit["document"], "手册.md")
         self.assertEqual(hit["source_format"], "md")
 
@@ -78,7 +80,7 @@ class SectionDocumentToolOutputTest(unittest.TestCase):
         result = self.knowledge.read_chunk(self.conn, self.ctx, self.chunk)
         target = result["chunks"][0]
         self.assertNotIn("page_start", target)
-        self.assertEqual(target["locator"], "安装 > 依赖")
+        self.assertEqual(target["locator"], "安装 > 依赖 · 第 2 段")
 
     def test_pdf_document_keeps_pages(self):
         # 对照:PDF(page 语义)仍带 page_start/page_end,locator 为 p.N

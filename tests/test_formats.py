@@ -6,7 +6,7 @@ import zipfile
 
 import _bootstrap  # noqa: F401
 
-from deephoto.parsing.formats import UnsupportedFormat, detect_format
+from deephoto.parsing.formats import UnsupportedFormat, accept_extensions, detect_format
 
 
 def _zip_with(*names: str) -> bytes:
@@ -115,6 +115,17 @@ class DetectRejectTest(unittest.TestCase):
 
     def test_no_extension(self):
         self._reject("unsupported", b"hello", "README")
+
+
+class AcceptExtensionsTest(unittest.TestCase):
+    def test_default_set(self):
+        self.assertEqual(accept_extensions({"pdf", "md", "txt"}),
+                         [".markdown", ".md", ".pdf", ".txt"])
+
+    def test_subset_and_unknown_ignored(self):
+        self.assertEqual(accept_extensions({"txt"}), [".txt"])
+        self.assertEqual(accept_extensions({"txt", "docx"}), [".docx", ".txt"])
+        self.assertEqual(accept_extensions({"nope"}), [])
 
 
 if __name__ == "__main__":

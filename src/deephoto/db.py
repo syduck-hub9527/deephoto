@@ -145,13 +145,21 @@ def init_db(db_path: Path) -> None:
 def migrate(conn: sqlite3.Connection) -> None:
     """已有库的幂等迁移:executescript 的 IF NOT EXISTS 对存量表加列无效,逐列判断。
 
-    - pdf_object_key → source_object_key(RENAME COLUMN,需 SQLite ≥ 3.25);
+    - pdf_object_key → source_object_key(RENAME COLUMN,需 SQLite ≥ 3.25,
+      惰性检查:只在真的遇到旧列时才要求该版本,全新安装不受影响);
     - 新增 source_format / locator_kind / parse_engine / source_meta;
     - 旧文档全是 PDF 且走 MinerU:parse_engine 回填 'mineru';
     - 去重索引换成含 parse_engine 的版本。
+
+    无显式事务:每步按列存在与否判断,中断后重跑可恢复(幂等)。
     """
     columns = {r["name"] for r in conn.execute("PRAGMA table_info(documents)")}
     if "pdf_object_key" in columns:
+        if sqlite3.sqlite_version_info < (3, 25, 0):
+            raise RuntimeError(
+                "旧数据库迁移需要 SQLite ≥ 3.25(RENAME COLUMN),"
+                f"当前为 {sqlite3.sqlite_version};请升级 Python(自带 SQLite 随之升级)后再启动,"
+                "或删除旧库重建(旧文档需重新上传)")
         conn.execute("ALTER TABLE documents RENAME COLUMN pdf_object_key TO source_object_key")
         columns.discard("pdf_object_key")
         columns.add("source_object_key")

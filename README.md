@@ -69,7 +69,7 @@ pip freeze > requirements.lock.txt
 
 ## API 摘要
 
-- `POST /api/documents` 上传文档(PDF / Markdown / TXT,多文件逐个上传)→ `{document_id, status, source_format}`;内容与扩展名不符 400,格式不在白名单 415
+- `POST /api/documents` 上传文档(PDF / Markdown / TXT,多文件逐个上传)→ `{document_id, status, source_format}`;内容与扩展名不符/损坏 400,格式不支持或不在白名单 415
 - `GET /api/documents` / `GET /api/documents/{id}` / `DELETE /api/documents/{id}`
 - `POST /api/qa` `{question, document_id?}` → `{answer, citations[], images[]}`
 - `GET /api/documents/{id}/images/{occ_id}`、`GET .../pages/{n}`:图片与页预览(问答响应中已生成 URL,本地部署无鉴权)
