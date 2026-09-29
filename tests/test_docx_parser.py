@@ -83,6 +83,39 @@ class DocxParserTest(unittest.TestCase):
         texts = {p.text: p.section for p in doc.all_paragraphs()}
         self.assertEqual(texts["正文。"], "中文样式标题")
 
+    def test_style_definition_outline_level(self):
+        # 回归:自定义样式的大纲级别写在样式定义里(w:style/w:pPr/w:outlineLvl),
+        # 段落自身 pPr 没有,修前不当标题、section 为空
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        def _set_outline(style, val: str):
+            ppr = style.element.find(qn("w:pPr"))
+            if ppr is None:
+                ppr = OxmlElement("w:pPr")
+                style.element.append(ppr)
+            ol = OxmlElement("w:outlineLvl")
+            ol.set(qn("w:val"), val)
+            ppr.append(ol)
+
+        def build(d):
+            parent = d.styles.add_style("我的标题", 1)   # WD_STYLE_TYPE.PARAGRAPH
+            _set_outline(parent, "0")
+            child = d.styles.add_style("我的子标题", 1)
+            bo = OxmlElement("w:basedOn")
+            bo.set(qn("w:val"), parent.style_id)
+            child.element.append(bo)                   # 子样式不写 outlineLvl,沿 basedOn 继承
+            d.add_paragraph("自定义样式标题", style="我的标题")
+            d.add_paragraph("正文一。")
+            d.add_paragraph("继承的子标题", style="我的子标题")
+            d.add_paragraph("正文二。")
+
+        doc = _parse(_docx(build))
+        texts = {p.text: p.section for p in doc.all_paragraphs()}
+        self.assertEqual(texts["正文一。"], "自定义样式标题")
+        # 子样式不写 outlineLvl,沿 basedOn 继承为 1 级;同级标题替换而非嵌套
+        self.assertEqual(texts["正文二。"], "继承的子标题")
+
     def test_image_with_caption_after(self):
         def build(d):
             d.add_paragraph("这份文档的正文内容足够长,超过了五十个字的回退阈值,本地解析可以正常进行,不会再回退到云端解析,这一段是填充。")
@@ -112,6 +145,156 @@ class DocxParserTest(unittest.TestCase):
         figs = doc.all_figures()
         self.assertEqual(len(figs), 1)
         self.assertEqual(doc.all_captions()[0].figure_number, "1.1")
+        # 配对成功的前置图注只出现一次(图片的图注段落),不再单独出文本块
+        self.assertEqual([p.text for p in doc.all_paragraphs()].count("图 1.1 前置图注"), 1)
+
+    def test_caption_after_image_not_stolen_by_next_figure(self):
+        # 回归:图1→"图1.1 第一张图"→图2→"图1.2 第二张图",修前两张图都配到"图1.1",
+        # 图注文本重复出现在 3 个段落里
+        filler = "这份文档的正文内容足够长,超过了五十个字的回退阈值,本地解析可以正常进行,不会再回退到云端解析,这一段是填充。"
+
+        def build(d):
+            d.add_paragraph(filler)
+            d.add_paragraph().add_run().add_picture(io.BytesIO(_png("red")))
+            d.add_paragraph("图 1.1 第一张图", style="Caption")
+            d.add_paragraph().add_run().add_picture(io.BytesIO(_png("blue")))
+            d.add_paragraph("图 1.2 第二张图", style="Caption")
+        doc = _parse(_docx(build))
+        figs = doc.all_figures()
+        self.assertEqual(len(figs), 2)
+        caps = {c.id: c for c in doc.all_captions()}
+        self.assertEqual(caps[figs[0].caption_id].figure_number, "1.1")   # 各配各的
+        self.assertEqual(caps[figs[1].caption_id].figure_number, "1.2")
+        texts = [p.text for p in doc.all_paragraphs()]
+        self.assertEqual(texts.count("图 1.1 第一张图"), 1)   # 图注文本恰好一份(装配层图注段落)
+        self.assertEqual(texts.count("图 1.2 第二张图"), 1)
+
+    def test_unpaired_caption_falls_back_to_plain_text(self):
+        # 附近没有图的图注样式段(如表格标题):不丢,落为普通文本恰好一份
+        def build(d):
+            d.add_paragraph("这份文档的正文内容足够长,超过了五十个字的回退阈值,本地解析可以正常进行,不回退。")
+            d.add_paragraph("表 1.1 参数对照", style="Caption")
+            d.add_paragraph("表格见上。")
+        doc = _parse(_docx(build))
+        texts = [p.text for p in doc.all_paragraphs()]
+        self.assertEqual(texts.count("表 1.1 参数对照"), 1)
+        self.assertEqual(doc.all_figures(), [])
+
+    def test_content_controls_unwrapped(self):
+        # 回归:块级 w:sdt / w:customXml 包住的段落与表格修前整段丢失(目录/封面/模板常见)
+        from docx.oxml import OxmlElement
+        filler = "这份文档的正文内容足够长,超过了五十个字的回退阈值,本地解析可以正常进行,不回退。"
+
+        def build(d):
+            d.add_paragraph(filler)
+            inner = d.add_paragraph("控件里的正文")
+            tbl_para = d.add_paragraph("控件表前的说明")
+            t = d.add_table(rows=2, cols=1)
+            t.rows[0].cells[0].text = "控件里的表头"
+            t.rows[1].cells[0].text = "控件里的单元格"
+            custom = d.add_paragraph("customXml 里的正文")
+            # XML 手术:把控件段落/表格包进 w:sdt > w:sdtContent;另一段包进 w:customXml
+            body = d.element.body
+            for el in (inner._p, tbl_para._p, t._tbl):
+                body.remove(el)
+            sdt = OxmlElement("w:sdt")
+            content = OxmlElement("w:sdtContent")
+            for el in (inner._p, tbl_para._p, t._tbl):
+                content.append(el)
+            sdt.append(content)
+            body.append(sdt)
+            body.remove(custom._p)
+            cx = OxmlElement("w:customXml")
+            cx.append(custom._p)
+            body.append(cx)
+
+        doc = _parse(_docx(build))
+        texts = [p.text for p in doc.all_paragraphs()]
+        self.assertIn("控件里的正文", texts)
+        self.assertIn("customXml 里的正文", texts)
+        blob = "\n".join(texts)
+        self.assertIn("控件里的单元格", blob)      # 容器里的表格也在
+        validate_parsed(doc)
+
+    def test_tracked_changes_accepted_view(self):
+        # 回归:开着修订的文档,w:ins 新增文字修前整段丢失;w:del 删除内容不应出现
+        from docx.oxml import OxmlElement
+
+        def build(d):
+            p = d.add_paragraph()
+            p.add_run("原文一二三")
+            ins = OxmlElement("w:ins")
+            r = OxmlElement("w:r")
+            t = OxmlElement("w:t")
+            t.text = "修订新增内容XYZ"
+            r.append(t)
+            ins.append(r)
+            p._p.append(ins)
+            # w:del:删除内容(接受后视角)不得出现
+            p2 = d.add_paragraph()
+            p2.add_run("保留的文字")
+            dele = OxmlElement("w:del")
+            r2 = OxmlElement("w:r")
+            dt = OxmlElement("w:delText")
+            dt.text = "被删除的内容"
+            r2.append(dt)
+            dele.append(r2)
+            p2._p.append(dele)
+            # 表格单元格里的修订同样生效
+            tb = d.add_table(rows=1, cols=1)
+            cell_p = tb.rows[0].cells[0].paragraphs[0]
+            cell_p.add_run("单元格原文")
+            ins2 = OxmlElement("w:ins")
+            r3 = OxmlElement("w:r")
+            t3 = OxmlElement("w:t")
+            t3.text = "单元格新增"
+            r3.append(t3)
+            ins2.append(r3)
+            cell_p._p.append(ins2)
+
+        doc = _parse(_docx(build))
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("原文一二三", blob)
+        self.assertIn("修订新增内容XYZ", blob)      # w:ins 收入
+        self.assertIn("保留的文字", blob)
+        self.assertNotIn("被删除的内容", blob)      # w:del 跳过
+        self.assertIn("单元格原文", blob)
+        self.assertIn("单元格新增", blob)           # 表格单元格同规则
+
+    def test_nested_table_and_cell_image(self):
+        # 回归:嵌套表格的内层文字、单元格里的图片,修前都丢
+        def build(d):
+            d.add_paragraph("这份文档的正文内容足够长,超过了五十个字的回退阈值,本地解析可以正常进行,不回退。")
+            t = d.add_table(rows=1, cols=1)
+            cell = t.rows[0].cells[0]
+            cell.paragraphs[0].text = "外层单元格"
+            nested = cell.add_table(rows=1, cols=1)
+            nested.rows[0].cells[0].text = "内层嵌套文字"
+            cell2 = cell.add_paragraph("说明 ")
+            cell2.add_run().add_picture(io.BytesIO(_png("green")))
+
+        doc = _parse(_docx(build))
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("外层单元格", blob)
+        self.assertIn("内层嵌套文字", blob)        # 嵌套表格展平
+        self.assertIn("说明", blob)
+        self.assertEqual(len(doc.all_figures()), 1)   # 单元格图片成为图块
+        validate_parsed(doc)
+
+    def test_merged_cells_deduped(self):
+        # 回归:横向合并单元格,row.cells 重复返回同一单元格,文字重复输出三次
+        def build(d):
+            d.add_paragraph("这份文档的正文内容足够长,超过了五十个字的回退阈值,本地解析可以正常进行,不回退。")
+            t = d.add_table(rows=2, cols=3)
+            merged = t.rows[0].cells[0].merge(t.rows[0].cells[1]).merge(t.rows[0].cells[2])
+            merged.text = "总标题合并"
+            t.rows[1].cells[0].text = "甲"
+            t.rows[1].cells[1].text = "乙"
+            t.rows[1].cells[2].text = "丙"
+        doc = _parse(_docx(build))
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertEqual(blob.count("总标题合并"), 1)          # 合并文字只出现一次
+        self.assertIn("甲 | 乙 | 丙", blob)                    # 普通行不受影响
 
     def test_table_rows_with_header_repeat_on_continuation(self):
         def build(d):
