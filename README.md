@@ -56,7 +56,7 @@ pip freeze > requirements.lock.txt
 | `DESCRIPTION_API_KEY` / `DESCRIPTION_BASE_URL` | 描述服务独立密钥与 OpenAI 兼容 Base URL(到 `/v1` 为止;不回退使用聊天密钥) | — |
 | `DESCRIPTION_MODEL` | 描述模型名 | `qwen3.8-omni-flash` |
 | `DESCRIPTION_REASONING_EFFORT` | 顶层关思考参数;空字符串表示不发送该参数 | `none` |
-| `DESCRIPTION_TIMEOUT_SECONDS` / `DESCRIPTION_MAX_RETRIES` / `DESCRIPTION_MAX_TOKENS` | 单次请求超时 / SDK 重试上限 / 输出上限 | `90` / `1` / `1024` |
+| `DESCRIPTION_TIMEOUT_SECONDS` / `DESCRIPTION_MAX_RETRIES` / `DESCRIPTION_MAX_TOKENS` | 单次请求超时 / SDK 重试上限 / 输出上限(以顶层 `max_tokens` 发送,非 `max_completion_tokens`) | `90` / `1` / `1024` |
 
 > ⚠️ **升级注意：图片描述默认关闭。** 早期版本复用聊天模型(Moonshot)生成图片描述;
 > 从本版本起描述使用独立的 `DESCRIPTION_*` 配置,仅填了旧聊天配置的用户**不会再自动描述图片**

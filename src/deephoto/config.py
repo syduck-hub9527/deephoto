@@ -155,11 +155,11 @@ def load_settings() -> Settings:
         description_max_retries=_get_int("DESCRIPTION_MAX_RETRIES", 1, minimum=0),
         description_max_tokens=_get_int("DESCRIPTION_MAX_TOKENS", 1024, minimum=1),
     )
-    _validate_description(settings)
+    validate_description(settings)
     return settings
 
 
-def _validate_description(settings: "Settings") -> None:
+def validate_description(settings: "Settings") -> None:
     """启用描述时启动校验:报配置变量名,不输出变量值或密钥。关闭时不要求 key/URL。"""
     if not settings.description_enabled:
         return
@@ -175,6 +175,14 @@ def _validate_description(settings: "Settings") -> None:
         problems.append("DEEPHOTO_DESCRIPTION_MODEL 为空")
     if problems:
         raise ValueError("图片描述配置不完整: " + "; ".join(problems))
+
+
+def description_uses_plain_http(settings: "Settings") -> bool:
+    """启用且 Base URL 为非本机的 http:// 明文地址(密钥与图片会明文传输)。"""
+    if not settings.description_enabled or not settings.description_base_url:
+        return False
+    parsed = urlparse(settings.description_base_url.strip())
+    return parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
 
 
 def _load_dotenv() -> None:

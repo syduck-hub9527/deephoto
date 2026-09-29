@@ -52,7 +52,10 @@ def build_description_model(settings: Settings):
         base_url=settings.description_base_url,
         timeout=settings.description_timeout_seconds,
         max_retries=settings.description_max_retries,
-        max_tokens=settings.description_max_tokens,
+        # 不用 max_tokens= 字段:langchain-openai 会把它改写成 max_completion_tokens
+        # (已在 0.3.0 / 0.3.35 / 1.6.6 实测),第三方兼容端点未必接受。
+        # 经 extra_body 直接发经典的顶层 max_tokens,各版本行为一致。
+        extra_body={"max_tokens": settings.description_max_tokens},
         # 官方 HTTP 指南推荐流式;invoke 由 LangChain 聚合为完整响应后再解析一次 JSON,
         # 流式中断的半段 JSON 不会被当成成功
         streaming=True,

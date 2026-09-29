@@ -545,6 +545,67 @@ class LateFixesTest(ProgressTestBase):
         self.assertIn("init boom", doc["error"])
         self.assertNotEqual(self._stages(doc_id)["describing"]["result"], "skipped")
 
+    def test_description_failure_text_is_sanitized(self):
+        # 单图失败与文档级失败落库的错误文本都不得含密钥/Authorization
+        from dataclasses import replace
+        secret = "DESC-SECRET-KEY-999"
+        self.settings = replace(self.settings, description_enabled=True,
+                                description_api_key=secret, description_base_url="https://x.cn/v1")
+
+        def leaky(*a, **k):
+            raise RuntimeError(f"401 Bearer abc123token key={secret} sk-abcd1234wxyz")
+
+        doc_id = self._new_doc()
+        self._ingest(doc_id, describe=leaky)
+        for occ in repo.occurrences_for_document(self.conn, doc_id):
+            blob = str(occ["uncertain_details"])
+            self.assertIn("RuntimeError", blob)              # 仍保留错误类别
+            for bad in (secret, "abc123token", "sk-abcd1234"):
+                self.assertNotIn(bad, blob)
+
+        doc2 = self._new_doc(b"%PDF-1.4 other")               # 初始化失败 -> 文档级 error
+        self.prog.register_run(f"run_{doc2}", doc2, LOCAL_CTX.tenant_id)
+        self.prog.claim_run(f"run_{doc2}")
+        service = IngestService(
+            self.settings, self.store, parser=None, index_service=IndexService(),
+            chat_model_factory=lambda: (_ for _ in ()).throw(
+                RuntimeError(f"init failed Bearer abc123token key={secret}")),
+            progress_store=self.prog,
+            mineru_client_factory=lambda obs: _FakeMinerU(obs))
+        service.ingest(doc2)
+        error = repo.get_document(self.conn, doc2)["error"]
+        self.assertIn("RuntimeError", error)
+        self.assertNotIn(secret, error)
+        self.assertNotIn("abc123token", error)
+
+    def test_same_version_reuses_but_new_version_redescribes(self):
+        calls = {"n": 0}
+
+        def counting(*a, **k):
+            calls["n"] += 1
+            return GOOD_DESC()
+
+        first = self._new_doc()
+        self._ingest(first, describe=counting)
+        after_first = calls["n"]
+        self.assertGreater(after_first, 0)
+
+        same = self._new_doc()                                # 同内容同版本 -> 复用,不请求模型
+        self._ingest(same, describe=counting)
+        self.assertEqual(calls["n"], after_first)
+        self.assertNotIn("describing", self._stages(same))
+
+        pdf_key, digest = self.store.put(b"%PDF-1.4 fake", "pdf", "application/pdf")
+        newer = repo.insert_document(                         # 同内容、新入库版本 -> 真正重新描述
+            self.conn, tenant_id=LOCAL_CTX.tenant_id, owner_id=LOCAL_CTX.user_id,
+            filename="t.pdf", pdf_object_key=pdf_key, sha256=digest,
+            ingestion_version="v2-description-omni-test1")
+        self._ingest(newer, describe=counting)
+        self.assertGreater(calls["n"], after_first)
+        stages = self._stages(newer)
+        self.assertIn("describing", stages)
+        self.assertNotIn("reuse", stages)
+
     def test_merge_end_measures_only_merge_work(self):
         # 多块合并耗时只含拼接操作,不含拆分与各块往返(此前按整个解析计时)
         import time as _time

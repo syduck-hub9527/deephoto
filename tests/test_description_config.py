@@ -164,8 +164,10 @@ class FactoryTest(unittest.TestCase):
         self.assertEqual(captured["model"], "m-desc")
         self.assertEqual(captured["api_key"], "secret(desc-key)")      # 不回退聊天密钥
         self.assertEqual(captured["base_url"], "https://desc.example.cn/v1")
-        self.assertEqual((captured["timeout"], captured["max_retries"], captured["max_tokens"]),
-                         (45.0, 3, 256))
+        self.assertEqual((captured["timeout"], captured["max_retries"]), (45.0, 3))
+        # max_tokens 走 extra_body(避免被 langchain-openai 改写成 max_completion_tokens)
+        self.assertEqual(captured["extra_body"], {"max_tokens": 256})
+        self.assertNotIn("max_tokens", captured)
         self.assertEqual(captured["reasoning_effort"], "none")         # 顶层关思考
         self.assertNotIn("temperature", captured)                      # 不继承聊天参数
         self.assertNotIn("enable_thinking", captured)                  # 不混用其他型号参数
@@ -191,6 +193,37 @@ class FactoryTest(unittest.TestCase):
                 else:
                     sys.modules[key] = value
         self.assertNotIn("reasoning_effort", captured)                 # 空 -> 不发送该参数
+
+
+class PublicValidationTest(unittest.TestCase):
+    """create_app(settings) 直传 Settings 时不能绕过启动校验。"""
+
+    def test_validate_description_rejects_enabled_without_key(self):
+        from deephoto.config import validate_description
+        with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_API_KEY"):
+            validate_description(_base_settings(
+                description_enabled=True, description_base_url="https://x.cn/v1"))
+
+    def test_validate_description_noop_when_disabled(self):
+        from deephoto.config import validate_description
+        validate_description(_base_settings())   # 不抛
+
+    def test_create_app_validates_directly_passed_settings(self):
+        try:
+            from deephoto.api.app import create_app
+        except ImportError:
+            self.skipTest("fastapi 未安装")
+        with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_BASE_URL"):
+            create_app(_base_settings(description_enabled=True, description_api_key="k"))
+
+    def test_plain_http_detection(self):
+        from deephoto.config import description_uses_plain_http as plain
+        on = dict(description_enabled=True, description_api_key="k")
+        self.assertTrue(plain(_base_settings(description_base_url="http://api.example.cn/v1", **on)))
+        self.assertFalse(plain(_base_settings(description_base_url="https://api.example.cn/v1", **on)))
+        self.assertFalse(plain(_base_settings(description_base_url="http://localhost:8000/v1", **on)))
+        self.assertFalse(plain(_base_settings(description_base_url="http://127.0.0.1:8000/v1", **on)))
+        self.assertFalse(plain(_base_settings()))                # 关闭
 
 
 class ParseHardeningTest(unittest.TestCase):

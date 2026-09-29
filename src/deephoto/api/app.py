@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 
 from ..agent.knowledge import KnowledgeService
 from ..agent.qa import QAService
-from ..config import Settings, load_settings
+from ..config import Settings, description_uses_plain_http, load_settings, validate_description
 from ..db import init_db
 from ..indexing.service import IndexService
 from ..llm import build_description_model, build_embeddings
@@ -31,6 +31,10 @@ _WEB_DIR = Path(__file__).parent.parent / "web"
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
+    validate_description(settings)   # 直传 Settings 时也要启动校验(load_settings 内已校验一次,幂等)
+    if description_uses_plain_http(settings):
+        logging.getLogger(__name__).warning(
+            "DEEPHOTO_DESCRIPTION_BASE_URL 使用明文 http://,密钥与图片将明文传输,生产环境请改用 https")
     # 项目 logger 的 INFO 需要真正可见(用户主要看服务日志),不重复添加 handler
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

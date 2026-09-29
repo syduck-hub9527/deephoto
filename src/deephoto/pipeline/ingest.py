@@ -20,6 +20,7 @@ from ..parsing.base import (
 )
 from ..parsing.content_list import build_document
 from ..parsing.mineru import MINERU_DEFAULT_BASE_URL, MinerUClient, MinerUError
+from ..sanitize import error_summary
 from ..storage import ObjectStore
 from .chunking import chunk_paragraphs
 from .describe import DESC_PROMPT_VERSION, describe_image
@@ -151,9 +152,11 @@ class IngestService:
             observer.finish(pg.RESULT_SUCCEEDED)
             self._log_run_summary(doc)
         except Exception as exc:  # 失败可重试:状态落库,worker 不中断
-            logger.exception("ingest failed for %s", document_id)
+            summary = error_summary(exc, self._secret_values(), max_chars=300)
+            logger.error("ingest failed for %s: %s", document_id, summary)
+            logger.debug("ingest failure traceback", exc_info=True)
             observer.finish(pg.RESULT_FAILED)
-            repo.update_document_status(conn, document_id, "failed", error=f"{type(exc).__name__}: {exc}")
+            repo.update_document_status(conn, document_id, "failed", error=summary)
 
     def _observer_for(self, document_id: str):
         """绑定该文档最新运行的观察器;无观测存储或无登记记录(旧文档)时用空实现。"""
@@ -385,16 +388,24 @@ class IngestService:
                     observer.warn(f"第 {seq} 张({label})描述格式解析失败,已降级")
             except Exception as exc:
                 # 单图失败不阻塞整篇入库(§6:描述漏掉关键内容 -> 检索命中后看原图兜底)
-                logger.exception("describe failed for %s", occ["id"])
+                summary = error_summary(exc, self._secret_values())
+                logger.error("describe failed for %s: %s", occ["id"], summary)
+                logger.debug("describe failure traceback", exc_info=True)
                 repo.update_occurrence_description(
                     conn, occ["id"], visible_summary="", visible_labels=[],
                     caption=occ["caption"] or "", context_summary="",
-                    uncertain_details=[f"描述生成失败:{type(exc).__name__}: {exc}"],
+                    uncertain_details=[f"描述生成失败:{summary}"],
                     description_model=desc_model_tag,
                 )
                 stats["failed"] += 1
                 observer.item_end("image", seq, pg.ITEM_ERROR, error_kind=type(exc).__name__)
         return stats
+
+    def _secret_values(self) -> list[str | None]:
+        """脱敏用:所有已配置的密钥原值(任何一个出现在异常文本里都要抹掉)。"""
+        st = self.settings
+        return [st.description_api_key, st.moonshot_api_key,
+                st.embedding_api_key, st.mineru_api_key]
 
     def _get_chat_model(self):
         """描述模型(进程内缓存)。工厂返回 None 表示"描述已关闭"(明确状态);

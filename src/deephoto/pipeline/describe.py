@@ -1,4 +1,4 @@
-"""用 Kimi K3 为图片生成检索描述(开发文档§3.4)。
+"""用图片描述模型(DESCRIPTION_* 配置,默认 qwen3.8-omni-flash)为图片生成检索描述(开发文档§3.4)。
 
 输入完整裁图(base64)、图注、所属章节与相关正文,输出结构化 JSON。
 visible_summary 必须依据图像;看不清的细节不得猜测,记入 uncertain_details。
