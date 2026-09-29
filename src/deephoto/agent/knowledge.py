@@ -86,9 +86,10 @@ class KnowledgeService:
             if link["confidence"] >= CONF_DISPLAY_THRESHOLD:
                 if link["image_occurrence_id"] not in chunk_image_rel:
                     chunk_image_rel[link["image_occurrence_id"]] = (link["relation"], link["confidence"])
-        # 命中图片 -> 补全图注与解释它的正文
+        # 命中图片 -> 补全图注与解释它的正文(整图文档:OCR 文本块即"解释它的正文")
         for link in repo.links_for_images(conn, list(image_hits)):
-            if link["relation"] in ("caption_of", "references") and link["chunk_id"] not in chunks:
+            if link["relation"] in ("caption_of", "references", "whole_document") \
+                    and link["chunk_id"] not in chunks:
                 extra = repo.get_chunks(conn, [link["chunk_id"]])
                 for c in extra:
                     chunks[c["id"]] = c

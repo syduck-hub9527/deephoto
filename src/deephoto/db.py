@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS chunk_image_links (
     document_id         TEXT NOT NULL,
     chunk_id            TEXT NOT NULL REFERENCES text_chunks(id),
     image_occurrence_id TEXT NOT NULL REFERENCES image_occurrences(id),
-    relation            TEXT NOT NULL,     -- references|caption_of|nearby
+    relation            TEXT NOT NULL,     -- references|caption_of|whole_document|nearby
     confidence          REAL NOT NULL,
     UNIQUE(chunk_id, image_occurrence_id, relation)
 );

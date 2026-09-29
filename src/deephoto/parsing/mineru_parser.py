@@ -115,8 +115,13 @@ class MinerUParser:
 
 
 def _attach_original_figure(doc: ParsedDocument, src: SourceFile) -> None:
-    """图片格式:整图本身就是唯一配图,补到第 1 页(图片来源=原图本身,§2 矩阵;
-    MinerU 对图片输入只回 OCR 文本,不回裁图——样本实测 elements 里无 image 元素)。"""
+    """图片格式:整图本身就是唯一配图,放到第 1 页(图片来源=原图本身,§2 矩阵)。
+
+    MinerU 对图片输入通常只回 OCR 文本(样本实测无 image 元素);若个别输入
+    (截图/图表类)返回了裁好的子图,也以原图为准——子图是原图的区域裁剪,
+    并存会在 QA 里重复配图,故丢弃子图只留原图(子图的图注文本仍留在段落里,
+    可检索)。
+    """
     from io import BytesIO
 
     from PIL import Image
@@ -128,6 +133,8 @@ def _attach_original_figure(doc: ParsedDocument, src: SourceFile) -> None:
             width, height = img.size
     except Exception:                # 魔数已过但解码失败:占位尺寸,字节照常入库
         width, height = int(PAGE_W), int(PAGE_H)
+    for page in doc.pages:
+        page.figures.clear()         # 丢弃 MinerU 可能返回的子图裁剪,只留原图
     doc.pages[0].figures.append(ParsedFigure(
         id="p1_fig_orig", page_number=1, bbox=(0.0, 0.0, float(width), float(height)),
         kind=KIND_EMBEDDED_BITMAP, image_bytes=src.data,

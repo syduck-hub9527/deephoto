@@ -87,5 +87,56 @@ class IngestImageTest(unittest.TestCase):
         self.assertEqual(entries[0]["locator_label"], "p.1")
 
 
+@unittest.skipUnless(HAVE_DEPS, "需要 numpy 与 pillow")
+class IngestImageMineruTest(unittest.TestCase):
+    """MinerU 路径(假客户端,返回与真实样本一致的形态:只有 OCR 文本、无图片元素):
+    用户问"图里写了什么"命中 OCR 文本块时,原图必须能配出来(whole_document 1.0)。"""
+
+    def setUp(self):
+        from deephoto.parsing.content_list import parse_content_list
+        from deephoto.parsing.mineru import MinerUResult
+
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        root = Path(self.tmp.name)
+        self.settings = Settings(
+            moonshot_api_key=None, moonshot_base_url="", chat_model="k3", chat_temperature=1.0,
+            embedding_base_url=None, embedding_api_key=None, embedding_model=None,
+            data_dir=root, max_upload_mb=100, ingestion_version="v2", mineru_api_key="tok")
+        init_db(self.settings.db_path)
+        self.conn = connect(self.settings.db_path)
+        self.store = ObjectStore(root / "objects")
+        data = _png()
+
+        class _FakeClient:      # 真实 MinerU 对图片输入的形态:仅 OCR 文本,无 image 元素
+            def parse_file(self, data, filename, fmt):
+                items = [{"type": "text", "text": "存储器层次结构 寄存器最快", "page_idx": 0}]
+                return MinerUResult(page_texts=["存储器层次结构 寄存器最快"], raw={},
+                                    elements=parse_content_list(items, {}))
+
+        key, digest = self.store.put(data, "sources", "image/png", ext="png")
+        self.doc_id = repo.insert_document(
+            self.conn, tenant_id=LOCAL_CTX.tenant_id, owner_id=LOCAL_CTX.user_id,
+            filename="照片.png", source_object_key=key, sha256=digest, ingestion_version="v2",
+            source_format="image", locator_kind="page", parse_engine="mineru")
+        self.index = IndexService()
+        IngestService(self.settings, self.store, parser=None, index_service=self.index,
+                      mineru_client_factory=lambda obs: _FakeClient()).ingest(self.doc_id)
+        self.knowledge = KnowledgeService(self.store, self.index)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_search_by_ocr_text_returns_original_image(self):
+        doc = repo.get_document(self.conn, self.doc_id)
+        self.assertEqual(doc["status"], "ready")
+        result = self.knowledge.search(self.conn, LOCAL_CTX, "存储器 寄存器")
+        self.assertTrue(result["chunks"])
+        images = result["images"]
+        self.assertEqual(len(images), 1)                   # 修复前:nearby 0.4 不够阈值,为 0
+        self.assertEqual(images[0]["relation"], "whole_document")
+        self.assertEqual(images[0]["locator_label"], "p.1")
+
+
 if __name__ == "__main__":
     unittest.main()

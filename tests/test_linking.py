@@ -1,7 +1,11 @@
 import unittest
 
 import _bootstrap  # noqa: F401
-from deephoto.pipeline.linking import CONF_DISPLAY_THRESHOLD, resolve_links
+from deephoto.pipeline.linking import (
+    CONF_DISPLAY_THRESHOLD,
+    resolve_links,
+    whole_document_links,
+)
 
 
 class LinkingTest(unittest.TestCase):
@@ -43,6 +47,21 @@ class LinkingTest(unittest.TestCase):
         links = resolve_links(chunks, self.occurrences)
         keys = [(l.chunk_id, l.image_occurrence_id, l.relation) for l in links]
         self.assertEqual(len(keys), len(set(keys)))
+
+    def test_whole_document_links(self):
+        # 整图文档(source_format='image'):唯一的图与所有文本块强制关联(1.0),
+        # 够到展示阈值——MinerU 对图片只回 OCR 文本,nearby(0.4)永远配不上图
+        chunks = [{"id": "chk_1", "text": "OCR 第一段", "page_start": 1, "page_end": 1,
+                   "referenced_image_ids": []},
+                  {"id": "chk_2", "text": "OCR 第二段", "page_start": 1, "page_end": 1,
+                   "referenced_image_ids": []}]
+        links = whole_document_links(chunks, [{"id": "occ_img", "page_number": 1,
+                                               "figure_number": None, "caption": None}])
+        self.assertEqual({(l.chunk_id, l.image_occurrence_id) for l in links},
+                         {("chk_1", "occ_img"), ("chk_2", "occ_img")})
+        for l in links:
+            self.assertEqual(l.relation, "whole_document")
+            self.assertGreaterEqual(l.confidence, CONF_DISPLAY_THRESHOLD)
 
 
 if __name__ == "__main__":

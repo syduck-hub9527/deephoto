@@ -130,6 +130,21 @@ class MinerUImageFigureTest(unittest.TestCase):
         self.assertEqual(len(doc.all_figures()), 1)
         validate_parsed(doc)
 
+    def test_mineru_subfigures_replaced_by_original(self):
+        # MinerU 若对图片输入返回了子图裁剪(截图/图表类未实测):以原图为准,
+        # 子图丢弃不并存(否则 QA 重复配图);子图的图注文本仍留在段落里可检索
+        from deephoto.parsing.content_list import parse_content_list
+        items = [{"type": "image", "img_path": "images/sub.png",
+                  "image_caption": ["图 1 子图"], "page_idx": 0},
+                 {"type": "text", "text": "OCR 文字", "page_idx": 0}]
+        elements = parse_content_list(items, {"images/sub.png": _png("blue")})
+        doc, png = self._parse_with_fake(elements, ["OCR 文字"])
+        figs = doc.all_figures()
+        self.assertEqual(len(figs), 1)                   # 不是 2 个
+        self.assertEqual(figs[0].image_bytes, png)       # 只有原图
+        self.assertIn("图 1 子图", [p.text for p in doc.all_paragraphs()])
+        validate_parsed(doc)
+
 
 if __name__ == "__main__":
     unittest.main()

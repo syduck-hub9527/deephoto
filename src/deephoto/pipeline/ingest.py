@@ -23,7 +23,7 @@ from ..sanitize import error_summary
 from ..storage import ObjectStore
 from .chunking import chunk_paragraphs
 from .describe import DESC_PROMPT_VERSION, describe_image
-from .linking import resolve_links
+from .linking import resolve_links, whole_document_links
 from .progress import NoOpObserver
 from . import progress as pg
 
@@ -259,7 +259,10 @@ class IngestService:
             chunks.append({"id": chunk_id, "text": draft.text,
                            "page_start": draft.page_start, "page_end": draft.page_end,
                            "referenced_image_ids": referenced})
-        for link in resolve_links(chunks, occurrences):
+        links = resolve_links(chunks, occurrences)
+        if doc.get("source_format") == "image":
+            links += whole_document_links(chunks, occurrences)   # 图即全文(§3.4f)
+        for link in links:
             repo.insert_link(conn, tenant_id=doc["tenant_id"], document_id=doc["id"],
                              chunk_id=link.chunk_id, image_occurrence_id=link.image_occurrence_id,
                              relation=link.relation, confidence=link.confidence)
