@@ -44,6 +44,8 @@ _IMAGE_MAGICS = [
 ]
 _IMAGE_EXTS = {"png", "jpg", "jpeg", "jp2", "webp", "gif", "bmp"}
 _TEXT_EXTS = {"md": "md", "markdown": "md", "txt": "txt", "html": "html", "htm": "html"}
+# Windows 记事本"Unicode"即 UTF-16(带 BOM);其 ASCII 字符都含 NUL,不能按二进制拒绝
+_UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
 
 
 @dataclass(frozen=True)
@@ -81,13 +83,19 @@ def format_by_key(key: str) -> FormatInfo:
 
 
 def decode_text(data: bytes) -> str:
-    """文本类解码:utf-8-sig → gb18030;都失败抛 UnsupportedFormat。检测与解析共用同一顺序。"""
+    """文本类解码:UTF-16 BOM → utf-8-sig → gb18030;都失败抛 UnsupportedFormat。
+    检测与解析共用同一顺序。"""
+    if data.startswith(_UTF16_BOMS):
+        try:
+            return data.decode("utf-16")   # 编解码器依 BOM 自动判定 LE/BE
+        except UnicodeDecodeError:
+            raise UnsupportedFormat("undecodable", "UTF-16 文本解码失败") from None
     for encoding in ("utf-8-sig", "gb18030"):
         try:
             return data.decode(encoding)
         except UnicodeDecodeError:
             continue
-    raise UnsupportedFormat("undecodable", "文本编码无法识别(支持 UTF-8 / GB18030)")
+    raise UnsupportedFormat("undecodable", "文本编码无法识别(支持 UTF-16/UTF-8/GB18030)")
 
 
 def _ext_of(filename: str) -> str:
@@ -146,7 +154,7 @@ def detect_format(data: bytes, filename: str) -> FormatInfo:
         return FormatInfo(key="image", ext="webp", mime="image/webp", locator_kind="page")
 
     if ext in _TEXT_EXTS:
-        if b"\x00" in data:
+        if b"\x00" in data and not data.startswith(_UTF16_BOMS):
             raise UnsupportedFormat("binary", "扩展名是文本类,但内容含 NUL 字节,疑似二进制文件")
         decode_text(data)   # 只验证可解码;解析时重新解码
         return _info(_TEXT_EXTS[ext])

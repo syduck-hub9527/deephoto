@@ -24,13 +24,32 @@ from .registry import SourceFile
 
 logger = logging.getLogger(__name__)
 
-_FRONT_MATTER_RE = re.compile(r"\A---[ \t]*\n.*?\n---[ \t]*(?:\n|\Z)", re.DOTALL)
+_FRONT_MATTER_MAX_LINES = 100        # 闭合 --- 必须在前 100 行内,否则视为普通分隔线
+_YAML_KEY_RE = re.compile(r"^[\w.-]+\s*:")   # front matter 正文第一行非空内容须像 YAML 键
 _DATA_URI_RE = re.compile(r"\Adata:([\w/+.\-]+);base64,(.*)\Z", re.DOTALL)
 _REMOTE_RE = re.compile(r"\Ahttps?://", re.IGNORECASE)
+# 容器块(列表/表格/引用)整块切原文后,把 ![alt](...) 换成 alt;
+# data URI 的 base64 长串随之抹掉,不污染检索与分块
+_IMG_SYNTAX_RE = re.compile(r"!\[([^\]]*)\]\(\s*[^)\s]+(?:\s+\"[^\"]*\")?\s*\)")
 
 
 def _strip_front_matter(text: str) -> str:
-    return _FRONT_MATTER_RE.sub("", text, count=1)
+    """剥离 YAML front matter。防线:首行 --- 的闭合 --- 须在前 100 行内,
+    且其间第一行非空内容须像 YAML 键(key: 形式);否则是正文里的普通分隔线,不剥离。"""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return text
+    for i in range(1, min(len(lines), _FRONT_MATTER_MAX_LINES + 1)):
+        if lines[i].strip() == "---":
+            first = next((l for l in lines[1:i] if l.strip()), "")
+            if _YAML_KEY_RE.match(first):
+                return "\n".join(lines[i + 1:])
+            return text
+    return text
+
+
+def _strip_image_syntax(text: str) -> str:
+    return _IMG_SYNTAX_RE.sub(lambda m: m.group(1), text)
 
 
 class _HtmlTextExtractor(HTMLParser):
@@ -139,6 +158,7 @@ class MarkdownParser:
                 end = tokens[j].map[1] if j < len(tokens) and tokens[j].map else \
                     (tok.map[1] if tok.map else None)
                 raw = self._slice(lines, (tok.map[0], end)) if tok.map and end is not None else ""
+                raw = _strip_image_syntax(raw)     # 容器内的图片语法只留 alt(围栏代码不动)
                 if raw.strip():
                     blocks.append(LocalBlock("text", text=raw))
                 i = j + 1
@@ -166,7 +186,7 @@ class MarkdownParser:
                 buf.append(f"`{child.content}`")
             elif child.type in ("text", "html_inline"):
                 buf.append(child.content)
-            elif child.type == "softbreak":
+            elif child.type in ("softbreak", "hardbreak"):
                 buf.append("\n")
         if "".join(buf).strip():
             blocks.append(LocalBlock("text", text="".join(buf)))

@@ -60,6 +60,12 @@ class DetectPositiveTest(unittest.TestCase):
         self.assertEqual(_detect("标题".encode("gb18030"), "a.md").key, "md")
         self.assertEqual(_detect(b"\xef\xbb\xbf# t", "a.txt").key, "txt")
 
+    def test_utf16_bom_text_accepted(self):
+        # Windows 记事本"Unicode"(UTF-16 带 BOM):含大量 NUL 但不是二进制
+        data = "# 标题\n\n正文".encode("utf-16")
+        self.assertEqual(_detect(data, "a.md").key, "md")
+        self.assertEqual(_detect(data, "a.txt").key, "txt")
+
     def test_pathy_filename_uses_basename_ext(self):
         self.assertEqual(_detect(b"%PDF-1.4", "../evil/a.pdf").key, "pdf")
 
@@ -93,6 +99,10 @@ class DetectRejectTest(unittest.TestCase):
 
     def test_nul_in_txt(self):
         self._reject("binary", b"ab\x00cd", "a.txt")
+
+    def test_utf16_without_bom_rejected_as_binary(self):
+        # 无 BOM 的 UTF-16 无法可靠识别(现状):按二进制拒绝
+        self._reject("binary", "# 标题".encode("utf-16-le"), "a.md")
 
     def test_undecodable_text(self):
         self._reject("undecodable", b"\xff\xff\xff\xff\xfe", "a.md")

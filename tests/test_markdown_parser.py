@@ -57,6 +57,18 @@ class FrontMatterTest(unittest.TestCase):
         self.assertEqual(_strip_front_matter("---\ntitle: 测试\ndate: 2026\n---\n# 正文\n"), "# 正文\n")
         self.assertEqual(_strip_front_matter("# 无 front matter"), "# 无 front matter")
 
+    def test_hr_then_text_then_hr_is_not_front_matter(self):
+        # 回归:以分隔线开头、后文还有分隔线,正文不得被当成 YAML 吞掉
+        src = "---\n\n重要前言\n\n---\n\n# 标题\n正文"
+        self.assertEqual(_strip_front_matter(src), src)
+        doc = _md(src)
+        self.assertIn("重要前言", [p.text for p in doc.all_paragraphs()])
+
+    def test_closing_fence_beyond_100_lines_not_stripped(self):
+        body = "\n".join(f"key{i}: v" for i in range(101))
+        src = f"---\n{body}\n---\n正文"
+        self.assertEqual(_strip_front_matter(src), src)   # 闭合行超过前 100 行:不剥离
+
     def test_front_matter_not_in_section(self):
         doc = _md("---\ntitle: 不该进章节\n---\n# 第一章 引论\n正文\n")
         sections = [p.section for p in doc.all_paragraphs()]
@@ -139,6 +151,46 @@ class MarkdownParseTest(unittest.TestCase):
         sections = [p.section for p in doc.all_paragraphs() if p.text.startswith("内容")]
         self.assertEqual(sections, ["章 > 节", "第二章"])
 
+    def test_images_inside_list_and_table_keep_only_alt(self):
+        # 回归:容器块整块切原文,![alt](data:...) 的 base64 长串不得进正文
+        big_b64 = "A" * 2000
+        src = (f"- 条目 ![图 9 曲线](data:image/png;base64,{big_b64}) 尾巴\n"
+               f"| 列 |\n| --- |\n| ![单元图](data:image/png;base64,{big_b64}) |\n")
+        doc = _md(src)
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("条目", blob)
+        self.assertIn("图 9 曲线", blob)          # alt 保留
+        self.assertIn("单元图", blob)
+        self.assertNotIn("base64", blob)           # 长串抹掉
+        self.assertNotIn("![", blob)
+
+    def test_hardbreak_kept(self):
+        # 回归:行尾两空格的硬换行被丢弃,文字粘在一起
+        doc = _md("第一行  \nsecond line  \nthird\n")
+        self.assertEqual(doc.all_paragraphs()[0].text, "第一行\nsecond line\nthird")
+
+    def test_giant_fence_split_across_segments(self):
+        # 回归:超大围栏整块落一个分段;现按行拆开再分页
+        fence_body = "\n".join(f"line {i} " + "x" * 60 for i in range(120))   # 约 8KB
+        doc = _md(f"```\n{fence_body}\n```\n")
+        self.assertGreater(doc.page_count, 1)
+        for p in doc.all_paragraphs():
+            self.assertLessEqual(len(p.text), 1600)
+
+    def test_utf16_bom_md(self):
+        # 回归:Windows 记事本"Unicode"(UTF-16 带 BOM)不得按二进制拒绝
+        data = "# 标题\n\n正文 utf16".encode("utf-16")   # 带 BOM,含大量 NUL
+        parser = MarkdownParser(_settings())
+        doc = parser.parse(SourceFile(data=data, filename="a.md", fmt=format_by_key("md")),
+                           _Recorder())
+        self.assertEqual(doc.all_paragraphs()[0].text, "标题")
+
+    def test_fence_keeps_image_syntax_raw(self):
+        # 容器块抹图片语法,但围栏代码是示例文本,原样保留(含围栏标记)
+        doc = _md("```\n![a](data:image/png;base64,AAAA)\n```\n")
+        blob = "\n".join(p.text for p in doc.all_paragraphs())
+        self.assertIn("![a](data:image/png;base64,AAAA)", blob)
+
 
 class TextParserTest(unittest.TestCase):
     def test_blank_line_segments(self):
@@ -157,6 +209,17 @@ class TextParserTest(unittest.TestCase):
         src = SourceFile(data="一\r\n\r\n二\r\n".encode(), filename="a.txt", fmt=format_by_key("txt"))
         doc = parser.parse(src, _Recorder())
         self.assertEqual([p.text for p in doc.all_paragraphs()], ["一", "二"])
+
+    def test_single_newline_only_falls_back_to_lines(self):
+        # 回归:800 行单换行的 txt 修前只有 1 页 1 个超长段落
+        text = "\n".join(f"第 {i} 行 " + "字" * 25 for i in range(800))   # 约 2.4 万字,无空行
+        parser = TextParser(_settings())
+        doc = parser.parse(SourceFile(data=text.encode(), filename="a.txt",
+                                      fmt=format_by_key("txt")), _Recorder())
+        self.assertGreater(doc.page_count, 1)                  # 虚拟分页生效
+        self.assertGreater(len(doc.all_paragraphs()), 100)     # 按行成段
+        for p in doc.all_paragraphs():
+            self.assertLessEqual(len(p.text), 1600)
 
 
 if __name__ == "__main__":

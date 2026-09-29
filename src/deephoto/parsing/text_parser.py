@@ -22,6 +22,10 @@ class TextParser:
 
     def parse(self, src: SourceFile, observer) -> "object":
         text = decode_text(src.data).replace("\r\n", "\n").replace("\r", "\n")
-        blocks = [LocalBlock("text", text=para.strip())
-                  for para in _BLANK_RE.split(text) if para.strip()]
+        paragraphs = [para.strip() for para in _BLANK_RE.split(text) if para.strip()]
+        if len(paragraphs) <= 1 and "\n" in text:
+            # 没有空行分段的 txt(如按行导出的文档):退回按单换行切,
+            # 否则整份文档只有一个超长段落,虚拟分页与 nearby 关联都失去局部性
+            paragraphs = [line.strip() for line in text.split("\n") if line.strip()]
+        blocks = [LocalBlock("text", text=para) for para in paragraphs]
         return build_local_document(blocks)

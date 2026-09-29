@@ -51,6 +51,30 @@ class PaginateTest(unittest.TestCase):
         self.assertEqual(paginate(blocks), [1, 1, 1])
 
 
+class SplitOversizeTest(unittest.TestCase):
+    def test_oversize_text_block_splits_at_line_boundaries(self):
+        # 回归:超过约 1500 字的块先按行拆开,再分页(否则整份 txt 落一个分段)
+        text = "\n".join("行" * 100 for _ in range(60))         # 约 6KB
+        doc = build_local_document([LocalBlock("text", text)])
+        self.assertGreater(doc.page_count, 1)
+        for p in doc.all_paragraphs():
+            self.assertLessEqual(len(p.text), 1600)
+
+    def test_single_overlong_line_hard_cut(self):
+        doc = build_local_document([LocalBlock("text", "x" * 5000)])
+        self.assertGreaterEqual(len(doc.all_paragraphs()), 4)
+        for p in doc.all_paragraphs():
+            self.assertLessEqual(len(p.text), 1500)
+
+    def test_headings_and_images_not_split(self):
+        long_heading = "标" * 2000
+        blocks = [LocalBlock("heading", long_heading, level=1),
+                  LocalBlock("image", "alt", image_bytes=b"\x89PNG" + b"0" * 2000)]
+        doc = build_local_document(blocks)
+        self.assertEqual(doc.all_paragraphs()[0].text, long_heading)   # 标题不拆
+        self.assertEqual(len(doc.all_figures()), 1)                    # 图不拆
+
+
 class BuildLocalDocumentTest(unittest.TestCase):
     def test_sections_and_caption_linkage(self):
         blocks = [
