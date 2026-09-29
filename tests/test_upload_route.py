@@ -65,14 +65,20 @@ class UploadRouteTest(unittest.TestCase):
             self.assertEqual(resp.status_code, 200, name)
             self.assertEqual(resp.json()["source_format"], key)
 
-    def test_docx_not_in_default_whitelist(self):
+    def test_docx_accepted_pptx_not_in_default_whitelist(self):
         import io
         import zipfile
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w") as z:
-            z.writestr("word/document.xml", "x")
-        resp = self._upload(buf.getvalue(), "a.docx")
-        self.assertEqual(resp.status_code, 415)      # 默认白名单只含 pdf/md/txt
+
+        def ooxml(entry):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as z:
+                z.writestr(entry, "x")
+            return buf.getvalue()
+        resp = self._upload(ooxml("word/document.xml"), "a.docx")
+        self.assertEqual(resp.status_code, 200)                    # docx 有本地引擎,默认放行
+        self.assertEqual(resp.json()["source_format"], "docx")
+        resp = self._upload(ooxml("ppt/presentation.xml"), "a.pptx")
+        self.assertEqual(resp.status_code, 415)                    # pptx 引擎未落地(P2 后续)
 
     def test_mismatch_is_400(self):
         resp = self._upload(b"%PDF-1.4 fake", "a.md")
@@ -112,8 +118,8 @@ class UploadRouteTest(unittest.TestCase):
         # 前端 accept 的唯一来源:与服务端白名单一致,不走硬编码
         resp = self.client.get("/api/documents/upload-config")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["accept"], [".markdown", ".md", ".pdf", ".txt"])
-        self.assertEqual(resp.json()["formats"], ["md", "pdf", "txt"])
+        self.assertEqual(resp.json()["accept"], [".docx", ".markdown", ".md", ".pdf", ".txt"])
+        self.assertEqual(resp.json()["formats"], ["docx", "md", "pdf", "txt"])
 
     def test_upload_config_follows_custom_whitelist(self):
         from deephoto.api.app import create_app

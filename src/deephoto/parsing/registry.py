@@ -39,7 +39,6 @@ class DocumentParser(Protocol):
 
 
 _UNAVAILABLE = {
-    "docx": "Word(docx)本地解析器将在后续版本提供",
     "pptx": "PPT(pptx)本地解析器将在后续版本提供",
     "xlsx": "Excel(xlsx)本地解析器将在后续版本提供",
     "doc": "旧版 Word(doc)需要 MinerU 云端解析,将在后续版本提供",
@@ -56,6 +55,8 @@ def engine_for(fmt: FormatInfo, settings: Settings) -> str:
         return "mineru"
     if fmt.key in ("md", "txt"):
         return "local"
+    if fmt.key == "docx":
+        return settings.docx_parser     # local(默认)| mineru(切云端需 Token)
     raise EngineUnavailable(_UNAVAILABLE.get(fmt.key, f"暂不支持 {fmt.key} 格式"))
 
 
@@ -74,6 +75,9 @@ def create_parser(fmt: FormatInfo, settings: Settings, *, engine: str | None = N
     if fmt.key == "txt":
         from .text_parser import TextParser
         return TextParser(settings)
+    if fmt.key == "docx":
+        from .docx_parser import DocxParser
+        return DocxParser(settings)
     raise EngineUnavailable(_UNAVAILABLE.get(fmt.key, f"暂不支持 {fmt.key} 格式"))
 
 

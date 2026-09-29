@@ -67,7 +67,7 @@ def _get_formats() -> frozenset:
     from .parsing.formats import supported_keys
     raw = _get("ALLOWED_FORMATS")
     if raw is None or not raw.strip():
-        return frozenset({"pdf", "md", "txt"})
+        return frozenset({"pdf", "md", "txt", "docx"})
     keys = {part.strip().lower() for part in raw.split(",") if part.strip()}
     unknown = keys - set(supported_keys())
     if unknown:
@@ -77,6 +77,18 @@ def _get_formats() -> frozenset:
     if not keys:
         raise ValueError(f"环境变量 {_ENV_PREFIX}ALLOWED_FORMATS 为空;请至少保留一种格式")
     return frozenset(keys)
+
+
+def _get_choice(name: str, default: str, choices: tuple[str, ...]) -> str:
+    """枚举配置:值必须在 choices 内,否则报错点名变量(不报值)。"""
+    raw = _get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value not in choices:
+        raise ValueError(
+            f"环境变量 {_ENV_PREFIX}{name} 必须是 {'/'.join(choices)} 之一,当前值无法识别")
+    return value
 
 
 def _description_url_error(url: str) -> str | None:
@@ -130,8 +142,10 @@ class Settings:
     description_max_tokens: int = 1024
 
     # 多格式:上传白名单(formats.FormatInfo.key);默认只开当前有可用引擎的格式
-    allowed_formats: frozenset = frozenset({"pdf", "md", "txt"})
+    allowed_formats: frozenset = frozenset({"pdf", "md", "txt", "docx"})
     markdown_data_uri_max_mb: int = 10   # md 内联图(data URI)单张上限
+    docx_parser: str = "local"           # local(python-docx)| mineru(云端,耗额度)
+    max_zip_uncompressed_mb: int = 500   # OOXML(zip)解压总量上限(防压缩炸弹)
 
     @property
     def embeddings_enabled(self) -> bool:
@@ -178,6 +192,8 @@ def load_settings() -> Settings:
         description_max_tokens=_get_int("DESCRIPTION_MAX_TOKENS", 1024, minimum=1),
         allowed_formats=_get_formats(),
         markdown_data_uri_max_mb=_get_int("MARKDOWN_DATA_URI_MAX_MB", 10, minimum=1),
+        docx_parser=_get_choice("DOCX_PARSER", "local", ("local", "mineru")),
+        max_zip_uncompressed_mb=_get_int("MAX_ZIP_UNCOMPRESSED_MB", 500, minimum=1),
     )
     validate_description(settings)
     return settings

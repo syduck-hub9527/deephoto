@@ -11,3 +11,4 @@ numpy>=1.26
 deepagents>=0.0.5
 langchain-openai>=0.3.0
 markdown-it-py>=3.0
+python-docx>=1.1

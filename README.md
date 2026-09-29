@@ -52,7 +52,9 @@ pip freeze > requirements.lock.txt
 | `INGESTION_VERSION` | 解析/索引版本;去重复用的判定维度之一 | `v2` |
 | `MINERU_API_KEY` | MinerU 云端解析 Token(解析 **PDF** 必填;Markdown/纯文本走本地解析,不需要) | — |
 | `MINERU_BASE_URL` | MinerU 服务地址 | `https://mineru.net` |
-| `ALLOWED_FORMATS` | 上传格式白名单(逗号分隔);Office/图片/HTML 的引擎将在后续版本提供,放开只会得到可读失败 | `pdf,md,txt` |
+| `ALLOWED_FORMATS` | 上传格式白名单(逗号分隔);pptx/xlsx/旧版 Office/图片/HTML 的引擎将在后续版本提供,放开只会得到可读失败 | `pdf,md,txt,docx` |
+| `DOCX_PARSER` | docx 解析引擎:`local`(python-docx 本地,默认)/ `mineru`(云端,耗额度,需 Token) | `local` |
+| `MAX_ZIP_UNCOMPRESSED_MB` | OOXML(zip)解压总量上限(防压缩炸弹) | `500` |
 | `MARKDOWN_DATA_URI_MAX_MB` | Markdown 内联图(data URI)单张上限 | `10` |
 | `DESCRIPTION_ENABLED` | 图片描述专用模型开关(独立于问答/嵌入/MinerU) | **`false`** |
 | `DESCRIPTION_API_KEY` / `DESCRIPTION_BASE_URL` | 描述服务独立密钥与 OpenAI 兼容 Base URL(到 `/v1` 为止;不回退使用聊天密钥) | — |
@@ -69,7 +71,7 @@ pip freeze > requirements.lock.txt
 
 ## API 摘要
 
-- `POST /api/documents` 上传文档(PDF / Markdown / TXT,多文件逐个上传)→ `{document_id, status, source_format}`;内容与扩展名不符/损坏 400,格式不支持或不在白名单 415
+- `POST /api/documents` 上传文档(PDF / Markdown / TXT / DOCX,多文件逐个上传)→ `{document_id, status, source_format}`;内容与扩展名不符/损坏 400,格式不支持或不在白名单 415
 - `GET /api/documents` / `GET /api/documents/{id}` / `DELETE /api/documents/{id}`
 - `POST /api/qa` `{question, document_id?}` → `{answer, citations[], images[]}`
 - `GET /api/documents/{id}/images/{occ_id}`、`GET .../pages/{n}`:图片与页预览(问答响应中已生成 URL,本地部署无鉴权)

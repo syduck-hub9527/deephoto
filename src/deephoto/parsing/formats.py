@@ -101,6 +101,39 @@ def accept_extensions(keys) -> list[str]:
     return sorted(f".{ext}" for key in keys for ext in _ACCEPT_EXTS.get(key, ()))
 
 
+# ---- OOXML(zip 容器)打开前的安全闸门(§3.1)----
+
+_MAX_ZIP_ENTRIES = 10000
+_MAX_COMPRESSION_RATIO = 100
+
+
+def check_zip_safety(data: bytes, max_uncompressed_mb: int) -> None:
+    """OOXML 打开/解压前的检查:条目数、解压总量、单条压缩比、条目路径。
+
+    违规抛 UnsupportedFormat("unsafe"/"corrupt", 可读原因)。只看目录元数据,不解压内容。
+    XML 实体安全由解析库负责(python-docx 1.2.0 resolve_entities=False,有探针测试)。
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            infos = z.infolist()
+    except zipfile.BadZipFile as exc:
+        raise UnsupportedFormat("corrupt", "zip 容器损坏,无法读取") from exc
+    if len(infos) > _MAX_ZIP_ENTRIES:
+        raise UnsupportedFormat("unsafe", f"zip 条目数 {len(infos)} 超过上限 {_MAX_ZIP_ENTRIES}")
+    total = 0
+    limit = max_uncompressed_mb * 1024 * 1024
+    for info in infos:
+        name = info.filename.replace("\\", "/")
+        if ".." in name.split("/") or name.startswith("/") or (len(name) > 1 and name[1] == ":"):
+            raise UnsupportedFormat("unsafe", "zip 条目路径不安全(含 .. 或绝对路径)")
+        total += info.file_size
+        if total > limit:
+            raise UnsupportedFormat("unsafe", f"zip 解压总量超过 {max_uncompressed_mb}MB 上限")
+        if info.file_size > 4096 and info.compress_size > 0 \
+                and info.file_size / info.compress_size > _MAX_COMPRESSION_RATIO:
+            raise UnsupportedFormat("unsafe", "zip 条目压缩比异常,疑似压缩炸弹")
+
+
 def decode_text(data: bytes) -> str:
     """文本类解码:UTF-16 BOM → utf-8-sig → gb18030;都失败抛 UnsupportedFormat。
     检测与解析共用同一顺序。"""
