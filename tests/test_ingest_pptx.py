@@ -68,17 +68,20 @@ class IngestPptxTest(unittest.TestCase):
         init_db(self.settings.db_path)
         self.conn = connect(self.settings.db_path)
         self.store = ObjectStore(root / "objects")
-        data = _pptx_bytes()
+        self.index = IndexService()
+        self.doc_id = self._ingest(_pptx_bytes(), "讲义.pptx")
+        self.knowledge = KnowledgeService(self.store, self.index)
+
+    def _ingest(self, data: bytes, filename: str) -> str:
         from deephoto.parsing.formats import format_by_key
         key, digest = self.store.put(data, "sources", format_by_key("pptx").mime, ext="pptx")
-        self.doc_id = repo.insert_document(
+        doc_id = repo.insert_document(
             self.conn, tenant_id=LOCAL_CTX.tenant_id, owner_id=LOCAL_CTX.user_id,
-            filename="讲义.pptx", source_object_key=key, sha256=digest, ingestion_version="v2",
+            filename=filename, source_object_key=key, sha256=digest, ingestion_version="v2",
             source_format="pptx", locator_kind="slide", parse_engine="local")
-        self.index = IndexService()
         IngestService(self.settings, self.store, parser=None,
-                      index_service=self.index).ingest(self.doc_id)
-        self.knowledge = KnowledgeService(self.store, self.index)
+                      index_service=self.index).ingest(doc_id)
+        return doc_id
 
     def tearDown(self):
         self.conn.close()
@@ -124,6 +127,40 @@ class IngestPptxTest(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertIsNone(entries[0]["source_page_url"])
         self.assertEqual(entries[0]["locator_label"], "幻灯片 1")
+
+    def test_notes_slide_without_body_placeholder(self):
+        # 回归:备注页缺正文占位符时 notes_text_frame 为 None,不能让整份 pptx 解析失败
+        from pptx import Presentation
+        from pptx.enum.shapes import PP_PLACEHOLDER
+        prs = Presentation()
+        s = prs.slides.add_slide(prs.slide_layouts[0])
+        s.shapes.title.text = "无备注占位符页"
+        for ph in list(s.notes_slide.placeholders):
+            if ph.placeholder_format.type == PP_PLACEHOLDER.BODY:
+                ph._element.getparent().remove(ph._element)
+        buf = io.BytesIO()
+        prs.save(buf)
+        doc_id = self._ingest(buf.getvalue(), "无占位符.pptx")
+        self.assertEqual(repo.get_document(self.conn, doc_id)["status"], "ready")
+        blob = "\n".join(c["text"] for c in repo.chunks_for_document(self.conn, doc_id))
+        self.assertIn("无备注占位符页", blob)                      # 正文正常入库
+        self.assertNotIn("备注:", blob)                            # 缺占位符不捏造备注
+
+    def test_soft_break_does_not_leak_control_char(self):
+        # 回归:强制换行(a:br)在 python-pptx 里是 \x0b,不能带进章节名与正文
+        from pptx import Presentation
+        prs = Presentation()
+        s = prs.slides.add_slide(prs.slide_layouts[0])
+        s.shapes.title.text_frame.text = "主标题\x0b副标题"        # 写成真实 a:br
+        s.placeholders[1].text_frame.text = "第一行\x0b第二行"
+        buf = io.BytesIO()
+        prs.save(buf)
+        doc_id = self._ingest(buf.getvalue(), "换行标题.pptx")
+        chunks = repo.chunks_for_document(self.conn, doc_id)
+        self.assertIn("幻灯片 1:主标题 副标题", {c["section"] for c in chunks})
+        blob = "\n".join(c["text"] for c in chunks)
+        self.assertIn("第一行 第二行", blob)
+        self.assertNotIn("\x0b", blob + "".join(c["section"] for c in chunks))
 
 
 if __name__ == "__main__":

@@ -122,11 +122,17 @@ def _caption_position_ok(img, cap) -> bool:
     return cap.top - bottom <= _CAPTION_MAX_GAP_EMU
 
 
+def _clean_text(text: str) -> str:
+    """python-pptx 把强制换行(a:br)读成 \x0b(垂直制表符):不换掉会随章节名、正文、
+    图注进库并显示到前端。统一换成空格;首尾 \x0b 已由调用方的 strip 处理。"""
+    return text.replace("\x0b", " ")
+
+
 def _table_text(table) -> str:
     """表格按行展平为文本行;被合并的格子(is_spanned,独立 tc 但无文字)跳过。"""
     lines: list[str] = []
     for row in table.rows:
-        texts = [cell.text.strip() for cell in row.cells if not cell.is_spanned]
+        texts = [_clean_text(cell.text.strip()) for cell in row.cells if not cell.is_spanned]
         row_text = " | ".join(t for t in texts if t)
         if row_text.strip(" |"):
             lines.append(row_text)
@@ -164,7 +170,7 @@ class PptxParser:
         for number, slide in enumerate(prs.slides, 1):
             page = ParsedPage(page_number=number, width=PAGE_W, height=PAGE_H, is_scanned=False)
             title_shape = slide.shapes.title
-            title = (title_shape.text or "").strip() if title_shape is not None else ""
+            title = _clean_text(title_shape.text).strip() if title_shape is not None else ""
             section = f"幻灯片 {number}:{title}" if title else f"幻灯片 {number}"
 
             items = self._walk_shapes(slide.shapes, observer, number)
@@ -202,7 +208,9 @@ class PptxParser:
                     ))
 
             if slide.has_notes_slide:
-                notes = slide.notes_slide.notes_text_frame.text.strip()
+                # 备注页缺正文占位符时 notes_text_frame 为 None(生成器裁剪过的备注页)
+                tf = slide.notes_slide.notes_text_frame
+                notes = _clean_text(tf.text.strip()) if tf is not None else ""
                 if notes:
                     add_paragraph(page, section, f"备注:{notes}")
             pages.append(page)
@@ -234,7 +242,7 @@ class PptxParser:
                 if body:
                     out.append(_Item("table", shape, text=body))
             elif getattr(shape, "has_text_frame", False) and shape.has_text_frame:
-                text = shape.text_frame.text.strip()
+                text = _clean_text(shape.text_frame.text.strip())
                 if text:
                     out.append(_Item("text", shape, text=text))
                 # 空文本的形状(装饰用矩形等)极常见,不告警
