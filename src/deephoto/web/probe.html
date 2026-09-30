@@ -1,0 +1,49 @@
+<!doctype html>
+<!-- M0 技术基座验证页(临时):验证 import map + Preact 11 + htm + markdown-it 15 在真实浏览器中的行为。M1 前端落地后连同 probe.js 与 app.py 中对应路由一起删除。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>deephoto M0 验证</title>
+<style>
+  body { max-width: 760px; margin: 24px auto; padding: 0 16px; font: 14px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; color: #23211c; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; }
+  .note { color: #6f6a5e; }
+  .md { border: 1px solid #e3ded2; border-radius: 10px; padding: 4px 16px; background: #fff; }
+  .md table { border-collapse: collapse; }
+  .md th, .md td { border: 1px solid #e3ded2; padding: 4px 10px; }
+  .md pre { background: #efede6; padding: 10px; border-radius: 8px; overflow-x: auto; }
+  .md code { background: #efede6; padding: 1px 4px; border-radius: 4px; }
+  .md pre code { background: none; padding: 0; }
+  .ok { color: #1a7f37; } .bad { color: #b3261e; font-weight: 600; }
+  #loadfail { display: none; border: 1px solid #b3261e; color: #b3261e; padding: 10px 14px; border-radius: 8px; }
+  button { font: inherit; padding: 6px 14px; border-radius: 8px; border: 1px solid #e3ded2; background: #fff; cursor: pointer; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "preact":        "/vendor/preact/preact.mjs",
+    "preact/hooks":  "/vendor/preact/hooks.mjs",
+    "htm":           "/vendor/htm/htm.module.js",
+    "markdown-it":   "/vendor/markdown-it/markdown-it.esm.min.mjs"
+} }
+</script>
+</head>
+<body>
+<h1>deephoto M0 技术基座验证</h1>
+<p class="note">临时验证页(见 md文档/deephoto_frontend_redesign_dev.md §7 M0),稳定后随 M1 删除。
+预期:① 计数按钮点击递增;② 渲染区出现层级嵌套列表、带边框表格、标注 language-python 的代码块、删除线、引用块、水平线;
+危险链接与原始 HTML 以纯文本显示;③ 自检全部 PASS;④ 控制台无任何报错。</p>
+<div id="loadfail">模块加载失败(import map 不受支持或 vendor 路径错误)——请打开控制台查看,并考虑改用 markdown-it UMD 备选方案(§5.1)。</div>
+<div id="app">正在加载模块…</div>
+<noscript>需要启用 JavaScript。</noscript>
+<script>
+// 兜底:模块脚本若未执行(import map 不被支持 / 解析失败),3 秒后给出可见提示而不是白屏
+setTimeout(function () {
+  if (!window.__PROBE_OK && !document.querySelector("#app[data-rendered]")) {
+    document.getElementById("loadfail").style.display = "block";
+  }
+}, 3000);
+</script>
+<script type="module" src="/probe.js"></script>
+</body>
+</html>

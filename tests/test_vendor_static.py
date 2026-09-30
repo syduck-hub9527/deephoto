@@ -48,6 +48,30 @@ class VendorStaticTest(unittest.TestCase):
                      "/vendor/katex/..%2f..%2fsegments.js"):
             self.assertNotEqual(self.client.get(path).status_code, 200, path)
 
+    def test_m0_vendor_libs_served(self):
+        # M0 技术基座:preact/htm/markdown-it 以 ES Module 直接提供(import map 依赖正确的 JS MIME)
+        for path, hint in (
+            ("/vendor/preact/preact.mjs", "createElement"),
+            ("/vendor/preact/hooks.mjs", "useState"),
+            ("/vendor/htm/htm.module.js", "export default"),
+            ("/vendor/markdown-it/markdown-it.esm.min.mjs", "markdown-it"),
+            ("/vendor/markdown-it/markdown-it.umd.min.js", "markdownit"),
+        ):
+            resp = self.client.get(path)
+            self.assertEqual(resp.status_code, 200, path)
+            self.assertIn(hint, resp.text, path)
+            self.assertIn("javascript", resp.headers["content-type"], path)
+
+    def test_m0_probe_page_served(self):
+        # M0 验证页(临时,M1 落地后连同路由一起删除)
+        html = self.client.get("/probe.html")
+        self.assertEqual(html.status_code, 200)
+        self.assertIn('"preact"', html.text)          # import map
+        self.assertIn("/probe.js", html.text)
+        js = self.client.get("/probe.js")
+        self.assertEqual(js.status_code, 200)
+        self.assertIn("text/javascript", js.headers["content-type"])
+
 
 if __name__ == "__main__":
     unittest.main()

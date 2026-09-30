@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# 部分平台(Windows 注册表、旧版 Python 的 mimetypes 表)不认识 .mjs,
+# StaticFiles 会猜错 Content-Type,浏览器按模块脚本 MIME 校验直接拒载
+mimetypes.add_type("text/javascript", ".mjs")
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -95,6 +100,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/segments.js", include_in_schema=False)
     def segments_js():
         return FileResponse(_WEB_DIR / "segments.js", media_type="text/javascript")
+
+    # M0 技术基座验证页(临时,M1 前端落地后连同 probe.html/probe.js 一起删除)
+    @app.get("/probe.html", include_in_schema=False)
+    def probe_html():
+        return FileResponse(_WEB_DIR / "probe.html")
+
+    @app.get("/probe.js", include_in_schema=False)
+    def probe_js():
+        return FileResponse(_WEB_DIR / "probe.js", media_type="text/javascript")
 
     # 前端第三方库(KaTeX 公式排版,随项目内置,离线可用)
     app.mount("/vendor", StaticFiles(directory=_WEB_DIR / "vendor"), name="vendor")
