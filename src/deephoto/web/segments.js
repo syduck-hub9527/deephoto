@@ -365,6 +365,9 @@
     return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
   }
 
+  // 与 ingest._describe_concurrent 的聚合文案对应("N 张并发处理中")
+  const CONCURRENT_LABEL_RE = /^\d+ 张并发处理中$/;
+
   // 列表一行的进度描述;无观测记录返回 null(调用方回退到原状态文案)
   function progressLine(doc) {
     const p = doc.progress;
@@ -373,11 +376,22 @@
     if (p.state === "running") {
       let text = PROG_STAGE_NAMES[p.stage] || "处理中";
       if (p.total) text += ` · 已处理 ${p.completed || 0}/${p.total}`;
-      if (p.current_item && p.current_item.label) {
-        text += ` · 当前:${p.current_item.label}`;
-        if (p.current_item.elapsed_ms != null) text += `,已等待 ${formatElapsed(p.current_item.elapsed_ms)}`;
-      } else if (p.stage_elapsed_ms != null) {
-        text += ` · 已等待 ${formatElapsed(p.stage_elapsed_ms)}`;
+      // current_item 只有一格,且随"当前项"切换(下一张图/下一批/下一部分/并发窗口里最久在途的一张换人)
+      // 而重新计时:它是"这一项等了多久",不是累计。所以累计耗时必须另外显示,
+      // 不能在有当前项时把阶段/总耗时藏起来
+      const cur = p.current_item;
+      if (cur && cur.label) {
+        const concurrent = CONCURRENT_LABEL_RE.test(cur.label);
+        text += concurrent ? ` · ${cur.label}` : ` · 当前:${cur.label}`;
+        if (cur.elapsed_ms != null) {
+          text += `(${concurrent ? "最久一张" : "本项"}已等待 ${formatElapsed(cur.elapsed_ms)})`;
+        }
+      }
+      if (p.stage_elapsed_ms != null) text += ` · 本阶段已耗时 ${formatElapsed(p.stage_elapsed_ms)}`;
+      // 总耗时(自开始处理起)与阶段耗时相差不足 1 秒时不重复显示(如第一个阶段)
+      if (p.processing_elapsed_ms != null &&
+          Math.abs(p.processing_elapsed_ms - (p.stage_elapsed_ms ?? 0)) >= 1000) {
+        text += ` · 总耗时 ${formatElapsed(p.processing_elapsed_ms)}`;
       }
       return text;
     }

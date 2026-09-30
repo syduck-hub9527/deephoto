@@ -339,7 +339,36 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
   const running = { status: "describing", progress: { state: "running", stage: "describing",
     completed: 3, total: 7, stage_elapsed_ms: 120000, total_elapsed_ms: 241200,
     current_item: { index: 4, label: "图 1.4", elapsed_ms: 42000 } } };
-  check("进度行:阶段+计数+当前项", SEG.progressLine(running) === "生成图片描述 · 已处理 3/7 · 当前:图 1.4,已等待 42 秒");
+  check("进度行:阶段+计数+当前项+累计耗时", SEG.progressLine(running) ===
+    "生成图片描述 · 已处理 3/7 · 当前:图 1.4(本项已等待 42 秒) · 本阶段已耗时 2 分");
+  {
+    const at = (elapsed) => ({ progress: { state: "running", stage: "describing", total: 7, completed: 3,
+      stage_elapsed_ms: 100000 + elapsed, processing_elapsed_ms: 400000 + elapsed,
+      current_item: { label: "图 1.4", elapsed_ms: 3000 } } });
+    const a = SEG.progressLine(at(0)), b = SEG.progressLine(at(60000));
+    check("进度行:当前项等待重置时,阶段/总耗时仍单调累加", a !== b
+      && a.includes("本阶段已耗时 1 分 40 秒") && a.includes("总耗时 6 分 40 秒")
+      && b.includes("本阶段已耗时 2 分 40 秒") && b.includes("总耗时 7 分 40 秒"));
+    const conc = { progress: { state: "running", stage: "describing", total: 715, completed: 564,
+      stage_elapsed_ms: 723000, processing_elapsed_ms: 900000,
+      current_item: { label: "8 张并发处理中", elapsed_ms: 6000 } } };
+    check("进度行:并发窗口口径", SEG.progressLine(conc) ===
+      "生成图片描述 · 已处理 564/715 · 8 张并发处理中(最久一张已等待 6 秒) · 本阶段已耗时 12 分 3 秒 · 总耗时 15 分");
+    const embed = { progress: { state: "running", stage: "embed_batches", total: 9, completed: 2,
+      stage_elapsed_ms: 30000, processing_elapsed_ms: 800000,
+      current_item: { label: "第 3/9 批", elapsed_ms: 2000 } } };
+    check("进度行:向量批次也显示累计", SEG.progressLine(embed).includes("本阶段已耗时 30 秒")
+      && SEG.progressLine(embed).includes("总耗时 13 分 20 秒"));
+    const mineru = { progress: { state: "running", stage: "parsing", total: 4, completed: 1,
+      stage_elapsed_ms: 200000, processing_elapsed_ms: 200500,
+      current_item: { label: "第 2 部分 · 云端解析中", elapsed_ms: 20000 } } };
+    check("进度行:MinerU 第 2 部分不再让累计归零", SEG.progressLine(mineru) ===
+      "解析文档 · 已处理 1/4 · 当前:第 2 部分 · 云端解析中(本项已等待 20 秒) · 本阶段已耗时 3 分 20 秒");
+    const noItem = { progress: { state: "running", stage: "chunks_and_links",
+      stage_elapsed_ms: 5000, processing_elapsed_ms: 60000 } };
+    check("进度行:无当前项时仍显示阶段与总耗时", SEG.progressLine(noItem) ===
+      "整理正文与图文关系 · 本阶段已耗时 5 秒 · 总耗时 1 分");
+  }
   check("进度行:排队", SEG.progressLine({ progress: { state: "queued", total_elapsed_ms: 30000 } }) === "排队中 · 已等待 30 秒");
   check("进度行:无观测记录为 null", SEG.progressLine({ progress: null }) === null);
   check("进度行:中断", SEG.progressLine({ progress: { state: "interrupted" } }) === "服务曾重启,未确认自动恢复");
