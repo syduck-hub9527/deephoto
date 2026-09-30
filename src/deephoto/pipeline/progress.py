@@ -37,6 +37,7 @@ STAGE_NAMES = {
     "mineru_split": "读取与拆分",
     "mineru_merge": "合并解析结果",
     "index_prepare": "整理检索内容",
+    "embed_batches": "生成语义向量",   # indexing 的子阶段;缺了会把内部标识原样显示给用户
 }
 
 # ---- 结果口径 ----

@@ -129,7 +129,9 @@ class IngestService:
         repo.update_document_status(conn, document_id, "parsing")
         source_bytes = self.store.get(doc["source_object_key"])
         parsed = self._parse(doc, source_bytes, observer)
-        observer.stage_end(pg.STAGE_PARSING, counts={"pages": parsed.page_count})
+        # unit:非 PDF 的"页"可能是幻灯片/虚拟分段,前端按 locator_kind 显示单位,不再一律写"页"
+        observer.stage_end(pg.STAGE_PARSING,
+                           counts={"pages": parsed.page_count, "unit": parsed.locator_kind})
 
         observer.stage_start(pg.STAGE_FIGURES)
         occurrences = self._persist_figures(

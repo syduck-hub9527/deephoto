@@ -267,6 +267,13 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
 }
 
 
+// ---- U:解析阶段计数单位(docx/md 的"页"是虚拟分段)----
+{
+  check("U1: locatorUnit 按位置类型给单位", SEG.locatorUnit("section") === "段" && SEG.locatorUnit("slide") === "张幻灯片"
+    && SEG.locatorUnit("sheet") === "个工作表" && SEG.locatorUnit("page") === "页");
+  check("U2: 缺省/未知类型回退为 页(旧记录无 unit)", SEG.locatorUnit(undefined) === "页" && SEG.locatorUnit("x") === "页");
+}
+
 // ---- 入库进度:格式化与轮询器(md文档/deephoto_ingestion_progress_plan.md §11/§14.12)----
 {
   check("formatElapsed 秒/分/小时", SEG.formatElapsed(42000) === "42 秒"

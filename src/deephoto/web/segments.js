@@ -283,6 +283,11 @@
     embed_batches: "生成语义向量",
   };
 
+  // 解析阶段计数的单位:docx/md 的"页"是虚拟分段,不是 Word 的真实页码
+  function locatorUnit(kind) {
+    return { slide: "张幻灯片", sheet: "个工作表", section: "段" }[kind] || "页";
+  }
+
   // 已等待时长显示(不猜测"还需多久");未知为 —
   function formatElapsed(ms) {
     if (ms === null || ms === undefined || isNaN(ms)) return "—";
@@ -429,6 +434,6 @@
   return { esc, figLabel, pageLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
            imageCardHTML, figureDomId, newMessageId, createAssistantMessage,
            applyStreamEvent, finishStream, restoreMessages,
-           PROG_STAGE_NAMES, PROG_STAGE_STATE, formatElapsed, progressLine, createDocPoller,
+           PROG_STAGE_NAMES, PROG_STAGE_STATE, locatorUnit, formatElapsed, progressLine, createDocPoller,
            renderChunks, renderImageItems, renderBatchItems, createProgDetailLoader };
 });

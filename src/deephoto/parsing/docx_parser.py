@@ -122,6 +122,11 @@ class DocxParser:
                     blocks.append(LocalBlock("image", image_bytes=image_bytes))
         flush_pending()                      # 结尾未被取走的暂存图注落回普通文本
 
+        unreadable = _count_unextractable_drawings(document.element.body)
+        if unreadable:
+            observer.warn(f"文档含 {unreadable} 处自绘形状/图表/SmartArt,无法提取为图片"
+                          "(形状里的文字若不在文本框内也读不到)")
+
         # 回退:正文几乎为空但含绘图对象 -> 内容可能在文本框/形状里,本地读不到
         text_chars = sum(len(b.text) for b in blocks if b.kind in ("text", "heading"))
         has_drawing = bool(
@@ -141,12 +146,21 @@ class DocxParser:
         return build_local_document(blocks)
 
     def _images_in(self, para, document, observer, qn) -> list[bytes]:
-        """段内 a:blip 的 r:embed → part.blob(inline 与 anchor 浮动图都覆盖)。"""
+        """段内图片字节,按出现顺序:DrawingML 的 a:blip(inline/anchor)与 VML 的 v:imagedata。
+
+        VML(w:pict/w:object)是旧版 Word、WPS、Word 2003 转换文档的常见写法,只认 a:blip 会
+        静默丢图且无告警。mc:AlternateContent 里 Choice 与 Fallback 常是同一张图的两种写法,
+        Fallback 一律跳过,否则同一张图会入库两次。
+        """
         blip = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
-        embed = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+        imagedata = "{urn:schemas-microsoft-com:vml}imagedata"
+        r_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+        fallback = "{%s}Fallback" % _MC_NS
         out: list[bytes] = []
-        for node in para._p.iter(blip):
-            rid = node.get(embed)
+        for node in para._p.iter(blip, imagedata):
+            if any(anc.tag == fallback for anc in node.iterancestors()):
+                continue
+            rid = node.get(r_ns + "embed") if node.tag == blip else node.get(r_ns + "id")
             if not rid or rid not in document.part.related_parts:
                 continue
             part = document.part.related_parts[rid]
@@ -204,6 +218,33 @@ class DocxParser:
         joined = "\n".join(cell_lines).strip()
         if joined:
             lines.append(joined)
+
+
+def _count_unextractable_drawings(body) -> int:
+    """无法作为图片提取的绘图对象数:自绘形状(不含承载文字的文本框)、图表、SmartArt。
+
+    只数 mc:AlternateContent 的 Choice 一侧;嵌套在形状组内的形状不重复计数。
+    """
+    fallback = "{%s}Fallback" % _MC_NS
+    wps = "{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}"
+    wpg = "{http://schemas.microsoft.com/office/word/2010/wordprocessingGroup}"
+    txbx = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}txbxContent"
+    chart = "{http://schemas.openxmlformats.org/drawingml/2006/chart}chart"
+    dgm = "{http://schemas.openxmlformats.org/drawingml/2006/diagram}relIds"
+    count = 0
+    for node in body.iter(wps + "wsp", wpg + "wgp", chart, dgm):
+        ancestors = list(node.iterancestors())
+        if any(a.tag == fallback for a in ancestors):
+            continue
+        if node.tag == wps + "wsp":
+            if any(a.tag == wpg + "wgp" for a in ancestors):
+                continue                      # 组内形状随组计一次
+            if next(node.iter(txbx), None) is not None:
+                continue                      # 文本框:文字已按文本读取,不算丢内容
+        elif node.tag == wpg + "wgp" and any(a.tag == wpg + "wgp" for a in ancestors):
+            continue
+        count += 1
+    return count
 
 
 def _iter_block_items(parent_el, qn):

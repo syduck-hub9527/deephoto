@@ -446,6 +446,103 @@ class ZipSafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(UnsupportedFormat, "解压总量"):
             check_zip_safety(self._zip({"a.xml": os.urandom(700_000), "b.xml": os.urandom(700_000)}), 1)
 
+def _rewrite_document_xml(data: bytes, fn) -> bytes:
+    zin = zipfile.ZipFile(io.BytesIO(data))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as zo:
+        for name in zin.namelist():
+            raw = zin.read(name)
+            if name == "word/document.xml":
+                raw = fn(raw.decode("utf8")).encode("utf8")
+            zo.writestr(name, raw)
+    return out.getvalue()
+
+
+_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_WPS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+
+
+def _inline_image_docx() -> bytes:
+    def build(doc):
+        doc.add_paragraph("正文" * 30)
+        from docx.shared import Inches
+        doc.add_picture(io.BytesIO(_png()), width=Inches(1))
+    return _docx(build)
+
+
+def _figure_count(parsed) -> int:
+    return sum(len(p.figures) for p in parsed.pages)
+
+
+@unittest.skipUnless(HAVE_DEPS, "需要 pillow 与 python-docx")
+class DocxVmlAndShapeTest(unittest.TestCase):
+    def test_vml_image_extracted(self):
+        # 回归:w:pict + v:imagedata(旧版 Word/WPS 常见)曾被静默丢弃,且没有告警
+        import re
+
+        def to_vml(xml):
+            rid = re.search(r'r:embed="(rId\d+)"', xml).group(1)
+            return re.sub(r"<w:drawing>.*?</w:drawing>",
+                          '<w:pict xmlns:v="urn:schemas-microsoft-com:vml"><v:shape>'
+                          f'<v:imagedata r:id="{rid}"/></v:shape></w:pict>', xml, flags=re.S)
+        obs = _Recorder()
+        parsed = _parse(_rewrite_document_xml(_inline_image_docx(), to_vml), obs)
+        self.assertEqual(_figure_count(parsed), 1)
+        self.assertEqual(obs.warnings, [])
+
+    def test_ole_object_preview_image_extracted(self):
+        # 真实文档里 Visio/嵌入对象的预览图写在 w:object > v:shape > v:imagedata(PNG 预览可提取)
+        import re
+
+        def to_object(xml):
+            rid = re.search(r'r:embed="(rId\d+)"', xml).group(1)
+            return re.sub(r"<w:drawing>.*?</w:drawing>",
+                          '<w:object xmlns:v="urn:schemas-microsoft-com:vml"><v:shape>'
+                          f'<v:imagedata r:id="{rid}"/></v:shape></w:object>', xml, flags=re.S)
+        parsed = _parse(_rewrite_document_xml(_inline_image_docx(), to_object))
+        self.assertEqual(_figure_count(parsed), 1)
+
+    def test_alternate_content_choice_and_fallback_not_duplicated(self):
+        # Choice(DrawingML)与 Fallback(VML)是同一张图的两种写法,只能入库一次
+        import re
+
+        def wrap(xml):
+            rid = re.search(r'r:embed="(rId\d+)"', xml).group(1)
+            m = re.search(r"<w:drawing>.*?</w:drawing>", xml, flags=re.S)
+            alt = (f'<mc:AlternateContent xmlns:mc="{_MC}"><mc:Choice Requires="wps">{m.group(0)}'
+                   '</mc:Choice><mc:Fallback><w:pict xmlns:v="urn:schemas-microsoft-com:vml">'
+                   f'<v:shape><v:imagedata r:id="{rid}"/></v:shape></w:pict></mc:Fallback>'
+                   '</mc:AlternateContent>')
+            return xml.replace(m.group(0), alt, 1)
+        parsed = _parse(_rewrite_document_xml(_inline_image_docx(), wrap))
+        self.assertEqual(_figure_count(parsed), 1)
+
+    def _with_shape(self, inner: str) -> bytes:
+        def add(xml):
+            shape = (f'<w:r><mc:AlternateContent xmlns:mc="{_MC}"><mc:Choice Requires="wps"><w:drawing>'
+                     '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+                     '<wp:extent cx="1000" cy="1000"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                     f'<a:graphicData uri="{_WPS}"><wps:wsp xmlns:wps="{_WPS}">{inner}</wps:wsp>'
+                     '</a:graphicData></a:graphic></wp:inline></w:drawing></mc:Choice></mc:AlternateContent></w:r>')
+            return xml.replace("</w:p><w:sectPr", shape + "</w:p><w:sectPr", 1)
+
+        def build(doc):
+            doc.add_paragraph("系统架构如图所示。" * 10)
+        return _rewrite_document_xml(_docx(build), add)
+
+    def test_shape_only_drawing_warns_instead_of_silent(self):
+        obs = _Recorder()
+        _parse(self._with_shape(""), obs)
+        self.assertTrue(any("自绘形状" in w for w in obs.warnings), obs.warnings)
+
+    def test_text_box_shape_does_not_warn(self):
+        # 文本框的文字已按文本读取,不能报"丢内容"
+        inner = ('<wps:txbx><w:txbxContent xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                 '<w:p><w:r><w:t>框内文字</w:t></w:r></w:p></w:txbxContent></wps:txbx>')
+        obs = _Recorder()
+        _parse(self._with_shape(inner), obs)
+        self.assertFalse(any("自绘形状" in w for w in obs.warnings), obs.warnings)
+
 
 if __name__ == "__main__":
     unittest.main()

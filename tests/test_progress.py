@@ -324,6 +324,15 @@ class FullRunTest(ProgressTestBase):
         summary = new.summaries(LOCAL_CTX.tenant_id, [{"id": doc2, "status": "ready"}])[doc2]
         self.assertEqual(summary["state"], "succeeded")               # 业务终态优先
 
+    def test_every_stage_name_known_to_frontend_has_server_display_name(self):
+        # 回归:embed_batches 只在前端表里,服务端 display_name 回退成内部标识 "embed_batches" 直接展示给用户
+        import re
+        js = (Path(__file__).resolve().parent.parent / "src/deephoto/web/segments.js").read_text(encoding="utf-8")
+        block = js[js.index("const PROG_STAGE_NAMES"): js.index("};", js.index("const PROG_STAGE_NAMES"))]
+        frontend = set(re.findall(r"(\w+):\s*\"", block))
+        self.assertTrue(frontend)
+        self.assertEqual(sorted(frontend - set(pg.STAGE_NAMES)), [])
+
     def test_observer_failure_isolated(self):
         bad = Path(self.tmp.name) / "afile"
         bad.write_text("x")

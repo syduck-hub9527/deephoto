@@ -355,7 +355,7 @@ function stageCount(s) {
   const c = s.counts;
   if (!c) return "";
   if (c.total) return `(${c.completed || 0}/${c.total})`;
-  if (c.pages != null) return `(${c.pages} 页)`;
+  if (c.pages != null) return `(${c.pages} ${SEG.locatorUnit(c.unit)})`;
   if (c.chunks != null) return `(${c.chunks} 块)`;
   if (c.figures != null) return `(${c.figures} 张)`;
   return "";
