@@ -181,7 +181,10 @@ class ProgressStore:
     def mark_interrupted(self) -> None:
         """启动时调用:旧实例未结束的运行标记中断(含在途单项),不伪造结束时间
         (业务终态优先于本值;未知耗时保持空,展示为未知)。"""
+        interrupted = 0   # _write 只返回成功与否,真实数量经闭包带出
+
         def op(conn):
+            nonlocal interrupted
             rows = conn.execute(
                 "SELECT run_id FROM runs WHERE result = 'running' AND instance_id != ?"
                 " AND claimed_at IS NOT NULL", (self.instance_id,)).fetchall()
@@ -196,10 +199,9 @@ class ProgressStore:
                 conn.execute(
                     "UPDATE items SET result = ? WHERE run_id = ? AND result = 'running'",
                     (pg.RESULT_INTERRUPTED, row["run_id"]))
-            return len(rows)
-        count = self._write("标记旧实例中断", op)
-        if count:
-            logger.info("progress: %s 个旧实例未完成任务标记为观测中断", count)
+            interrupted = len(rows)
+        if self._write("标记旧实例中断", op) and interrupted:
+            logger.info("progress: %s 个旧实例未完成任务标记为观测中断", interrupted)
 
     # ---- 观察器 ----
 
