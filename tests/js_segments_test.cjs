@@ -241,6 +241,58 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
   check("R7: 重复锚点的引用徽标不含 emoji", rep.includes('class="chip fig"') && !/[\u{1F300}-\u{1FAFF}]/u.test(rep.split('class="chip fig"')[1].split("</a>")[0]));
 }
 
+// ---- T:表格渲染(GFM 管道表格;见 md文档/deephoto_table_render_fix.md)----
+{
+  const render = (content, extra) => SEG.renderAnswerBody(Object.assign(done(content, []), extra || {})).html;
+  const SHOT = "在 MQTT 通信中,主题用于分类:\n\n| 分类 | Topic 主题 | 设计说明 |\n|------|-----------|---------|\n" +
+    "| 设备心跳上报 | alarm/device/ping | 用于判断设备是否离线 |\n| 温湿度数据上报 | alarm/device/temp | 供后端解析 |\n\n合理的主题划分。";
+  const h = render(SHOT);
+  check("T1 截图同款表格渲染为 <table>", h.includes("<table") && h.includes("</table>"));
+  check("T1 表头 3 列 / 数据 2 行", (h.match(/<th[ >]/g) || []).length === 3 && (h.match(/<tr>/g) || []).length === 3);
+  check("T1 不再出现裸管道符分隔行", !h.includes("|------|") && !h.includes("<br>|"));
+  check("T1 表格前后段落保留", h.indexOf("主题用于分类") < h.indexOf("<table") && h.indexOf("</table>") < h.indexOf("合理的主题划分"));
+
+  // 无外侧管道符、对齐、转义管道
+  const h2 = render("a | b | c\n:--- | :---: | ---:\n1 | 2 | x\\|y");
+  check("T2 无首尾管道符可识别", h2.includes("<table"));
+  check("T2 对齐 class", h2.includes('class="al-center"') && h2.includes('class="al-right"'));
+  check("T2 \\| 还原为字面竖线且不拆列", h2.includes("x|y") && (h2.match(/<td/g) || []).length === 3);
+
+  // 不是表格的情况
+  check("T3 分隔行缺失 → 不是表格", !render("| a | b |\n| c | d |").includes("<table"));
+  check("T3 列数不等 → 不是表格", !render("| a | b |\n|---|---|---|\n| 1 | 2 |").includes("<table"));
+  check("T3 水平线 --- 不误判", !render("标题行 | 含竖线\n---\n正文").includes("<table"));
+
+  // 数据行:补齐 / 截断 / 遇空行结束
+  const h4 = render("| a | b |\n|---|---|\n| 1 |\n| 1 | 2 | 3 |\n\n后文");
+  check("T4 缺列补空、超列截断", (h4.match(/<td/g) || []).length === 4 && !h4.includes(">3<"));
+  check("T4 空行后回到段落", h4.indexOf("</table>") < h4.indexOf("后文"));
+
+  // 表格可直接打断上一段(无空行)
+  const h5 = render("先说明\n| a | b |\n|---|---|\n| 1 | 2 |");
+  check("T5 表格打断段落", h5.indexOf("先说明") < h5.indexOf("<table") && h5.includes("<td>1</td>"));
+
+  // 单元格内的行内 Markdown / 转义 / 引用徽标
+  const cm = { role: "assistant", validated: true, images: [],
+    citations: [{ chunk_id: "c1", page: 11, page_end: 12 }],
+    content: "| k | v |\n|---|---|\n| **粗** | `code` <b>x</b> [chunk:c1] |" };
+  const h6 = SEG.renderAnswerBody(cm).html;
+  check("T6 单元格支持粗体", h6.includes("<td><strong>粗</strong></td>"));
+  check("T6 单元格 HTML 被转义", !h6.includes("<b>x</b>") && h6.includes("&lt;b&gt;x&lt;/b&gt;"));
+  check("T6 单元格内出处徽标", h6.includes('class="chip cite"') && h6.includes("p.11"));
+
+  // 与图片锚点共存;流式中不崩、半张表也能显示表头
+  const h7 = render("| a | b |\n|---|---|\n| 1 | 2 |\n\n[image:occ_a]\n\n结尾", { images: [E1] });
+  check("T7 表格与图片锚点共存", h7.includes("<table") && h7.includes("<figure") && h7.indexOf("</table>") < h7.indexOf("<figure"));
+  const h8 = SEG.renderAnswerBody({ role: "assistant", streaming: true, content: "| a | b |\n|---|---|\n| 1" }).html;
+  check("T8 流式半张表:表头+补空行", h8.includes("<th") && (h8.match(/<td/g) || []).length === 2);
+  const h9 = SEG.renderAnswerBody({ role: "assistant", streaming: true, content: "| a | b |\n|---|---|" }).html;
+  check("T8 流式仅表头+分隔行:只有表头", h9.includes("<th") && !h9.includes("<td"));
+
+  // 围栏代码里的表格原样展示
+  check("T9 围栏代码内不渲染表格", !render("```\n| a | b |\n|---|---|\n| 1 | 2 |\n```").includes("<table"));
+}
+
 // ---- M:多格式(位置文案 / 可空页预览 / 长章节胶囊)----
 {
   // 服务端给 label:章节路径直接显示(渲染层 esc,">" 转义为 &gt;);长路径带 title 供悬停看全文

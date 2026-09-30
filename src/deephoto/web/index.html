@@ -104,6 +104,11 @@
   .msg .text .md-list li { margin: .15em 0; }
   .msg .text .md-code { background: var(--code-bg); border-radius: 6px; padding: 8px 10px; margin: 0 0 .7em;
                         font-size: 13px; white-space: pre-wrap; overflow-x: auto; }
+  .msg .text .md-table-wrap { overflow-x: auto; margin: 0 0 .9em; }     /* 宽表在容器内横向滚动,不撑破页面 */
+  .msg .text .md-table { border-collapse: collapse; font-size: 14px; line-height: 1.6; min-width: 100%; }
+  .msg .text .md-table th, .msg .text .md-table td { border: 1px solid var(--border); padding: 6px 12px; text-align: left; vertical-align: top; }
+  .msg .text .md-table th { background: var(--code-bg); font-weight: 650; white-space: nowrap; }
+  .msg .text .md-table .al-center { text-align: center; } .msg .text .md-table .al-right { text-align: right; }
   .msg .text > :last-child { margin-bottom: 0; }
   .msg .text code { background: var(--code-bg); border-radius: 4px; padding: 1px 5px; font-size: 13px; }
   .msg .text strong { font-weight: 650; }

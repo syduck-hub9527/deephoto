@@ -126,7 +126,7 @@
     return isCandidate ? text.slice(0, i) : text;
   }
 
-  // ---- 文字片段渲染(受限 Markdown:标题 / 列表 / 段落 / 粗体 / 代码)----
+  // ---- 文字片段渲染(受限 Markdown:标题 / 列表 / 表格 / 段落 / 粗体 / 代码)----
 
   const INLINE_CODE_RE = /(`[^`\n]*`)/g;
   const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*)$/;
@@ -144,6 +144,65 @@
       if (i % 2 === 1) return `<code>${esc(part.slice(1, -1))}</code>`;
       return renderPlain(part, citeMap, opts);
     }).join("");
+  }
+
+  // ---- 表格(GFM 管道表格:表头行 + 分隔行 + 若干数据行)----
+
+  // 按未转义的 | 切分一行;首尾的管道符不产生空列;\| 还原为字面 |
+  function splitTableRow(line) {
+    let s = String(line).trim();
+    if (s.startsWith("|")) s = s.slice(1);
+    const cells = [];
+    let cur = "";
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === "\\" && s[i + 1] === "|") { cur += "|"; i++; }
+      else if (ch === "|") { cells.push(cur.trim()); cur = ""; }
+      else cur += ch;
+    }
+    if (cur.trim() !== "" || cells.length === 0) cells.push(cur.trim());   // 末尾管道符之后无内容则不补空列
+    return cells;
+  }
+
+  // 分隔行:每列形如 --- / :--- / ---: / :---:;整行必须含管道符(否则是水平线,不是表格)
+  const TABLE_SEP_CELL_RE = /^:?-+:?$/;
+  function parseTableSeparator(line) {
+    if (!String(line).includes("|")) return null;
+    const cells = splitTableRow(line);
+    if (!cells.length || !cells.every(c => TABLE_SEP_CELL_RE.test(c))) return null;
+    return cells.map(c => c.startsWith(":") && c.endsWith(":") ? "center"
+      : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : "");
+  }
+
+  // 在 lines[i] 处尝试解析表格;成功返回 { html, next }(next 为表格之后第一行的下标),否则 null。
+  // 表头列数必须等于分隔行列数(GFM 规则);数据行在空行、含不到管道符的行、标题/围栏处结束,
+  // 列数不足补空、超出截断。流式中只到表头+分隔行时也会渲染出表头。
+  function tryParseTable(lines, i, citeMap, opts) {
+    const header = lines[i];
+    if (!header.includes("|") || i + 1 >= lines.length) return null;
+    const aligns = parseTableSeparator(lines[i + 1]);
+    if (!aligns) return null;
+    const heads = splitTableRow(header);
+    if (heads.length !== aligns.length) return null;
+    const cell = (tag, text, k) => {
+      const al = aligns[k] ? ` class="al-${aligns[k]}"` : "";
+      return `<${tag}${al}>${renderInline(text, citeMap, opts)}</${tag}>`;
+    };
+    const rows = [];
+    let j = i + 2;
+    for (; j < lines.length; j++) {
+      const ln = lines[j];
+      if (!ln.trim() || !ln.includes("|")) break;
+      if (HEADING_RE.test(ln) || ln.trimStart().startsWith("```")) break;
+      const cells = splitTableRow(ln);
+      while (cells.length < heads.length) cells.push("");
+      rows.push(cells.slice(0, heads.length));
+    }
+    const html = `<div class="md-table-wrap"><table class="md-table"><thead><tr>` +
+      heads.map((h, k) => cell("th", h, k)).join("") + `</tr></thead>` +
+      (rows.length ? `<tbody>${rows.map(r => `<tr>${r.map((c, k) => cell("td", c, k)).join("")}</tr>`).join("")}</tbody>` : "") +
+      `</table></div>`;
+    return { html, next: j };
   }
 
   function renderTextFragment(text, citeMap, opts) {
@@ -176,6 +235,13 @@
       if (h) {
         flushPara(); flushList();
         out.push(`<div class="md-h md-h${Math.min(h[1].length, 3)}">${renderInline(h[2], citeMap, opts)}</div>`);
+        continue;
+      }
+      const tbl = tryParseTable(lines, i, citeMap, opts);
+      if (tbl) {                                          // 表格可直接打断上一段(无需空行)
+        flushPara(); flushList();
+        out.push(tbl.html);
+        i = tbl.next - 1;
         continue;
       }
       const li = LIST_RE.exec(line);
