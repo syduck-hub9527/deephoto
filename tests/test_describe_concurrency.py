@@ -292,6 +292,37 @@ class ConcurrentDescribeTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(pools, [])
 
+    # §3.6:并发不改变失败语义——提交前的上下文计算出错只算单图失败
+    def test_context_computation_error_fails_only_that_image(self):
+        import deephoto.pipeline.ingest as ingest_mod
+        original = ingest_mod._context_for_occurrence
+
+        def boom(occ, chunks, parsed):
+            if "独有说明3" in (occ.get("caption") or ""):
+                raise RuntimeError("context boom")
+            return original(occ, chunks, parsed)
+
+        calls = []
+
+        def fake(model, data, mime, caption=None, **kw):
+            calls.append(caption)
+            return _good(caption)
+
+        ingest_mod._context_for_occurrence = boom
+        try:
+            self._ingest(fake)
+        finally:
+            ingest_mod._context_for_occurrence = original
+        self.assertEqual(repo.get_document(self.conn, self.doc_id)["status"], "ready")
+        self.assertEqual(len(calls), IMAGE_COUNT - 1)                  # 出错图未提交模型
+        self.assertNotIn("图 1.3 独有说明3", calls)
+        by_label = {i["label"]: i["result"] for i in self._items() if i["kind"] == "image"}
+        self.assertEqual(by_label["图 1.3"], pg.ITEM_ERROR)
+        for label, result in by_label.items():
+            if label != "图 1.3":
+                self.assertEqual(result, pg.ITEM_OK, label)
+        self.assertEqual(self._stage(pg.STAGE_DESCRIBING)["result"], pg.RESULT_PARTIAL)
+
     # §9-10:疑似限流识别与告警(不硬依赖 openai)
     def test_rate_limit_suspects_warn(self):
         class RateLimitError(Exception):

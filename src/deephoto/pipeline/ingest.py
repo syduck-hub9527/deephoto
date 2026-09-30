@@ -340,7 +340,7 @@ class IngestService:
         """滑动窗口:任一时刻至多 N 个在途调用。
 
         item_start 在提交时(而非排队时)调用,duration_ms 是单次调用真实耗时,
-        不含排队;读图在提交前做,读图失败按单图失败处理,不占窗口。
+        不含排队;读图与上下文计算在提交前做,失败按单图失败处理,不占窗口(§3.6)。
         """
         limit = self.settings.description_concurrency
         pending = deque(enumerate(occurrences, start=1))
@@ -365,15 +365,17 @@ class IngestService:
             observer.item_start("image", seq, label=label,
                                 page=occ["page_number"], figure=occ["figure_number"])
             try:
+                # 与串行路径同一 try 口径(§3.6):读图与上下文计算的失败都只算单图失败
                 image_bytes = self.store.get(asset["original_object_key"])
+                section = _section_for_page(parsed, occ["page_number"])
+                context_text = _context_for_occurrence(occ, chunks, parsed)
             except Exception as exc:
                 self._fail_description(conn, occ, seq, label, exc, desc_model_tag,
                                        observer, stats)
                 return
             future = executor.submit(
                 _call_model, model, image_bytes, asset["mime_type"],
-                occ["caption"], _section_for_page(parsed, occ["page_number"]),
-                _context_for_occurrence(occ, chunks, parsed))
+                occ["caption"], section, context_text)
             inflight[future] = (seq, occ, label)
             refresh_current_label()
 
@@ -391,8 +393,13 @@ class IngestService:
                         self._fail_description(conn, occ, seq, label, exc, desc_model_tag,
                                                observer, stats)
                     else:
-                        self._settle_description(conn, occ, seq, label, future.result(),
-                                                 desc_model_tag, observer, stats)
+                        try:
+                            # 与串行路径同一 try 口径(§3.6):settle 出错也只算单图失败
+                            self._settle_description(conn, occ, seq, label, future.result(),
+                                                     desc_model_tag, observer, stats)
+                        except Exception as settle_exc:
+                            self._fail_description(conn, occ, seq, label, settle_exc,
+                                                   desc_model_tag, observer, stats)
                 refresh_current_label()
         finally:
             # 主线程异常上抛时:取消未开始的任务;已开始的最多再跑一个超时周期
