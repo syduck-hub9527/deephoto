@@ -1,7 +1,10 @@
+import http.client
 import io
 import json
+import os
 import unittest
 import zipfile
+from urllib.error import HTTPError
 
 import _bootstrap  # noqa: F401
 
@@ -377,6 +380,108 @@ class ChunkPdfTest(unittest.TestCase):
         n = d.page_count
         d.close()
         return n
+
+
+class DownloadRetryTest(unittest.TestCase):
+    """_download:IncompleteRead 等中途断流应重试/续传,而不是直接让入库失败。"""
+
+    def _client(self, opener):
+        return MinerUClient(api_key="tok", opener=opener, sleep=lambda s: None)
+
+    class _Resp:
+        def __init__(self, body=b"", status=200, partial_then_fail=None):
+            self.body, self.status, self.fail = body, status, partial_then_fail
+
+        def read(self):
+            if self.fail is not None:
+                raise http.client.IncompleteRead(self.fail, 373301)
+            return self.body
+
+    def setUp(self):
+        self.zip = _make_zip({"full.md": "x" * 5000, "b.bin": os.urandom(4000)})
+
+    def test_resumes_with_range_after_incomplete_read(self):
+        cut = 3000
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request.headers.get("Range"))
+            if len(calls) == 1:
+                return self._Resp(partial_then_fail=self.zip[:cut])
+            return self._Resp(self.zip[cut:], status=206)
+
+        self.assertEqual(self._client(opener)._download("https://oss/z"), self.zip)
+        self.assertEqual(calls, [None, f"bytes={cut}-"])
+
+    def test_server_ignores_range_full_restart(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request.headers.get("Range"))
+            if len(calls) == 1:
+                return self._Resp(partial_then_fail=self.zip[:100])
+            return self._Resp(self.zip, status=200)     # 忽略 Range,返回整份
+
+        self.assertEqual(self._client(opener)._download("https://oss/z"), self.zip)
+
+    def test_retries_network_errors(self):
+        n = {"i": 0}
+
+        def opener(request, timeout):
+            n["i"] += 1
+            if n["i"] < 3:
+                raise ConnectionResetError("reset")
+            return self._Resp(self.zip)
+
+        self.assertEqual(self._client(opener)._download("https://oss/z"), self.zip)
+        self.assertEqual(n["i"], 3)
+
+    def test_4xx_not_retried(self):
+        n = {"i": 0}
+
+        def opener(request, timeout):
+            n["i"] += 1
+            raise HTTPError("https://oss/z", 403, "expired", {}, None)
+
+        with self.assertRaises(MinerUError):
+            self._client(opener)._download("https://oss/z")
+        self.assertEqual(n["i"], 1)
+
+    def test_gives_up_after_max_attempts(self):
+        n = {"i": 0}
+
+        def opener(request, timeout):
+            n["i"] += 1
+            return self._Resp(partial_then_fail=b"")
+
+        with self.assertRaises(MinerUError) as ctx:
+            self._client(opener)._download("https://oss/z")
+        self.assertEqual(n["i"], 4)
+        self.assertIn("已重试 4 次", str(ctx.exception))
+
+    def test_corrupt_resumed_zip_is_discarded(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request.headers.get("Range"))
+            if len(calls) == 1:
+                return self._Resp(partial_then_fail=self.zip[:3000])
+            if len(calls) == 2:
+                return self._Resp(b"garbage-tail", status=206)     # 拼出来不是合法 ZIP
+            return self._Resp(self.zip, status=200)
+
+        self.assertEqual(self._client(opener)._download("https://oss/z"), self.zip)
+        self.assertEqual(calls[2], None)                            # 丢弃后整份重取
+
+    def test_normal_path_single_request(self):
+        n = {"i": 0}
+
+        def opener(request, timeout):
+            n["i"] += 1
+            return self._Resp(b"not even a zip")                     # 一次成功不做 ZIP 校验
+
+        self.assertEqual(self._client(opener)._download("https://oss/z"), b"not even a zip")
+        self.assertEqual(n["i"], 1)
 
 
 if __name__ == "__main__":

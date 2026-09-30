@@ -40,6 +40,9 @@ DEFAULT_MAX_WAIT_SECONDS = 300.0
 DEFAULT_MAX_PAGES_PER_CHUNK = 200
 DEFAULT_MAX_BYTES = 200_000_000
 DEFAULT_MAX_CHUNKS = 200
+# 结果 ZIP 下载:最多尝试次数与退避基数(秒,指数增长,单次上限 30 秒)
+DOWNLOAD_MAX_ATTEMPTS = 4
+DOWNLOAD_BACKOFF_SECONDS = 2.0
 
 
 class MinerUError(RuntimeError):
@@ -258,12 +261,54 @@ class MinerUClient:
             self._sleep(self.poll_interval)
 
     def _download(self, url: str) -> bytes:
-        request = Request(url, method="GET")
-        try:
-            response = self._opener(request, timeout=120)
-            return response.read()
-        except (HTTPError, URLError, TimeoutError) as exc:
-            raise MinerUError(f"MineU 结果下载失败: {exc}") from exc
+        """下载结果 ZIP:失败自动重试并尽量断点续传(Range)。
+
+        大文件(几十 MB)经 CDN 下载时,连接可能中途被断开:http.client 抛
+        IncompleteRead(它不是 OSError/URLError,旧实现不会捕获,任务直接失败)。
+        此时云端解析早已完成,没必要整份重来,只需重新取回结果:
+        - 已收到的字节保留,重试带 Range: bytes=N-;服务器返回 206 则续传,返回 200(忽略 Range)则整份重取;
+        - 4xx(如预签名链接过期)不可重试,5xx/网络错误/超时重试,指数退避;
+        - 经过重试拼接出的结果先校验 ZIP 完整性,不完整则丢弃重来。"""
+        data = b""
+        retried = False
+        last_error: Exception | None = None
+        for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                retried = True
+                logger.warning("MinerU 结果下载重试 %d/%d(已收到 %d 字节): %s",
+                               attempt, DOWNLOAD_MAX_ATTEMPTS, len(data), last_error)
+                self._sleep(min(DOWNLOAD_BACKOFF_SECONDS * 2 ** (attempt - 2), 30.0))
+            resuming = len(data) > 0
+            headers = {"Range": f"bytes={len(data)}-"} if resuming else {}
+            status = None
+            try:
+                response = self._opener(Request(url, method="GET", headers=headers), timeout=120)
+                status = getattr(response, "status", None)
+                body = response.read()
+            except http.client.IncompleteRead as exc:
+                # 已读到的部分保留:续传响应(206)接在原数据后,整份响应(200)则替换
+                data = data + exc.partial if (resuming and status == 206) else exc.partial
+                last_error = exc
+                continue
+            except HTTPError as exc:
+                if exc.code == 416:                      # 续传范围无效:丢弃已收数据整份重取
+                    data, last_error = b"", exc
+                    continue
+                if exc.code < 500:                       # 4xx:链接过期/无权限,重试无意义
+                    raise MinerUError(f"MineU 结果下载失败: {exc}") from exc
+                last_error = exc
+                continue
+            except (URLError, OSError, http.client.HTTPException) as exc:   # 含超时、连接重置
+                last_error = exc
+                continue
+            data = data + body if (resuming and status == 206) else body
+            if not retried:
+                return data
+            if _zip_is_complete(data):
+                return data
+            data, last_error = b"", MinerUError("续传拼接后的 ZIP 不完整")
+        raise MinerUError(
+            f"MineU 结果下载失败(已重试 {DOWNLOAD_MAX_ATTEMPTS} 次): {last_error}") from last_error
 
     def _request_json(self, method: str, path: str, payload: dict | None) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
@@ -291,6 +336,15 @@ class MinerUClient:
         if data is None:
             raise MinerUError("MineU 响应缺少 data 字段")
         return data
+
+
+def _zip_is_complete(data: bytes) -> bool:
+    """ZIP 中央目录在文件末尾,截断的文件打不开;用来确认重试拼接结果完整。"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            return archive.testzip() is None
+    except zipfile.BadZipFile:
+        return False
 
 
 def _zip_to_page_texts(zip_bytes: bytes, expected_pages: int | None = None) -> list[str]:
