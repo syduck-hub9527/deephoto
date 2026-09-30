@@ -293,6 +293,73 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
   check("T9 围栏代码内不渲染表格", !render("```\n| a | b |\n|---|---|\n| 1 | 2 |\n```").includes("<table"));
 }
 
+// ---- L:数学公式(LaTeX;见 md文档/deephoto_math_render_fix.md)----
+{
+  const render = (content, extra) => SEG.renderAnswerBody(Object.assign(done(content, []), extra || {})).html;
+  const texOf = html => [...html.matchAll(/data-tex="([^"]*)"/g)].map(m => m[1]);
+
+  // 截图里的真实公式
+  const inl = render("平均速率 $\\bar{c}=\\sqrt{8kT/\\pi m}$;均方根 $v_{rms}=\\sqrt{3kT/m}$。");
+  check("L1 行内公式变占位节点", texOf(inl).length === 2 && inl.includes('data-display="0"'));
+  check("L1 tex 原样保留(反斜杠/下划线/花括号不被吃)", texOf(inl)[0] === "\\bar{c}=\\sqrt{8kT/\\pi m}"
+    && texOf(inl)[1] === "v_{rms}=\\sqrt{3kT/m}");
+  check("L1 占位节点内是原文(KaTeX 未加载时的回退)", inl.includes(">$\\bar{c}=\\sqrt{8kT/\\pi m}$</span>"));
+
+  const blk = render("速度分布:\n\n$$p(\\mathbf{v}) = 4\\pi\\left[\\frac{m}{2\\pi kT}\\right]^{3/2}v^2 e^{-mv^2/2kT}$$\n\n式中 m 是质量。");
+  check("L2 独立公式渲染为 math-block", blk.includes('class="math-block"') && blk.includes('data-display="1"'));
+  check("L2 独立公式前后文字保留", blk.indexOf("速度分布") < blk.indexOf("math-block") && blk.indexOf("math-block") < blk.indexOf("式中 m"));
+  check("L2 公式里的 [ ] 不被当成引用标记", texOf(blk)[0].includes("\\left[\\frac{m}{2\\pi kT}\\right]^{3/2}"));
+
+  const multi = render("$$\n\\lambda = \\frac{1}{\\sqrt{2}\\pi d^2 n}\n$$");
+  check("L3 多行 $$ 块", multi.includes("math-block") && texOf(multi)[0] === "\\lambda = \\frac{1}{\\sqrt{2}\\pi d^2 n}");
+
+  check("L4 \\( \\) 行内与 \\[ \\] 独立",
+    texOf(render("式 \\(a+b\\) 成立")).join() === "a+b"
+    && render("\\[x^2\\]").includes("math-block"));
+
+  // 不误判
+  check("L5 金额不当公式", texOf(render("价格 $5 和 $10 都可以")).length === 0);
+  check("L5 \\$ 是字面美元", texOf(render("花了 \\$5 和 \\$10")).length === 0 && render("花了 \\$5").includes("花了 $5"));
+  check("L5 空白紧贴的 $ 不识别", texOf(render("a $ b $ c")).length === 0);
+  check("L5 未闭合的 $$(流式中)不生成公式块", !render("$$\n\\frac{a}{b}").includes("math-block"));
+  check("L5 单个 $ 不吞后文", render("只有一个 $ 符号,后文照常").includes("后文照常"));
+
+  // 代码里不解释
+  check("L6 行内代码里的 $x$ 保持代码", texOf(render("写作 `$x$` 即可")).length === 0 && render("写作 `$x$` 即可").includes("<code>$x$</code>"));
+  check("L6 围栏代码里不解释", texOf(render("```\n$$x^2$$\n```")).length === 0);
+
+  // 与其他规则共存
+  const bold = render("**结论** $a**b**c$ 与 $x_1$");
+  check("L7 公式内的 ** 不被粗体规则破坏", texOf(bold).join("|") === "a**b**c|x_1" && bold.includes("<strong>结论</strong>"));
+  const evil = render("$<img src=x onerror=alert(1)>$");
+  check("L7 公式源码被转义,无法注入标签", !evil.includes("<img") && texOf(evil)[0].includes("&lt;img"));
+  const cm = SEG.renderAnswerBody({ role: "assistant", validated: true, images: [],
+    citations: [{ chunk_id: "c1", page: 11, page_end: 12 }], content: "速度 $v=\\sqrt{2}$ [chunk:c1]" }).html;
+  check("L7 公式后的出处徽标仍在", cm.includes('class="chip cite"') && texOf(cm).length === 1);
+  const tbl = render("| 量 | 式 |\n|---|---|\n| 平均 | $\\bar{c}$ |");
+  check("L7 表格单元格内公式", tbl.includes("<table") && texOf(tbl)[0] === "\\bar{c}");
+  check("L7 标题与列表里的公式", texOf(render("## 式 $E=mc^2$\n\n- 项 $a_1$")).join("|") === "E=mc^2|a_1");
+  const stream = SEG.renderAnswerBody({ role: "assistant", streaming: true, content: "速度 $v=\\sqrt{2}$ 和 $未闭合" }).html;
+  check("L8 流式:已闭合公式即生成,未闭合保持文字", texOf(stream).length === 1 && stream.includes("$未闭合"));
+
+  // 真实 KaTeX:截图里的公式必须能被引擎无错排版(throwOnError: true)
+  const katex = require("../src/deephoto/web/vendor/katex/katex.min.js");
+  const real = [
+    "p(\\mathbf{v}) = 4\\pi\\left[\\frac{m}{2\\pi kT}\\right]^{3/2}v^2 e^{-mv^2/2kT}",
+    "\\bar{c}=\\sqrt{8kT/\\pi m}", "\\bar{v}_x=\\bar{v}_y=\\bar{v}_z=\\sqrt{2kT/\\pi m}", "v_{rms}=\\sqrt{3kT/m}",
+    "\\lambda = \\frac{1}{\\sqrt{2}\\pi d^2 n}", "\\lambda = \\frac{kT}{\\sqrt{2}\\pi d^2 p}",
+    "\\lambda \\ll L", "J_n = \\frac{n\\bar{v}_x}{2} = \\sqrt{\\frac{p^2}{2\\pi kTm}}",
+    "6\\times10^{29}\\ \\mathrm{cm}^{-2}\\mathrm{s}^{-1}",
+  ];
+  let bad = [];
+  for (const tex of real) {
+    try { katex.renderToString(tex, { throwOnError: true, strict: "ignore", trust: false }); }
+    catch (e) { bad.push(tex + " → " + e.message); }
+  }
+  check("L9 截图中的公式全部可被 KaTeX 排版" + (bad.length ? ":" + bad.join(";") : ""), bad.length === 0);
+  check("L9 排版结果含 katex 节点", katex.renderToString("x^2", { displayMode: true }).includes("katex-display"));
+}
+
 // ---- M:多格式(位置文案 / 可空页预览 / 长章节胶囊)----
 {
   // 服务端给 label:章节路径直接显示(渲染层 esc,">" 转义为 &gt;);长路径带 title 供悬停看全文

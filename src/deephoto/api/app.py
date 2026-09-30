@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from ..agent.knowledge import KnowledgeService
 from ..agent.qa import QAService
@@ -94,5 +95,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/segments.js", include_in_schema=False)
     def segments_js():
         return FileResponse(_WEB_DIR / "segments.js", media_type="text/javascript")
+
+    # 前端第三方库(KaTeX 公式排版,随项目内置,离线可用)
+    app.mount("/vendor", StaticFiles(directory=_WEB_DIR / "vendor"), name="vendor")
 
     return app

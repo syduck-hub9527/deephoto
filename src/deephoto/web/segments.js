@@ -126,7 +126,7 @@
     return isCandidate ? text.slice(0, i) : text;
   }
 
-  // ---- 文字片段渲染(受限 Markdown:标题 / 列表 / 表格 / 段落 / 粗体 / 代码)----
+  // ---- 文字片段渲染(受限 Markdown:标题 / 列表 / 表格 / 公式 / 段落 / 粗体 / 代码)----
 
   const INLINE_CODE_RE = /(`[^`\n]*`)/g;
   const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*)$/;
@@ -144,6 +144,105 @@
       if (i % 2 === 1) return `<code>${esc(part.slice(1, -1))}</code>`;
       return renderPlain(part, citeMap, opts);
     }).join("");
+  }
+
+  // ---- 数学公式(LaTeX)----
+  // 纯函数只负责"识别 + 输出带 data-tex 的占位节点";真正的排版由页面加载的 KaTeX 完成
+  // (index.html 的 renderMath)。KaTeX 未加载时占位节点显示原文,与旧行为一致。
+  // 支持 $...$ / \(...\) 行内,$$...$$ / \[...\] 独立公式;识别规则(避免把金额 "$5 和 $10" 当公式):
+  //   - 开头 $ 后不能是空白,结尾 $ 前不能是空白、后不能紧跟数字;
+  //   - \$ 是字面美元符;行内公式不跨行;独立公式未闭合(流式中)不识别,按普通文字显示。
+
+  const MATH_OPEN = "\uE000", MATH_CLOSE = "\uE001";
+  const MATH_PLACEHOLDER_RE = /\uE000(\d+)\uE001/g;
+  const isSpace = ch => ch === undefined || /\s/.test(ch);
+
+  function mathNode(tex, display, source) {
+    return `<span class="math${display ? " math-display" : ""}" data-tex="${esc(tex)}" ` +
+      `data-display="${display ? 1 : 0}">${esc(source)}</span>`;
+  }
+
+  // 把一行文字里的公式换成占位符;返回 { text, maths }
+  function extractMath(text) {
+    const maths = [];
+    let out = "";
+    const put = (tex, display, source) => {
+      maths.push({ tex, display, source });
+      out += MATH_OPEN + (maths.length - 1) + MATH_CLOSE;
+    };
+    for (let i = 0; i < text.length;) {
+      const ch = text[i], nx = text[i + 1];
+      if (ch === "\\" && nx === "$") { out += "$"; i += 2; continue; }             // \$ 字面美元符
+      if (ch === "\\" && (nx === "(" || nx === "[")) {
+        const close = nx === "(" ? "\\)" : "\\]";
+        const end = text.indexOf(close, i + 2);
+        if (end > i + 2 && text.slice(i + 2, end).trim()) {
+          put(text.slice(i + 2, end), nx === "[", text.slice(i, end + 2));
+          i = end + 2; continue;
+        }
+      }
+      if (ch === "$" && nx === "$") {
+        const end = text.indexOf("$$", i + 2);
+        if (end > i + 2 && text.slice(i + 2, end).trim()) {
+          put(text.slice(i + 2, end), true, text.slice(i, end + 2));
+          i = end + 2; continue;
+        }
+      } else if (ch === "$" && !isSpace(nx)) {
+        let j = i + 1, found = -1;
+        while (j < text.length) {
+          if (text[j] === "\\") { j += 2; continue; }
+          if (text[j] === "$") { found = j; break; }
+          j++;
+        }
+        if (found > i + 1 && !isSpace(text[found - 1]) && !/\d/.test(text[found + 1] || "")) {
+          put(text.slice(i + 1, found), false, text.slice(i, found + 1));
+          i = found + 1; continue;
+        }
+      }
+      out += ch; i++;
+    }
+    return { text: out, maths };
+  }
+
+  function restoreMath(html, maths) {
+    return html.replace(MATH_PLACEHOLDER_RE, (_, k) => {
+      const m = maths[Number(k)];
+      return m ? mathNode(m.tex, m.display, m.source) : "";
+    });
+  }
+
+  // 独立公式块:从 lines[i] 起尝试匹配 $$...$$ 或 \[...\](可跨多行,闭合行后不得有其他文字)。
+  // 成功返回 { html, next };未闭合/有夹杂文字返回 null(交给行内规则或当普通文字)
+  function tryParseMathBlock(lines, i) {
+    const first = lines[i].trim();
+    const kinds = [["$$", "$$"], ["\\[", "\\]"]];
+    for (const [open, close] of kinds) {
+      if (!first.startsWith(open)) continue;
+      const rest = first.slice(open.length);
+      let body = null, end = i;
+      const same = rest.indexOf(close);
+      if (same >= 0) {
+        if (rest.slice(same + close.length).trim() !== "") return null;
+        body = rest.slice(0, same);
+      } else {
+        const buf = [rest];
+        for (let k = i + 1; k < lines.length; k++) {
+          const at = lines[k].indexOf(close);
+          if (at >= 0) {
+            if (lines[k].slice(at + close.length).trim() !== "") return null;
+            buf.push(lines[k].slice(0, at));
+            body = buf.join("\n"); end = k; break;
+          }
+          if (!lines[k].trim() && k > i + 1 && !buf[buf.length - 1].trim()) return null;   // 连续空行:不是公式块
+          buf.push(lines[k]);
+        }
+        if (body === null) return null;
+      }
+      if (!body.trim()) return null;
+      const source = lines.slice(i, end + 1).join("\n").trim();
+      return { html: `<div class="math-block">${mathNode(body.trim(), true, source)}</div>`, next: end + 1 };
+    }
+    return null;
   }
 
   // ---- 表格(GFM 管道表格:表头行 + 分隔行 + 若干数据行)----
@@ -231,6 +330,13 @@
         continue;
       }
       if (!line.trim()) { flushPara(); flushList(); continue; }
+      const mb = tryParseMathBlock(lines, i);
+      if (mb) {                                           // 独立公式块(可打断段落)
+        flushPara(); flushList();
+        out.push(mb.html);
+        i = mb.next - 1;
+        continue;
+      }
       const h = HEADING_RE.exec(line);
       if (h) {
         flushPara(); flushList();
@@ -261,15 +367,19 @@
   }
 
   function renderPlain(text, citeMap, opts) {
-    const html = esc(text).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    // 公式先换成占位符,避免其中的 * _ [ ] 被粗体/出处规则误伤;最后再还原
+    const { text: plain, maths } = extractMath(text);
+    let html = esc(plain).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     if (opts.streaming) {
       // 流式期间 chunk 标记只显示中性徽标,避免裸 ID 闪烁
-      return html.replace(/\[chunk:[A-Za-z0-9_]+\]/g, '<span class="chip cite">出处…</span>');
+      html = html.replace(/\[chunk:[A-Za-z0-9_]+\]/g, '<span class="chip cite">出处…</span>');
+    } else {
+      html = html.replace(/\[chunk:([A-Za-z0-9_]+)\]/g, (_, id) =>
+        citeMap.has(id)
+          ? `<span class="chip cite" title="出处 ${esc(citeMap.get(id))}">出处 ${esc(citeMap.get(id))}</span>`
+          : "");
     }
-    return html.replace(/\[chunk:([A-Za-z0-9_]+)\]/g, (_, id) =>
-      citeMap.has(id)
-        ? `<span class="chip cite" title="出处 ${esc(citeMap.get(id))}">出处 ${esc(citeMap.get(id))}</span>`
-        : "");
+    return maths.length ? restoreMath(html, maths) : html;
   }
 
   // ---- 图片卡片(正文插图与补充图片区共用)----
@@ -512,7 +622,7 @@
              get inflightCount() { return inflight.size; } };
   }
 
-  return { esc, figLabel, pageLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
+  return { esc, extractMath, figLabel, pageLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
            imageCardHTML, figureDomId, newMessageId, createAssistantMessage,
            applyStreamEvent, finishStream, restoreMessages,
            PROG_STAGE_NAMES, PROG_STAGE_STATE, locatorUnit, formatElapsed, progressLine, createDocPoller,

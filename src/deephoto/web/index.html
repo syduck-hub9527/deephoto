@@ -109,6 +109,12 @@
   .msg .text .md-table th, .msg .text .md-table td { border: 1px solid var(--border); padding: 6px 12px; text-align: left; vertical-align: top; }
   .msg .text .md-table th { background: var(--code-bg); font-weight: 650; white-space: nowrap; }
   .msg .text .md-table .al-center { text-align: center; } .msg .text .md-table .al-right { text-align: right; }
+  /* 公式:KaTeX 渲染前占位节点显示原文;渲染后加 math-done。独立公式在容器内横向滚动 */
+  .msg .text .math:not(.math-done) { font-family: ui-monospace, Consolas, monospace; font-size: 13px;
+                                     color: var(--muted); white-space: pre-wrap; }
+  .msg .text .math-block { margin: 0 0 .9em; overflow-x: auto; overflow-y: hidden; }
+  .msg .text .math-block .katex-display { margin: .3em 0; }
+  .msg .text .katex { font-size: 1.05em; }
   .msg .text > :last-child { margin-bottom: 0; }
   .msg .text code { background: var(--code-bg); border-radius: 4px; padding: 1px 5px; font-size: 13px; }
   .msg .text strong { font-weight: 650; }
@@ -181,6 +187,8 @@
     .msg .body { max-width: 88%; }
   }
 </style>
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
+<script defer src="/vendor/katex/katex.min.js"></script>
 </head>
 <body>
 <aside id="sidebar">
@@ -496,8 +504,31 @@ function renderThread() {
         ${m.streaming ? "" : renderSupplement(m, body.supplement)}
       </div></div>`;
   }).join("");
+  renderMath(box);
   if (nearBottom) requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; });
 }
+
+// 公式排版:segments.js 只输出带 data-tex 的占位节点,这里交给 KaTeX。
+// 消息列表每次都整体重建 DOM,按 (模式+源码) 缓存排版结果,流式输出时不重复计算;
+// KaTeX 未加载(离线/脚本被拦)或单条公式出错时保留原文,不影响其余内容。
+const _mathCache = new Map();
+function renderMath(root) {
+  if (typeof katex === "undefined") return;
+  root.querySelectorAll(".math:not(.math-done)").forEach(el => {
+    const display = el.dataset.display === "1";
+    const key = (display ? "D:" : "I:") + el.dataset.tex;
+    let html = _mathCache.get(key);
+    if (html === undefined) {
+      try {
+        html = katex.renderToString(el.dataset.tex,
+          { displayMode: display, throwOnError: false, strict: "ignore", trust: false });
+      } catch (e) { html = null; }
+      _mathCache.set(key, html);
+    }
+    if (html) { el.innerHTML = html; el.classList.add("math-done"); }
+  });
+}
+window.addEventListener("load", () => renderMath(document.body));   // defer 脚本晚于首次渲染时补一次
 
 // 正文锚点未使用到的已校验图片(例如模型没插图但后端补了候选):末尾"补充图片"区
 // 定位命名与正文插图一致(消息 ID + occurrence ID)
