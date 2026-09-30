@@ -281,6 +281,8 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
     && SEG.formatElapsed(3720000) === "1 小时 2 分"
     && SEG.formatElapsed(null) === "—");
   check("formatElapsed 负数防护", SEG.formatElapsed(-5) === "0 秒");
+  check("formatElapsed 亚秒按 1 秒显示,不显示 0 秒", SEG.formatElapsed(0) === "1 秒"
+    && SEG.formatElapsed(999) === "1 秒" && SEG.formatElapsed(1500) === "2 秒");
 
   const running = { status: "describing", progress: { state: "running", stage: "describing",
     completed: 3, total: 7, stage_elapsed_ms: 120000, total_elapsed_ms: 241200,

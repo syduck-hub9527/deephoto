@@ -291,7 +291,8 @@
   // 已等待时长显示(不猜测"还需多久");未知为 —
   function formatElapsed(ms) {
     if (ms === null || ms === undefined || isNaN(ms)) return "—";
-    const s = Math.max(0, Math.round(ms / 1000));
+    // 亚秒按 1 秒显示("0 秒"读起来像没干活);负数只来自异常数据,防护为 0 秒
+    const s = ms < 0 ? 0 : Math.max(1, Math.round(ms / 1000));
     if (s < 60) return `${s} 秒`;
     const m = Math.floor(s / 60), rs = s % 60;
     if (m < 60) return rs ? `${m} 分 ${rs} 秒` : `${m} 分`;
