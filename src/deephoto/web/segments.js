@@ -375,7 +375,7 @@
         `<td>${esc(PROG_STAGE_STATE[i.result] || i.result)}</td>` +
         `<td>${formatElapsed(elapsed)}</td></tr>`;
     }).join("");
-    return `<div class="prog-sub">图片描述逐张结果:</div><table class="prog-table">${rows}</table>`;
+    return `<div class="prog-sub">图片描述逐张结果(并发处理时各图耗时会重叠):</div><table class="prog-table">${rows}</table>`;
   }
 
   function renderBatchItems(items) {

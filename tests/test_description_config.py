@@ -18,6 +18,7 @@ _DESC_VARS = [
     "DEEPHOTO_DESCRIPTION_BASE_URL", "DEEPHOTO_DESCRIPTION_MODEL",
     "DEEPHOTO_DESCRIPTION_REASONING_EFFORT", "DEEPHOTO_DESCRIPTION_TIMEOUT_SECONDS",
     "DEEPHOTO_DESCRIPTION_MAX_RETRIES", "DEEPHOTO_DESCRIPTION_MAX_TOKENS",
+    "DEEPHOTO_DESCRIPTION_CONCURRENCY",
 ]
 
 
@@ -52,6 +53,8 @@ class OldConstructionTest(unittest.TestCase):
         self.assertEqual(s.description_model, "qwen3.8-omni-flash")
         self.assertEqual((s.description_timeout_seconds, s.description_max_retries,
                           s.description_max_tokens), (90.0, 1, 1024))
+        # 数据类默认并发 1:依赖调用次序的现有测试一行不改(F11);生产经 load_settings 得 4
+        self.assertEqual(s.description_concurrency, 1)
 
 
 class EnvParsingTest(EnvTestBase):
@@ -93,6 +96,21 @@ class EnvParsingTest(EnvTestBase):
         os.environ["DEEPHOTO_DESCRIPTION_MAX_RETRIES"] = "abc"   # 关闭时数字仍应合法
         with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_MAX_RETRIES"):
             load_settings()
+
+
+class ConcurrencyConfigTest(EnvTestBase):
+    def test_default_is_4_via_load_settings(self):
+        self.assertEqual(load_settings().description_concurrency, 4)
+
+    def test_explicit_value(self):
+        os.environ["DEEPHOTO_DESCRIPTION_CONCURRENCY"] = "8"
+        self.assertEqual(load_settings().description_concurrency, 8)
+
+    def test_invalid_values_name_variable(self):
+        for raw in ("0", "-2", "abc", "17"):     # 下限 1、上限 16、必须整数
+            os.environ["DEEPHOTO_DESCRIPTION_CONCURRENCY"] = raw
+            with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_CONCURRENCY"):
+                load_settings()
 
 
 class ValidationTest(EnvTestBase):

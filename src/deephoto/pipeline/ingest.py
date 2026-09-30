@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import io
 import logging
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from .. import repo
 from ..config import Settings
@@ -30,6 +32,23 @@ from . import progress as pg
 logger = logging.getLogger(__name__)
 
 _MIME_BY_PIL_FORMAT = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
+
+
+def _call_model(model, image_bytes, mime_type, caption, section, context_text):
+    """工作线程唯一职责:调用描述模型。纯函数,不碰数据库/observer/共享可变状态(§3.1)。
+
+    describe_image 在调用时从模块全局解析,测试的模块级 patch 对本函数同样生效。
+    """
+    return describe_image(model, image_bytes, mime_type,
+                          caption=caption, section=section, context_text=context_text)
+
+
+def _looks_rate_limited(exc: Exception) -> bool:
+    """疑似限流:status_code == 429 或异常类名含 RateLimit。
+    getattr 探测,不引入对 openai 的硬依赖。"""
+    if getattr(exc, "status_code", None) == 429:
+        return True
+    return "RateLimit" in type(exc).__name__
 
 
 def _display_label(occ: dict) -> str | None:
@@ -272,13 +291,30 @@ class IngestService:
 
     def _describe_all(self, conn, doc: dict, parsed: ParsedDocument, occurrences: list[dict],
                       chunks: list[dict], observer) -> dict:
-        """逐张描述并记录进度;返回统计 {model, ok, failed}(failed 含异常与格式失败)。"""
+        """逐张描述并记录进度;返回统计 {model, ok, failed, rate_limited}(failed 含异常与格式失败)。
+
+        并发度 1 走原同步循环(顺序、进度、结果与旧版完全一致);>1 走滑动窗口:
+        工作线程只调 describe_image(纯函数),读库/写库/观测全部留在本线程(§3.1)。
+        """
         model = self._get_chat_model()
-        stats = {"model": model, "ok": 0, "failed": 0}
+        stats = {"model": model, "ok": 0, "failed": 0, "rate_limited": 0}
         if model is None:
             logger.warning("图片描述已关闭,跳过(仅以图注检索)")
             return stats
         desc_model_tag = f"{self.settings.description_model}:{DESC_PROMPT_VERSION}"
+        if self.settings.description_concurrency > 1 and len(occurrences) > 1:
+            self._describe_concurrent(conn, parsed, occurrences, chunks, observer,
+                                      stats, model, desc_model_tag)
+        else:
+            self._describe_sequential(conn, parsed, occurrences, chunks, observer,
+                                      stats, model, desc_model_tag)
+        if stats["rate_limited"]:
+            observer.warn(f"图片描述有 {stats['rate_limited']} 张疑似被服务商限流,"
+                          "可调低 DEEPHOTO_DESCRIPTION_CONCURRENCY")
+        return stats
+
+    def _describe_sequential(self, conn, parsed, occurrences, chunks, observer,
+                             stats, model, desc_model_tag) -> None:
         for seq, occ in enumerate(occurrences, start=1):
             full = repo.get_occurrence(conn, occ["id"])
             asset = repo.get_asset(conn, full["image_asset_id"])
@@ -293,37 +329,112 @@ class IngestService:
                     section=_section_for_page(parsed, occ["page_number"]),
                     context_text=_context_for_occurrence(occ, chunks, parsed),
                 )
-                repo.update_occurrence_description(
-                    conn, occ["id"], visible_summary=result["visible_summary"],
-                    visible_labels=result["visible_labels"],
-                    caption=result["caption"] or (occ["caption"] or ""),
-                    context_summary=result["context_summary"],
-                    uncertain_details=result["uncertain_details"],
-                    description_model=desc_model_tag,
-                )
-                diag = (result.get("diagnostic") or {}).get("result", "ok")
-                if diag == "ok":
-                    stats["ok"] += 1
-                    observer.item_end("image", seq, pg.ITEM_OK)
-                else:
-                    # 调用完成但输出不是有效 JSON:按格式失败计数,不能算成功
-                    stats["failed"] += 1
-                    observer.item_end("image", seq, pg.ITEM_PARSE_FAILED)
-                    observer.warn(f"第 {seq} 张({label})描述格式解析失败,已降级")
+                self._settle_description(conn, occ, seq, label, result, desc_model_tag,
+                                         observer, stats)
             except Exception as exc:
-                # 单图失败不阻塞整篇入库(§6:描述漏掉关键内容 -> 检索命中后看原图兜底)
-                summary = error_summary(exc, self._secret_values())
-                logger.error("describe failed for %s: %s", occ["id"], summary)
-                logger.debug("describe failure traceback", exc_info=True)
-                repo.update_occurrence_description(
-                    conn, occ["id"], visible_summary="", visible_labels=[],
-                    caption=occ["caption"] or "", context_summary="",
-                    uncertain_details=[f"描述生成失败:{summary}"],
-                    description_model=desc_model_tag,
-                )
-                stats["failed"] += 1
-                observer.item_end("image", seq, pg.ITEM_ERROR, error_kind=type(exc).__name__)
-        return stats
+                self._fail_description(conn, occ, seq, label, exc, desc_model_tag,
+                                       observer, stats)
+
+    def _describe_concurrent(self, conn, parsed, occurrences, chunks, observer,
+                             stats, model, desc_model_tag) -> None:
+        """滑动窗口:任一时刻至多 N 个在途调用。
+
+        item_start 在提交时(而非排队时)调用,duration_ms 是单次调用真实耗时,
+        不含排队;读图在提交前做,读图失败按单图失败处理,不占窗口。
+        """
+        limit = self.settings.description_concurrency
+        pending = deque(enumerate(occurrences, start=1))
+        inflight: dict = {}          # future -> (seq, occ, label)
+        executor = ThreadPoolExecutor(max_workers=limit)
+
+        def refresh_current_label() -> None:
+            """列表行"当前"只有一格:在途多于一张时显示聚合文案,收尾恢复单张标签(§7-B)。"""
+            if not inflight:
+                return
+            seq, occ, label = min(inflight.values())   # 最久在途:已等待时间按它算
+            if len(inflight) > 1:
+                observer.item_update("image", seq, label=f"{len(inflight)} 张并发处理中")
+            else:
+                observer.item_update("image", seq, label=label)
+
+        def submit_one() -> None:
+            seq, occ = pending.popleft()
+            full = repo.get_occurrence(conn, occ["id"])
+            asset = repo.get_asset(conn, full["image_asset_id"])
+            label = _display_label(occ) or f"第 {seq} 张"
+            observer.item_start("image", seq, label=label,
+                                page=occ["page_number"], figure=occ["figure_number"])
+            try:
+                image_bytes = self.store.get(asset["original_object_key"])
+            except Exception as exc:
+                self._fail_description(conn, occ, seq, label, exc, desc_model_tag,
+                                       observer, stats)
+                return
+            future = executor.submit(
+                _call_model, model, image_bytes, asset["mime_type"],
+                occ["caption"], _section_for_page(parsed, occ["page_number"]),
+                _context_for_occurrence(occ, chunks, parsed))
+            inflight[future] = (seq, occ, label)
+            refresh_current_label()
+
+        try:
+            while pending or inflight:
+                while pending and len(inflight) < limit:
+                    submit_one()
+                if not inflight:
+                    break                # 读图全部失败:无任务可等
+                done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+                for future in done:
+                    seq, occ, label = inflight.pop(future)
+                    exc = future.exception()
+                    if exc is not None:
+                        self._fail_description(conn, occ, seq, label, exc, desc_model_tag,
+                                               observer, stats)
+                    else:
+                        self._settle_description(conn, occ, seq, label, future.result(),
+                                                 desc_model_tag, observer, stats)
+                refresh_current_label()
+        finally:
+            # 主线程异常上抛时:取消未开始的任务;已开始的最多再跑一个超时周期
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _settle_description(self, conn, occ, seq, label, result, desc_model_tag,
+                            observer, stats) -> None:
+        """主线程:成功调用的落库与观测(两条路径共用)。"""
+        repo.update_occurrence_description(
+            conn, occ["id"], visible_summary=result["visible_summary"],
+            visible_labels=result["visible_labels"],
+            caption=result["caption"] or (occ["caption"] or ""),
+            context_summary=result["context_summary"],
+            uncertain_details=result["uncertain_details"],
+            description_model=desc_model_tag,
+        )
+        diag = (result.get("diagnostic") or {}).get("result", "ok")
+        if diag == "ok":
+            stats["ok"] += 1
+            observer.item_end("image", seq, pg.ITEM_OK)
+        else:
+            # 调用完成但输出不是有效 JSON:按格式失败计数,不能算成功
+            stats["failed"] += 1
+            observer.item_end("image", seq, pg.ITEM_PARSE_FAILED)
+            observer.warn(f"第 {seq} 张({label})描述格式解析失败,已降级")
+
+    def _fail_description(self, conn, occ, seq, label, exc, desc_model_tag,
+                          observer, stats) -> None:
+        """主线程:单图失败(读图/调用异常)不阻塞整篇入库(§6:检索命中后看原图兜底)。"""
+        summary = error_summary(exc, self._secret_values())
+        logger.error("describe failed for %s: %s", occ["id"], summary)
+        logger.debug("describe failure traceback", exc_info=True)
+        repo.update_occurrence_description(
+            conn, occ["id"], visible_summary="", visible_labels=[],
+            caption=occ["caption"] or "", context_summary="",
+            uncertain_details=[f"描述生成失败:{summary}"],
+            description_model=desc_model_tag,
+        )
+        stats["failed"] += 1
+        if _looks_rate_limited(exc):
+            stats["rate_limited"] += 1
+        observer.item_end("image", seq, pg.ITEM_ERROR, error_kind=type(exc).__name__)
 
     def _secret_values(self) -> list[str | None]:
         """脱敏用:所有已配置的密钥原值(任何一个出现在异常文本里都要抹掉)。"""

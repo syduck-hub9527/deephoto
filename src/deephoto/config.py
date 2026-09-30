@@ -48,7 +48,7 @@ def _get_float(name: str, default: float, *, minimum: float) -> float:
     return value
 
 
-def _get_int(name: str, default: int, *, minimum: int) -> int:
+def _get_int(name: str, default: int, *, minimum: int, maximum: int | None = None) -> int:
     raw = _get(name)
     if raw is None or not raw.strip():
         return default
@@ -58,6 +58,8 @@ def _get_int(name: str, default: int, *, minimum: int) -> int:
         raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须是整数,当前值无法解析") from None
     if value < minimum:
         raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须 >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须 <= {maximum}")
     return value
 
 
@@ -156,6 +158,9 @@ class Settings:
     description_timeout_seconds: float = 90.0
     description_max_retries: int = 1
     description_max_tokens: int = 1024
+    # 描述并发度:数据类默认 1(串行,与旧行为一致,现有测试依赖调用次序);
+    # 生产经 load_settings 默认 4。上限 16(滑动窗口内存 = 在途图字节数 × 并发度)
+    description_concurrency: int = 1
 
     # 多格式:上传白名单(formats.FormatInfo.key);默认只开当前有可用引擎的格式
     allowed_formats: frozenset = frozenset(
@@ -209,6 +214,7 @@ def load_settings() -> Settings:
         description_timeout_seconds=_get_float("DESCRIPTION_TIMEOUT_SECONDS", 90.0, minimum=1.0),
         description_max_retries=_get_int("DESCRIPTION_MAX_RETRIES", 1, minimum=0),
         description_max_tokens=_get_int("DESCRIPTION_MAX_TOKENS", 1024, minimum=1),
+        description_concurrency=_get_int("DESCRIPTION_CONCURRENCY", 4, minimum=1, maximum=16),
         allowed_formats=_get_formats(),
         markdown_data_uri_max_mb=_get_int("MARKDOWN_DATA_URI_MAX_MB", 10, minimum=1),
         docx_parser=_get_choice("DOCX_PARSER", "local", ("local", "mineru")),
