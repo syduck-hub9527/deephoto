@@ -30,6 +30,10 @@ class SessionError(ValueError):
     """会话不存在、范围不匹配或上轮未完成。"""
 
 
+class DocumentScopeError(SessionError):
+    """文档暂不可用,图尚未执行,不改变健康会话状态。"""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -137,7 +141,8 @@ class QAPersistence:
         return namespace, f"qa:{owner}:{session_id}"
 
     @contextmanager
-    def turn(self, ctx, session_id: str | None, document_id: str | None, profile: dict):
+    def turn(self, ctx, session_id: str | None, document_id: str | None, profile: dict,
+             *, preflight=None):
         existing = session_id is not None
         session_id = session_id or f"sess_{uuid4().hex}"
         _validate_id(session_id)
@@ -159,6 +164,10 @@ class QAPersistence:
             else:
                 metadata = {"version": 1, "document_id": document_id, "profile": profile,
                             "created_at": _now(), "chunk_ids": [], "image_ids": []}
+            # 归属/scope/profile/status 校验后,但 running 写入前进行业务预检。
+            # 预检异常不进入 turn 的失败 finally,旧 metadata/checkpoint 均保持原样。
+            if preflight is not None:
+                preflight()
             metadata.update(status="running", updated_at=_now())
             self.store.put(namespace, session_id, metadata)
             turn = SessionTurn(self, namespace, session_id, thread_id, metadata)

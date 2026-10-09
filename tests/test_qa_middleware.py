@@ -294,16 +294,16 @@ class ServiceTest(_Base):
         self.assertEqual(result["tool_trace"]["events"][1]["agent"], "figure_checker")
         self.assertNotIn("SECRET_PIXELS", json.dumps(result["tool_trace"]))
 
-    def test_default_general_purpose_is_outside_trace_scope(self):
+    def test_middleware_on_removes_unbounded_general_purpose(self):
         qa = self._qa()
         qa._chat_model = ScriptedFakeChatModel(script=[
-            {"tool": "task", "args": {"description": "find", "subagent_type": "general-purpose"}},
             {"tool": "search_knowledge", "args": {"query": "x"}},
-            f"brief [chunk:{self.c1}]", f"answer [chunk:{self.c1}]"],
+            f"answer [chunk:{self.c1}]"],
             model_name=qa.settings.chat_model, ls_provider="openai")
         result = qa.answer(self.conn, self.ctx, "q")
         self.assertEqual([(e["agent"], e["tool"]) for e in result["tool_trace"]["events"]],
-                         [("main", "task")])
+                         [("main", "search_knowledge")])
+        self.assertNotIn("task", qa._chat_model.bound_tool_names[0])
         self.assertEqual(result["citations"][0]["chunk_id"], self.c1)
 
     def test_new_settings_validation(self):

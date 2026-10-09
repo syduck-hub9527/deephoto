@@ -322,6 +322,9 @@ class ServiceContextTest(_Base):
 
     def test_default_general_purpose_gets_skills_but_not_main_memory_middleware(self):
         qa = self._qa(memory=True, persistence=True)
+        # 此用例验证 05 的 GP 继承边界;04 开启后修复版禁用 GP。
+        qa.settings.qa_middleware_enabled = False
+        qa.settings.chat_model += "-gp-without-04"
         qa.preference_memory().put(self.ctx, Preferences(language="en"))
         model = self._model(qa, [{"tool": "task", "args": {"subagent_type": "general-purpose", "description": "gp"}}, "brief", "a"])
         qa.answer(self.conn, self.ctx, "q")

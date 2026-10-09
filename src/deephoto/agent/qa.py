@@ -29,6 +29,7 @@ from ..security import AuthContext
 from .answer_format import normalize_image_anchors
 from .knowledge import KnowledgeService
 from .locator import locator_label
+from .persistence import DocumentScopeError
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,8 @@ class QAService:
                session_id: str | None = None) -> dict:
         if not self._persistence_enabled():
             return self._answer_impl(conn, ctx, question, document_id, history)
-        with self._sessions().turn(ctx, session_id, document_id, self._session_profile()) as turn:
+        with self._sessions().turn(ctx, session_id, document_id, self._session_profile(),
+                                   preflight=lambda: self._validate_scope(conn, ctx, document_id)) as turn:
             # 会话历史以 checkpoint 为准;浏览器历史不导入新会话,也不重复追加。
             result = self._answer_impl(conn, ctx, question, document_id, None, turn)
             turn.complete(result)
@@ -109,7 +111,7 @@ class QAService:
 
     def _answer_impl(self, conn: Connection, ctx: AuthContext, question: str,
                      document_id: str | None, history: list[dict] | None, turn=None) -> dict:
-        if document_id and not self.knowledge.allowed_document_ids(conn, ctx, document_id):
+        if turn is None and document_id and not self.knowledge.allowed_document_ids(conn, ctx, document_id):
             return {"error": "文档不存在、无权限或尚未处理完成", "answer": None, "citations": [], "images": []}
         tools, tracker = self._make_tools(ctx)
         agent_kwargs = self._agent_kwargs(ctx, tracker)
@@ -134,7 +136,8 @@ class QAService:
             if not self._persistence_enabled():
                 yield from self._stream_impl(ctx, question, document_id, history)
             else:
-                with self._sessions().turn(ctx, session_id, document_id, self._session_profile()) as turn:
+                with self._sessions().turn(ctx, session_id, document_id, self._session_profile(),
+                                           preflight=lambda: self._validate_scope(connect(self.settings.db_path), ctx, document_id)) as turn:
                     yield {"type": "session", "session_id": turn.session_id}
                     broken = False
                     for event in self._stream_impl(ctx, question, document_id, None, turn):
@@ -146,6 +149,8 @@ class QAService:
                             event["session_id"] = turn.session_id
                             event["session_status"] = "failed" if broken else "ready"
                         yield event
+        except DocumentScopeError as exc:
+            yield {"type": "error", "detail": str(exc), "code": "document_scope_unavailable", "recoverable": True}
         except Exception as exc:
             logger.exception("qa stream failed")
             yield {"type": "error", "detail": f"{type(exc).__name__}: {exc}"}
@@ -153,7 +158,7 @@ class QAService:
     def _stream_impl(self, ctx: AuthContext, question: str,
                      document_id: str | None, history: list[dict] | None, turn=None) -> Iterator[dict]:
         db_path = self.settings.db_path
-        if document_id and not self.knowledge.allowed_document_ids(connect(db_path), ctx, document_id):
+        if turn is None and document_id and not self.knowledge.allowed_document_ids(connect(db_path), ctx, document_id):
             yield {"type": "error", "detail": "文档不存在、无权限或尚未处理完成"}
             return
 
@@ -209,6 +214,10 @@ class QAService:
         yield result
 
     # ---- 公共部分 ----
+
+    def _validate_scope(self, conn: Connection, ctx: AuthContext, document_id: str | None) -> None:
+        if document_id and not self.knowledge.allowed_document_ids(conn, ctx, document_id):
+            raise DocumentScopeError("文档不存在、无权限或尚未处理完成")
 
     def _delegating(self) -> bool:
         # settings 在部分测试里是 SimpleNamespace,取值要带默认;默认关闭 = 升级前行为
@@ -339,6 +348,9 @@ class QAService:
     def _build_agent(self, tools, backend=None, trace=None, checkpointer=None, store=None,
                      skills=None, memory_enabled=False):
         middleware = []
+        if self._persistence_enabled():
+            from .history import CompletedRoundMiddleware
+            middleware.append(CompletedRoundMiddleware())
         memory_sources = None
         if memory_enabled:
             from .context import FreshMemoryMiddleware, MEMORY_PATH
@@ -380,7 +392,7 @@ class QAService:
             extra["memory"] = memory_sources
         if backend is not None:
             extra["backend"] = backend
-        if self._kb_vfs() or skills is not None:
+        if self._kb_vfs() or skills is not None or self._middleware_enabled():
             if not self._harness_registered:
                 self._register_harness()
         return create_deep_agent(model=self._model(), tools=tools,
@@ -390,7 +402,7 @@ class QAService:
         from .harness import register_harness
 
         register_harness(self.settings.chat_model, delegating=self._delegating(), kb_vfs=self._kb_vfs(),
-                         skills=self._skills_enabled())
+                         skills=self._skills_enabled(), middleware=self._middleware_enabled())
         self._harness_registered = True
 
     def _run_kwargs(self) -> dict:

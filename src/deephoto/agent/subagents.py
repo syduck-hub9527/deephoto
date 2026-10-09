@@ -94,7 +94,7 @@ def _call_limit(n: int):
 
 def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int = 8,
                          checker_max_calls: int = 4, kb_vfs: bool = False, trace=None,
-                         skills_enabled: bool = False) -> list[dict]:
+                         skills_enabled: bool = False, compact_history: bool = False) -> list[dict]:
     from .harness import READ_TOOLS, hide_tools_middleware
 
     by_name = {getattr(t, "__name__", getattr(t, "name", "")): t for t in tools}
@@ -133,6 +133,10 @@ def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int 
         from .context import skill_sources
         for spec in specs:
             spec["skills"] = skill_sources(spec["name"])
+    if compact_history:
+        from .history import CompletedRoundMiddleware
+        for spec in specs:
+            spec["middleware"].append(CompletedRoundMiddleware())
     return specs
 
 
@@ -168,6 +172,7 @@ def build_delegating_agent(model, tools: Sequence[Callable], *, retriever_max_ca
         system_prompt=DELEGATING_SYSTEM_PROMPT,
         subagents=build_subagent_specs(
             tools, retriever_max_calls=retriever_max_calls, checker_max_calls=checker_max_calls,
-            kb_vfs=kb_vfs, trace=trace, skills_enabled=skills is not None),
+            kb_vfs=kb_vfs, trace=trace, skills_enabled=skills is not None,
+            compact_history=checkpointer is not None),
         **extra,
     )

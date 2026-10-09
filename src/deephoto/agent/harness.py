@@ -14,8 +14,8 @@ READ_TOOLS = frozenset({"ls", "read_file", "glob", "grep"})
 WRITE_TOOLS = frozenset({"write_file", "edit_file", "delete", "execute"})
 ALL_FS_TOOLS = READ_TOOLS | WRITE_TOOLS
 
-# model key -> (delegating, kb_vfs, skills);profile 排除取并集,换配置必须重启。
-_REGISTERED: dict[str, tuple[bool, bool, bool]] = {}
+# model key -> (delegating, kb_vfs, skills, middleware);改配置必须重启。
+_REGISTERED: dict[str, tuple[bool, bool, bool, bool]] = {}
 
 
 def excluded_tools(*, delegating: bool, kb_vfs: bool, skills: bool = False) -> frozenset[str]:
@@ -24,23 +24,24 @@ def excluded_tools(*, delegating: bool, kb_vfs: bool, skills: bool = False) -> f
     return ALL_FS_TOOLS if delegating else frozenset()
 
 
-def register_harness(chat_model: str, *, delegating: bool, kb_vfs: bool, skills: bool = False) -> None:
+def register_harness(chat_model: str, *, delegating: bool, kb_vfs: bool, skills: bool = False,
+                     middleware: bool = False) -> None:
     """按 openai:<chat_model> 注册 profile。
 
-    - 单智能体且未启用 kb/skills:不注册(与升级前完全一致);
-    - 委派模式:关闭 general-purpose 子智能体;
+    - 单智能体且未启用 kb/skills/middleware:不注册(与升级前完全一致);
+    - 委派模式或 04 开启:关闭 general-purpose,防止绕过主级调用限制;
     - 同一进程里对同一 key 换配置重复注册会抛 RuntimeError(并集无法撤销,需要重启进程)。
     """
     key = f"openai:{chat_model}"
-    flags = (delegating, kb_vfs, skills)
+    flags = (delegating, kb_vfs, skills, middleware)
     if key in _REGISTERED:
         if _REGISTERED[key] != flags:
             raise RuntimeError(
-                f"{key} 已按 delegating/kb_vfs/skills={_REGISTERED[key]} 注册;excluded_tools 只增不减,"
+                f"{key} 已按 delegating/kb_vfs/skills/middleware={_REGISTERED[key]} 注册;excluded_tools 只增不减,"
                 f"不能在同一进程里改成 {flags},请重启进程。")
         return
     excluded = excluded_tools(delegating=delegating, kb_vfs=kb_vfs, skills=skills)
-    if not excluded and not delegating:
+    if not excluded and not delegating and not middleware:
         _REGISTERED[key] = flags
         return
 
@@ -48,7 +49,7 @@ def register_harness(chat_model: str, *, delegating: bool, kb_vfs: bool, skills:
     from deepagents.profiles import GeneralPurposeSubagentProfile
 
     kwargs: dict[str, Any] = {"excluded_tools": excluded}
-    if delegating:
+    if delegating or middleware:
         kwargs["general_purpose_subagent"] = GeneralPurposeSubagentProfile(enabled=False)
     register_harness_profile(key, HarnessProfile(**kwargs))
     _REGISTERED[key] = flags
