@@ -163,6 +163,7 @@ def main() -> None:
             "answer": result.get("answer"),
             "error": result.get("error"),
             "tool_trace": result.get("tool_trace"),
+            "session_id": result.get("session_id"),
             "citations": [
                 {"chunk_id": c["chunk_id"], "page": c["page"], "page_end": c["page_end"],
                  "label": c["label"]}
@@ -178,12 +179,14 @@ def main() -> None:
               f"{len(records[-1]['citations'])} 条引用, {len(records[-1]['images'])} 张图"
               + (f", 错误: {records[-1]['error']}" if records[-1]["error"] else ""), flush=True)
 
+    qa.close()
     versions = {name: _pkg_version(name) for name in
                 ("deepagents", "langchain", "langchain-core", "langchain-openai", "langgraph")}
     flags = {"qa_subagents_enabled": getattr(settings, "qa_subagents_enabled", False),
              "qa_kb_vfs_enabled": getattr(settings, "qa_kb_vfs_enabled", False),
              "qa_middleware_enabled": getattr(settings, "qa_middleware_enabled", False),
-             "qa_main_max_model_calls": getattr(settings, "qa_main_max_model_calls", 12)}
+             "qa_main_max_model_calls": getattr(settings, "qa_main_max_model_calls", 12),
+             "qa_persistence_enabled": getattr(settings, "qa_persistence_enabled", False)}
     snapshot = {
         "meta": {
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -199,7 +202,8 @@ def main() -> None:
     SNAPSHOT_DIR.mkdir(exist_ok=True)
     suffix = ("-subagents" if flags["qa_subagents_enabled"] else "") + \
              ("-kbvfs" if flags["qa_kb_vfs_enabled"] else "") + \
-             ("-middleware" if flags["qa_middleware_enabled"] else "")
+             ("-middleware" if flags["qa_middleware_enabled"] else "") + \
+             ("-persistence" if flags["qa_persistence_enabled"] else "")
     out = SNAPSHOT_DIR / (f"snapshot-{time.strftime('%Y%m%d-%H%M%S')}"
                           f"-deepagents-{versions.get('deepagents') or 'unknown'}{suffix}.json")
     out.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")

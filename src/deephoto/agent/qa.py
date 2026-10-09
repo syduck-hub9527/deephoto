@@ -17,6 +17,7 @@ import json
 import logging
 import re
 from sqlite3 import Connection
+from threading import Lock
 from typing import Iterator
 
 from .. import repo
@@ -84,6 +85,8 @@ class QAService:
         self.knowledge = knowledge
         self._chat_model = None
         self._harness_registered = False
+        self._session_runtime = None
+        self._session_lock = Lock()
 
     def _model(self):
         if self._chat_model is None:
@@ -93,16 +96,30 @@ class QAService:
     # ---- 非流式(保留给调试/程序化调用)----
 
     def answer(self, conn: Connection, ctx: AuthContext, question: str,
-               document_id: str | None = None, history: list[dict] | None = None) -> dict:
+               document_id: str | None = None, history: list[dict] | None = None,
+               session_id: str | None = None) -> dict:
+        if not self._persistence_enabled():
+            return self._answer_impl(conn, ctx, question, document_id, history)
+        with self._sessions().turn(ctx, session_id, document_id, self._session_profile()) as turn:
+            # 会话历史以 checkpoint 为准;浏览器历史不导入新会话,也不重复追加。
+            result = self._answer_impl(conn, ctx, question, document_id, None, turn)
+            turn.complete(result)
+            result["session_id"] = turn.session_id
+            return result
+
+    def _answer_impl(self, conn: Connection, ctx: AuthContext, question: str,
+                     document_id: str | None, history: list[dict] | None, turn=None) -> dict:
         if document_id and not self.knowledge.allowed_document_ids(conn, ctx, document_id):
             return {"error": "文档不存在、无权限或尚未处理完成", "answer": None, "citations": [], "images": []}
         tools, tracker = self._make_tools(ctx)
         agent_kwargs = self._agent_kwargs(ctx, tracker)
+        self._attach_persistence(agent_kwargs, turn)
         agent = self._build_agent(tools, **agent_kwargs)
         messages = _build_messages(question, document_id, history)
-        result = agent.invoke({"messages": messages}, **self._run_kwargs())
+        result = agent.invoke({"messages": messages}, **self._invoke_kwargs(turn))
         answer_text = _final_answer_text(result.get("messages", []))
-        extra_chunks, extra_images = _history_cited_ids(history)
+        extra_chunks, extra_images = (self._session_cited_ids(conn, ctx, turn)
+                                      if turn is not None else _history_cited_ids(history))
         assembled = self._assemble(conn, ctx, answer_text, question, tracker, extra_chunks, extra_images)
         self._attach_trace(assembled, agent_kwargs)
         return assembled
@@ -110,16 +127,31 @@ class QAService:
     # ---- 流式(SSE)----
 
     def answer_stream(self, ctx: AuthContext, question: str,
-                      document_id: str | None = None, history: list[dict] | None = None) -> Iterator[dict]:
+                      document_id: str | None = None, history: list[dict] | None = None,
+                      session_id: str | None = None) -> Iterator[dict]:
         """产出事件:{type: thinking|token|done|error}。done 携带校验后的 citations/images。"""
         try:
-            yield from self._stream_impl(ctx, question, document_id, history)
+            if not self._persistence_enabled():
+                yield from self._stream_impl(ctx, question, document_id, history)
+            else:
+                with self._sessions().turn(ctx, session_id, document_id, self._session_profile()) as turn:
+                    yield {"type": "session", "session_id": turn.session_id}
+                    broken = False
+                    for event in self._stream_impl(ctx, question, document_id, None, turn):
+                        if event["type"] in {"warning", "error"}:
+                            broken = True
+                        if event["type"] == "done":
+                            if not broken:
+                                turn.complete(event)
+                            event["session_id"] = turn.session_id
+                            event["session_status"] = "failed" if broken else "ready"
+                        yield event
         except Exception as exc:
             logger.exception("qa stream failed")
             yield {"type": "error", "detail": f"{type(exc).__name__}: {exc}"}
 
     def _stream_impl(self, ctx: AuthContext, question: str,
-                     document_id: str | None, history: list[dict] | None) -> Iterator[dict]:
+                     document_id: str | None, history: list[dict] | None, turn=None) -> Iterator[dict]:
         db_path = self.settings.db_path
         if document_id and not self.knowledge.allowed_document_ids(connect(db_path), ctx, document_id):
             yield {"type": "error", "detail": "文档不存在、无权限或尚未处理完成"}
@@ -127,6 +159,7 @@ class QAService:
 
         tools, tracker = self._make_tools(ctx)
         agent_kwargs = self._agent_kwargs(ctx, tracker)
+        self._attach_persistence(agent_kwargs, turn)
         agent = self._build_agent(tools, **agent_kwargs)
         messages = _build_messages(question, document_id, history)
 
@@ -134,7 +167,7 @@ class QAService:
         stream_broken: str | None = None
         seen_chunks = 0
         try:
-            for chunk, _metadata in agent.stream({"messages": messages}, stream_mode="messages", **self._run_kwargs()):
+            for chunk, _metadata in agent.stream({"messages": messages}, stream_mode="messages", **self._invoke_kwargs(turn)):
                 seen_chunks += 1
                 # 只流式 AI 增量:ToolMessage(Chunk) 的 content 是工具返回的 JSON/图片块,必须排除。
                 # 注意 langchain-core 中 AIMessageChunk.type == "AIMessageChunk"(非 "ai")
@@ -166,8 +199,10 @@ class QAService:
             yield {"type": "warning", "detail": f"回答可能不完整(流中断:{stream_broken})"}
 
         answer_text = "".join(answer_parts)
-        extra_chunks, extra_images = _history_cited_ids(history)
-        result = self._assemble(connect(db_path), ctx, answer_text, question, tracker,
+        conn = connect(db_path)
+        extra_chunks, extra_images = (self._session_cited_ids(conn, ctx, turn)
+                                      if turn is not None else _history_cited_ids(history))
+        result = self._assemble(conn, ctx, answer_text, question, tracker,
                                 extra_chunks, extra_images)
         result["type"] = "done"
         self._attach_trace(result, agent_kwargs)
@@ -184,6 +219,65 @@ class QAService:
 
     def _middleware_enabled(self) -> bool:
         return bool(getattr(self.settings, "qa_middleware_enabled", False))
+
+    def _persistence_enabled(self) -> bool:
+        return bool(getattr(self.settings, "qa_persistence_enabled", False))
+
+    def _sessions(self):
+        from .persistence import QAPersistence
+
+        with self._session_lock:
+            if self._session_runtime is None:
+                self._session_runtime = QAPersistence(
+                    getattr(self.settings, "qa_checkpoint_db_path",
+                            self.settings.db_path.with_name("qa-checkpoints.db")),
+                    getattr(self.settings, "qa_store_db_path",
+                            self.settings.db_path.with_name("qa-store.db")))
+            return self._session_runtime
+
+    def _session_profile(self) -> dict:
+        return {"schema": 1, "model": getattr(self.settings, "chat_model", ""),
+                "subagents": self._delegating(), "kb_vfs": self._kb_vfs(),
+                "middleware": self._middleware_enabled()}
+
+    @staticmethod
+    def _attach_persistence(kwargs: dict, turn) -> None:
+        if turn is not None:
+            kwargs.update(checkpointer=turn.runtime.saver, store=turn.runtime.store)
+
+    def _invoke_kwargs(self, turn=None) -> dict:
+        kwargs = self._run_kwargs()
+        if turn is not None:
+            config = dict(kwargs.get("config", {}))
+            config["configurable"] = turn.config["configurable"]
+            kwargs["config"] = config
+        return kwargs
+
+    def _session_cited_ids(self, conn: Connection, ctx: AuthContext, turn) -> tuple[set[str], set[str]]:
+        # Store 只保存此前响应中后端认可过的引用;再次检查当前 ready/归属/文档范围。
+        allowed_docs = set(self.knowledge.allowed_document_ids(conn, ctx, turn.metadata["document_id"]))
+        chunk_ids = turn.metadata.get("chunk_ids", [])
+        chunks = set()
+        # 避免长会话积累的引用超过旧版 SQLite 的绑定参数上限。
+        for start in range(0, len(chunk_ids), 500):
+            chunks.update(c["id"] for c in repo.get_chunks(conn, chunk_ids[start:start + 500])
+                          if c["tenant_id"] == ctx.tenant_id and c["document_id"] in allowed_docs)
+        images = set()
+        for occ_id in turn.metadata.get("image_ids", []):
+            occ = repo.get_occurrence(conn, occ_id)
+            if occ and occ["tenant_id"] == ctx.tenant_id and occ["document_id"] in allowed_docs:
+                images.add(occ_id)
+        return chunks, images
+
+    def delete_session(self, ctx: AuthContext, session_id: str) -> None:
+        if not self._persistence_enabled():
+            raise RuntimeError("问答持久化未启用")
+        self._sessions().delete(ctx, session_id)
+
+    def close(self) -> None:
+        with self._session_lock:
+            if self._session_runtime is not None:
+                self._session_runtime.close()
 
     @staticmethod
     def _attach_trace(result: dict, agent_kwargs: dict) -> None:
@@ -205,12 +299,12 @@ class QAService:
         db_path = self.settings.db_path
         vfs = KnowledgeVFS(self.knowledge, ctx, lambda: connect(db_path), tracker,
                            grep_max_docs=getattr(self.settings, "qa_kb_grep_max_docs", 300))
-        # 默认后端 = 临时 StateBackend:deepagents 会把超大工具结果转存到 /large_tool_results/,
-        # 这些路径必须可写;/kb/ 只读且按请求(租户)构造。
+        # 默认后端 = StateBackend:超大工具结果转存到 /large_tool_results/。
+        # 03 开启时这些文件随 checkpoint 持久化;/kb/ 只读且按请求(租户)构造。
         kwargs["backend"] = CompositeBackend(default=StateBackend(), routes={KB_ROUTE: vfs})
         return kwargs
 
-    def _build_agent(self, tools, backend=None, trace=None):
+    def _build_agent(self, tools, backend=None, trace=None, checkpointer=None, store=None):
         middleware = []
         if self._middleware_enabled():
             from langchain.agents.middleware import ModelCallLimitMiddleware
@@ -231,11 +325,16 @@ class QAService:
                 self._model(), tools,
                 retriever_max_calls=getattr(self.settings, "qa_retriever_max_model_calls", 8),
                 checker_max_calls=getattr(self.settings, "qa_checker_max_model_calls", 4),
-                backend=backend, middleware=middleware, trace=trace)
+                backend=backend, middleware=middleware, trace=trace,
+                checkpointer=checkpointer, store=store)
 
         from deepagents import create_deep_agent
 
         extra = {"middleware": middleware} if middleware else {}
+        if checkpointer is not None:
+            extra["checkpointer"] = checkpointer
+        if store is not None:
+            extra["store"] = store
         if self._kb_vfs():
             if not self._harness_registered:
                 self._register_harness()

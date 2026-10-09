@@ -183,6 +183,16 @@ class Settings:
     # 04:工具轨迹 + 主智能体调用上限;默认关闭,返回契约保持原样
     qa_middleware_enabled: bool = False
     qa_main_max_model_calls: int = 12
+    # 03:服务端会话历史与已验证引用;本阶段仅支持单进程服务
+    qa_persistence_enabled: bool = False
+
+    @property
+    def qa_checkpoint_db_path(self) -> Path:
+        return self.data_dir / "qa-checkpoints.db"
+
+    @property
+    def qa_store_db_path(self) -> Path:
+        return self.data_dir / "qa-store.db"
 
     @property
     def embeddings_enabled(self) -> bool:
@@ -227,6 +237,7 @@ def load_settings() -> Settings:
         qa_kb_grep_max_docs=_get_int("QA_KB_GREP_MAX_DOCS", 300, minimum=1),
         qa_middleware_enabled=_get_bool("QA_MIDDLEWARE_ENABLED", False),
         qa_main_max_model_calls=_get_int("QA_MAIN_MAX_MODEL_CALLS", 12, minimum=2),
+        qa_persistence_enabled=_get_bool("QA_PERSISTENCE_ENABLED", False),
         description_enabled=_get_bool("DESCRIPTION_ENABLED", False),
         description_api_key=_get("DESCRIPTION_API_KEY"),
         description_base_url=_get("DESCRIPTION_BASE_URL"),

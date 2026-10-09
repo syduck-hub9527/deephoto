@@ -77,9 +77,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     settings.description_model if settings.description_enabled else "-",
                     settings.description_reasoning_effort if settings.description_enabled else "-",
                     settings.description_timeout_seconds, settings.description_max_retries)
-        yield
-        worker.stop()
-        worker.join(timeout=5)
+        try:
+            yield
+        finally:
+            worker.stop()
+            worker.join(timeout=5)
+            qa_service.close()
 
     app = FastAPI(title="deephoto", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings

@@ -8,14 +8,34 @@ from __future__ import annotations
 
 import json
 
+from anyio import CancelScope
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from ..security import AuthContext
+from ..agent.persistence import SessionError
 from .deps import CtxDep, conn_for
 
 router = APIRouter(prefix="/api", tags=["qa"])
+
+
+class _QAStreamingResponse(StreamingResponse):
+    """断连/发送失败后主动关闭问答生成器,不依赖 GC 释放会话租约。"""
+
+    def __init__(self, content, *, qa_events, **kwargs):
+        super().__init__(content, **kwargs)
+        self._qa_events = qa_events
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            close = getattr(self._qa_events, "close", None)
+            if close is not None:
+                with CancelScope(shield=True):
+                    await run_in_threadpool(close)
 
 
 class Question(BaseModel):
@@ -23,6 +43,7 @@ class Question(BaseModel):
     document_id: str | None = None
     # 多轮对话历史:[{"role": "user"|"assistant", "content": str}],服务端只取最近 20 条
     history: list[dict] = Field(default_factory=list, max_length=50)
+    session_id: str | None = Field(default=None, pattern=r"^sess_[0-9a-f]{32}$")
 
 
 @router.post("/qa")
@@ -30,7 +51,9 @@ def ask(request: Request, body: Question, ctx: AuthContext = CtxDep):
     qa_service = request.app.state.qa_service
     try:
         result = qa_service.answer(conn_for(request), ctx, body.question, body.document_id,
-                                   history=body.history)
+                                   history=body.history, session_id=body.session_id)
+    except SessionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     if result.get("answer") is None and result.get("error"):
@@ -41,14 +64,27 @@ def ask(request: Request, body: Question, ctx: AuthContext = CtxDep):
 @router.post("/qa/stream")
 def ask_stream(request: Request, body: Question, ctx: AuthContext = CtxDep):
     qa_service = request.app.state.qa_service
-    events = qa_service.answer_stream(ctx, body.question, body.document_id, history=body.history)
+    events = qa_service.answer_stream(ctx, body.question, body.document_id,
+                                     history=body.history, session_id=body.session_id)
 
     def sse():
         for event in events:
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-    return StreamingResponse(
+    return _QAStreamingResponse(
         sse(),
+        qa_events=events,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.delete("/qa/sessions/{session_id}")
+def delete_session(request: Request, session_id: str, ctx: AuthContext = CtxDep):
+    try:
+        request.app.state.qa_service.delete_session(ctx, session_id)
+    except SessionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"deleted": True}

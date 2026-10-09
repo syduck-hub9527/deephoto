@@ -130,7 +130,8 @@ def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int 
 
 
 def build_delegating_agent(model, tools: Sequence[Callable], *, retriever_max_calls: int = 8,
-                           checker_max_calls: int = 4, backend=None, middleware=(), trace=None):
+                           checker_max_calls: int = 4, backend=None, middleware=(), trace=None,
+                           checkpointer=None, store=None):
     """backend 非 None 即启用 02 的知识库文件系统:retriever 可用 /kb/,主智能体仍只有 task。"""
     from deepagents import create_deep_agent
 
@@ -138,6 +139,10 @@ def build_delegating_agent(model, tools: Sequence[Callable], *, retriever_max_ca
 
     kb_vfs = backend is not None
     extra: dict = {}
+    if checkpointer is not None:
+        extra["checkpointer"] = checkpointer
+    if store is not None:
+        extra["store"] = store
     main_middleware = list(middleware)
     if kb_vfs:
         extra["backend"] = backend

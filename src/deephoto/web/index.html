@@ -375,11 +375,18 @@ function stageCount(s) {
 }
 
 function setScope(id) {
+  if (sending) return;
   const cur = localStorage.getItem("deephoto_scope") || "";
   localStorage.setItem("deephoto_scope", cur === id ? "" : id);
+  if (localStorage.getItem("deephoto_session")) newChat();
   refreshDocs(true);
 }
-function saveScope() { localStorage.setItem("deephoto_scope", $("scope").value); renderDocs(); }
+function saveScope() {
+  if (sending) { $("scope").value = localStorage.getItem("deephoto_scope") || ""; return; }
+  localStorage.setItem("deephoto_scope", $("scope").value);
+  if (localStorage.getItem("deephoto_session")) newChat();
+  renderDocs();
+}
 
 async function upload() {
   // multiple:顺序逐个上传,汇总成功/失败数(单文件行为不变)
@@ -404,17 +411,25 @@ async function upload() {
 }
 
 async function delDoc(id) {
+  if (sending && (localStorage.getItem("deephoto_scope") || "") === id) {
+    toast("请等待当前回答结束后再删除"); return;
+  }
   if (!confirm("删除该文档及其索引与图片?")) return;
   const r = await fetch("/api/documents/" + id, { method: "DELETE" });
   if (!r.ok) { const j = await r.json().catch(() => ({})); toast("删除失败:" + (j.detail || r.status)); }
-  if ((localStorage.getItem("deephoto_scope") || "") === id) localStorage.removeItem("deephoto_scope");
+  if ((localStorage.getItem("deephoto_scope") || "") === id && r.ok) {
+    localStorage.removeItem("deephoto_scope");
+    if (localStorage.getItem("deephoto_session")) newChat();
+  }
   refreshDocs(true);
 }
 
 // ---- 会话 ----
 function newChat() {
+  if (sending) return;
   messages = [];
   localStorage.removeItem("deephoto_chat");
+  localStorage.removeItem("deephoto_session");
   renderThread();
   $("input").focus();
 }
@@ -423,7 +438,9 @@ async function send() {
   const question = $("input").value.trim();
   if (!question || sending) return;
   sending = true; $("sendBtn").disabled = true;
-  const history = messages.map(m => ({ role: m.role, content: m.content }));
+  const sessionId = localStorage.getItem("deephoto_session") || null;
+  // 保留兼容历史,便于服务端关闭 03 后回到原模式;开启时服务端完全忽略它。
+  const history = messages.slice(-50).map(m => ({ role: m.role, content: m.content }));
   messages.push({ role: "user", content: question });
   const msg = SEG.createAssistantMessage();
   messages.push(msg);
@@ -433,7 +450,8 @@ async function send() {
     const r = await fetch("/api/qa/stream", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question,
-        document_id: localStorage.getItem("deephoto_scope") || null, history }),
+        document_id: localStorage.getItem("deephoto_scope") || null, history,
+        session_id: sessionId }),
     });
     if (!r.ok || !r.body) {
       const j = await r.json().catch(() => ({}));
@@ -467,6 +485,11 @@ async function consumeSSE(body, msg) {
       const line = raw.split("\n").find(l => l.startsWith("data:"));
       if (!line) continue;
       let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+      if (ev.type === "session") {
+        localStorage.setItem("deephoto_session", ev.session_id);
+        continue;
+      }
+      if (ev.type === "done" && !ev.session_id) localStorage.removeItem("deephoto_session");
       SEG.applyStreamEvent(msg, ev);   // token/thinking/done/warning/error 的状态迁移在 segments.js
       renderThread();   // token 级刷新;量不大,直接重渲染
     }
