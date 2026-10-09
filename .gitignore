@@ -10,3 +10,8 @@ dist/
 venv/
 md文档/
 claude-web-md/
+
+# B4 对照基线快照输出(md文档 00 §4.1)
+tests/baseline/snapshots/
+# Linux 虚拟环境(Windows 环境在 venv/)
+.venv/

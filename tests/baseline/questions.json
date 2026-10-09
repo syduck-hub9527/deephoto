@@ -1,0 +1,38 @@
+[
+  {
+    "id": "q1_text_fact",
+    "question": "什么是热氧化？硅的热氧化主要有哪几种方式，各有什么特点？",
+    "document_id": null,
+    "expect": "纯检索事实题;应命中第 4 章并给 [chunk:ID] 引用"
+  },
+  {
+    "id": "q2_read_full",
+    "question": "预淀积扩散和推进扩散有什么区别？各自的杂质浓度分布特征是什么？",
+    "document_id": null,
+    "expect": "答案跨块,预期触发 read_chunk(可能带 neighbors);对应图 3.7 一带内容"
+  },
+  {
+    "id": "q3_inspect_image",
+    "question": "图 4.1 氧化期间的氧化剂流动示意图中，氧化剂从主气流到硅片表面要经过哪几个阶段？请查看原图后回答。",
+    "document_id": null,
+    "expect": "问图中空间/流程关系,按系统提示规则 3 必须调 inspect_image"
+  },
+  {
+    "id": "q4_show_image",
+    "question": "请展示卢瑟福背散射（RBS）的示意图（图 3.19），并解释它是怎样测量样品中杂质的。",
+    "document_id": null,
+    "expect": "明确要求展示图片,正文应出现独占一行的 [image:ID] 锚点"
+  },
+  {
+    "id": "q5_unanswerable",
+    "question": "本书作者 Stephen A. Campbell 是否获得过诺贝尔奖？",
+    "document_id": null,
+    "expect": "书内无此信息;按规则 6 应明确说不知道,不得编造"
+  },
+  {
+    "id": "q6_pinned_doc",
+    "question": "这本书介绍了集成电路制造中的哪些单项工艺？",
+    "document_id": "doc_10e368f7e2ed4272ac289392",
+    "expect": "指定 document_id 路径;内容简介(第 4 页)列有单项工艺清单"
+  }
+]
