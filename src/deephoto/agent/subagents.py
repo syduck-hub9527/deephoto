@@ -93,13 +93,20 @@ def _call_limit(n: int):
 
 
 def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int = 8,
-                         checker_max_calls: int = 4, kb_vfs: bool = False) -> list[dict]:
+                         checker_max_calls: int = 4, kb_vfs: bool = False, trace=None) -> list[dict]:
     from .harness import READ_TOOLS, hide_tools_middleware
 
     by_name = {getattr(t, "__name__", getattr(t, "name", "")): t for t in tools}
     missing = {"search_knowledge", "read_chunk", "inspect_image"} - set(by_name)
     if missing:
         raise ValueError(f"缺少子智能体所需工具: {sorted(missing)}")
+
+    def trace_middleware(role):
+        if trace is None:
+            return []
+        from .middleware import ToolTraceMiddleware
+        return [ToolTraceMiddleware(trace, role)]
+
     return [
         {
             "name": RETRIEVER_NAME,
@@ -107,7 +114,7 @@ def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int 
             # kb_vfs 开启时 retriever 保留内置的 ls/read_file/glob/grep(写类由 profile 排除)
             "system_prompt": RETRIEVER_KB_PROMPT if kb_vfs else RETRIEVER_PROMPT,
             "tools": [by_name["search_knowledge"], by_name["read_chunk"]],
-            "middleware": [_call_limit(retriever_max_calls)],
+            "middleware": [_call_limit(retriever_max_calls)] + trace_middleware(RETRIEVER_NAME),
         },
         {
             "name": FIGURE_CHECKER_NAME,
@@ -116,13 +123,14 @@ def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int 
             "tools": [by_name["inspect_image"]],
             # 读类文件工具在 kb_vfs 下不再被 profile 排除,figure_checker 不需要它们
             "middleware": [_call_limit(checker_max_calls)]
+            + trace_middleware(FIGURE_CHECKER_NAME)
             + ([hide_tools_middleware(READ_TOOLS)] if kb_vfs else []),
         },
     ]
 
 
 def build_delegating_agent(model, tools: Sequence[Callable], *, retriever_max_calls: int = 8,
-                           checker_max_calls: int = 4, backend=None):
+                           checker_max_calls: int = 4, backend=None, middleware=(), trace=None):
     """backend 非 None 即启用 02 的知识库文件系统:retriever 可用 /kb/,主智能体仍只有 task。"""
     from deepagents import create_deep_agent
 
@@ -130,14 +138,18 @@ def build_delegating_agent(model, tools: Sequence[Callable], *, retriever_max_ca
 
     kb_vfs = backend is not None
     extra: dict = {}
+    main_middleware = list(middleware)
     if kb_vfs:
-        extra = {"backend": backend, "middleware": [hide_tools_middleware(READ_TOOLS)]}
+        extra["backend"] = backend
+        main_middleware.append(hide_tools_middleware(READ_TOOLS))
+    if main_middleware:
+        extra["middleware"] = main_middleware
     return create_deep_agent(
         model=model,
         tools=[],    # 业务工具全部下放给子智能体;主智能体只有 task
         system_prompt=DELEGATING_SYSTEM_PROMPT,
         subagents=build_subagent_specs(
             tools, retriever_max_calls=retriever_max_calls, checker_max_calls=checker_max_calls,
-            kb_vfs=kb_vfs),
+            kb_vfs=kb_vfs, trace=trace),
         **extra,
     )

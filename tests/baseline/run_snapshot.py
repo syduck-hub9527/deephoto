@@ -162,6 +162,7 @@ def main() -> None:
             "tool_calls": box["log"],
             "answer": result.get("answer"),
             "error": result.get("error"),
+            "tool_trace": result.get("tool_trace"),
             "citations": [
                 {"chunk_id": c["chunk_id"], "page": c["page"], "page_end": c["page_end"],
                  "label": c["label"]}
@@ -180,7 +181,9 @@ def main() -> None:
     versions = {name: _pkg_version(name) for name in
                 ("deepagents", "langchain", "langchain-core", "langchain-openai", "langgraph")}
     flags = {"qa_subagents_enabled": getattr(settings, "qa_subagents_enabled", False),
-             "qa_kb_vfs_enabled": getattr(settings, "qa_kb_vfs_enabled", False)}
+             "qa_kb_vfs_enabled": getattr(settings, "qa_kb_vfs_enabled", False),
+             "qa_middleware_enabled": getattr(settings, "qa_middleware_enabled", False),
+             "qa_main_max_model_calls": getattr(settings, "qa_main_max_model_calls", 12)}
     snapshot = {
         "meta": {
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -195,7 +198,8 @@ def main() -> None:
     }
     SNAPSHOT_DIR.mkdir(exist_ok=True)
     suffix = ("-subagents" if flags["qa_subagents_enabled"] else "") + \
-             ("-kbvfs" if flags["qa_kb_vfs_enabled"] else "")
+             ("-kbvfs" if flags["qa_kb_vfs_enabled"] else "") + \
+             ("-middleware" if flags["qa_middleware_enabled"] else "")
     out = SNAPSHOT_DIR / (f"snapshot-{time.strftime('%Y%m%d-%H%M%S')}"
                           f"-deepagents-{versions.get('deepagents') or 'unknown'}{suffix}.json")
     out.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")

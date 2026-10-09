@@ -57,23 +57,9 @@ def register_harness(chat_model: str, *, delegating: bool, kb_vfs: bool) -> None
 def hide_tools_middleware(names: frozenset[str] | set[str]):
     """只对**某一个**智能体隐藏工具(profile 是按模型全局生效的,做不到"主智能体看不到、子智能体看得到")。
 
-    注意:这只是从模型请求里摘掉工具定义;工具仍注册在执行节点上。模型看不到就不会调用。
+    注意:这只是从模型请求里摘掉工具定义;工具仍注册在执行节点上,模型仍可能构造调用。
+    执行边界依赖 profile 排除与后端权限校验,不能把隐藏当作权限控制。
     """
-    from langchain.agents.middleware import AgentMiddleware
+    from .middleware import HideToolsMiddleware
 
-    hidden = frozenset(names)
-
-    def _tool_name(t: Any) -> str | None:
-        n = t.get("name") if isinstance(t, dict) else getattr(t, "name", None)
-        return n if isinstance(n, str) else None
-
-    class HideToolsMiddleware(AgentMiddleware):
-        def wrap_model_call(self, request, handler):
-            return handler(request.override(
-                tools=[t for t in request.tools if _tool_name(t) not in hidden]))
-
-        async def awrap_model_call(self, request, handler):
-            return await handler(request.override(
-                tools=[t for t in request.tools if _tool_name(t) not in hidden]))
-
-    return HideToolsMiddleware()
+    return HideToolsMiddleware(names)

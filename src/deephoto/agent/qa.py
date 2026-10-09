@@ -97,12 +97,15 @@ class QAService:
         if document_id and not self.knowledge.allowed_document_ids(conn, ctx, document_id):
             return {"error": "文档不存在、无权限或尚未处理完成", "answer": None, "citations": [], "images": []}
         tools, tracker = self._make_tools(ctx)
-        agent = self._build_agent(tools, **self._agent_kwargs(ctx, tracker))
+        agent_kwargs = self._agent_kwargs(ctx, tracker)
+        agent = self._build_agent(tools, **agent_kwargs)
         messages = _build_messages(question, document_id, history)
         result = agent.invoke({"messages": messages}, **self._run_kwargs())
         answer_text = _final_answer_text(result.get("messages", []))
         extra_chunks, extra_images = _history_cited_ids(history)
-        return self._assemble(conn, ctx, answer_text, question, tracker, extra_chunks, extra_images)
+        assembled = self._assemble(conn, ctx, answer_text, question, tracker, extra_chunks, extra_images)
+        self._attach_trace(assembled, agent_kwargs)
+        return assembled
 
     # ---- 流式(SSE)----
 
@@ -123,7 +126,8 @@ class QAService:
             return
 
         tools, tracker = self._make_tools(ctx)
-        agent = self._build_agent(tools, **self._agent_kwargs(ctx, tracker))
+        agent_kwargs = self._agent_kwargs(ctx, tracker)
+        agent = self._build_agent(tools, **agent_kwargs)
         messages = _build_messages(question, document_id, history)
 
         answer_parts: list[str] = []
@@ -166,6 +170,7 @@ class QAService:
         result = self._assemble(connect(db_path), ctx, answer_text, question, tracker,
                                 extra_chunks, extra_images)
         result["type"] = "done"
+        self._attach_trace(result, agent_kwargs)
         yield result
 
     # ---- 公共部分 ----
@@ -177,11 +182,23 @@ class QAService:
     def _kb_vfs(self) -> bool:
         return bool(getattr(self.settings, "qa_kb_vfs_enabled", False))
 
+    def _middleware_enabled(self) -> bool:
+        return bool(getattr(self.settings, "qa_middleware_enabled", False))
+
+    @staticmethod
+    def _attach_trace(result: dict, agent_kwargs: dict) -> None:
+        if trace := agent_kwargs.get("trace"):
+            result["tool_trace"] = trace.snapshot()
+
     def _agent_kwargs(self, ctx: AuthContext, tracker: dict) -> dict:
-        """知识库文件系统开启时,给 _build_agent 传请求级 backend;关闭时返回空字典,
-        _build_agent(tools) 的调用形态与升级前一致(现有测试把它替换成单参数 lambda)。"""
+        """按开关传请求级 backend / trace;02 与 04 都关闭时返回空字典,
+        保持 _build_agent(tools) 形态(现有测试会替换为单参数 lambda)。"""
+        kwargs: dict = {}
+        if self._middleware_enabled():
+            from .middleware import ToolTrace
+            kwargs["trace"] = ToolTrace()
         if not self._kb_vfs():
-            return {}
+            return kwargs
         from .kb_vfs import KB_ROUTE, KnowledgeVFS
         from deepagents.backends import CompositeBackend, StateBackend
 
@@ -190,9 +207,21 @@ class QAService:
                            grep_max_docs=getattr(self.settings, "qa_kb_grep_max_docs", 300))
         # 默认后端 = 临时 StateBackend:deepagents 会把超大工具结果转存到 /large_tool_results/,
         # 这些路径必须可写;/kb/ 只读且按请求(租户)构造。
-        return {"backend": CompositeBackend(default=StateBackend(), routes={KB_ROUTE: vfs})}
+        kwargs["backend"] = CompositeBackend(default=StateBackend(), routes={KB_ROUTE: vfs})
+        return kwargs
 
-    def _build_agent(self, tools, backend=None):
+    def _build_agent(self, tools, backend=None, trace=None):
+        middleware = []
+        if self._middleware_enabled():
+            from langchain.agents.middleware import ModelCallLimitMiddleware
+            from .middleware import ToolTraceMiddleware
+
+            # 固定版本实测:end 的合成 AIMessage 同时出现在终态与 messages 流,
+            # 因此沿用现有 answer / SSE done 路径,不额外生成一次付费回答。
+            middleware.append(ModelCallLimitMiddleware(
+                run_limit=getattr(self.settings, "qa_main_max_model_calls", 12), exit_behavior="end"))
+            if trace is not None:
+                middleware.append(ToolTraceMiddleware(trace, "main"))
         if self._delegating():
             from . import subagents
 
@@ -202,16 +231,17 @@ class QAService:
                 self._model(), tools,
                 retriever_max_calls=getattr(self.settings, "qa_retriever_max_model_calls", 8),
                 checker_max_calls=getattr(self.settings, "qa_checker_max_model_calls", 4),
-                backend=backend)
+                backend=backend, middleware=middleware, trace=trace)
 
         from deepagents import create_deep_agent
 
+        extra = {"middleware": middleware} if middleware else {}
         if self._kb_vfs():
             if not self._harness_registered:
                 self._register_harness()
             return create_deep_agent(model=self._model(), tools=tools,
-                                     system_prompt=SYSTEM_PROMPT_KB, backend=backend)
-        return create_deep_agent(model=self._model(), tools=tools, system_prompt=SYSTEM_PROMPT)
+                                     system_prompt=SYSTEM_PROMPT_KB, backend=backend, **extra)
+        return create_deep_agent(model=self._model(), tools=tools, system_prompt=SYSTEM_PROMPT, **extra)
 
     def _register_harness(self) -> None:
         from .harness import register_harness

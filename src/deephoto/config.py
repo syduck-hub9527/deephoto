@@ -180,6 +180,10 @@ class Settings:
     qa_kb_vfs_enabled: bool = False
     qa_kb_grep_max_docs: int = 300     # 单次 grep 最多覆盖的文档数(每次都要整篇渲染进内存)
 
+    # 04:工具轨迹 + 主智能体调用上限;默认关闭,返回契约保持原样
+    qa_middleware_enabled: bool = False
+    qa_main_max_model_calls: int = 12
+
     @property
     def embeddings_enabled(self) -> bool:
         return bool(self.embedding_base_url and self.embedding_model)
@@ -221,6 +225,8 @@ def load_settings() -> Settings:
         qa_main_recursion_limit=_get_int("QA_MAIN_RECURSION_LIMIT", 40, minimum=10),
         qa_kb_vfs_enabled=_get_bool("QA_KB_VFS_ENABLED", False),
         qa_kb_grep_max_docs=_get_int("QA_KB_GREP_MAX_DOCS", 300, minimum=1),
+        qa_middleware_enabled=_get_bool("QA_MIDDLEWARE_ENABLED", False),
+        qa_main_max_model_calls=_get_int("QA_MAIN_MAX_MODEL_CALLS", 12, minimum=2),
         description_enabled=_get_bool("DESCRIPTION_ENABLED", False),
         description_api_key=_get("DESCRIPTION_API_KEY"),
         description_base_url=_get("DESCRIPTION_BASE_URL"),
