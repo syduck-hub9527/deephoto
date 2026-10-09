@@ -1,0 +1,20 @@
+[
+  {
+    "id": "kb1_literal",
+    "question": "热生长的二氧化硅（SiO₂）薄膜的折射率是多少？氮化硅的折射率又是多少？",
+    "document_id": null,
+    "expect": "字面数值题(表4.2:SiO2 折射率 1.48,氮化硅 1.97);检验 grep 字面匹配与 read_file 取块头"
+  },
+  {
+    "id": "kb2_sequential",
+    "question": "在集成电路制造中，二氧化硅层有哪几种用途？请按书中顺序逐一说明。",
+    "document_id": null,
+    "expect": "通读题:第4章开头对氧化层用途的列举;检验 read_file 顺序通读(offset/limit 翻页)"
+  },
+  {
+    "id": "kb3_figures_list",
+    "question": "这本书里与硅的氧化相关的图有哪些？请列出图号和图注。",
+    "document_id": null,
+    "expect": "清单题:figures.md 全量清单 vs search_knowledge top-k 截断的对比点"
+  }
+]

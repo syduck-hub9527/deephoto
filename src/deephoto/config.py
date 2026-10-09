@@ -176,6 +176,9 @@ class Settings:
     qa_retriever_max_model_calls: int = 8    # 单次检索子智能体最多模型调用数(子智能体自带 9999,必须显式限)
     qa_checker_max_model_calls: int = 4
     qa_main_recursion_limit: int = 40
+    # 知识库虚拟文件系统(开发文档 02):默认关闭;开启后智能体获得只读的 /kb/(ls/read_file/glob/grep)
+    qa_kb_vfs_enabled: bool = False
+    qa_kb_grep_max_docs: int = 300     # 单次 grep 最多覆盖的文档数(每次都要整篇渲染进内存)
 
     @property
     def embeddings_enabled(self) -> bool:
@@ -216,6 +219,8 @@ def load_settings() -> Settings:
         qa_retriever_max_model_calls=_get_int("QA_RETRIEVER_MAX_MODEL_CALLS", 8, minimum=2),
         qa_checker_max_model_calls=_get_int("QA_CHECKER_MAX_MODEL_CALLS", 4, minimum=2),
         qa_main_recursion_limit=_get_int("QA_MAIN_RECURSION_LIMIT", 40, minimum=10),
+        qa_kb_vfs_enabled=_get_bool("QA_KB_VFS_ENABLED", False),
+        qa_kb_grep_max_docs=_get_int("QA_KB_GREP_MAX_DOCS", 300, minimum=1),
         description_enabled=_get_bool("DESCRIPTION_ENABLED", False),
         description_api_key=_get("DESCRIPTION_API_KEY"),
         description_base_url=_get("DESCRIPTION_BASE_URL"),

@@ -59,6 +59,21 @@ CITATION_AND_FORMAT_RULES = (
 
 SYSTEM_PROMPT = _RETRIEVAL_RULES + CITATION_AND_FORMAT_RULES
 
+# 02:知识库文件系统(/kb/,只读)的使用说明。单智能体模式插在规则 3 与规则 4 之间;
+# 委派模式只给 retriever(见 subagents.RETRIEVER_KB_PROMPT)。开关关闭时不出现,SYSTEM_PROMPT 不变。
+KB_USAGE_RULES = (
+    "知识库文件系统(只读,挂载在 /kb/;ls、read_file、glob、grep 只能读它,不能写):\n"
+    "- /kb/index.md 是文档清单;/kb/<document_id>/content.md 是按阅读顺序排列的全文,"
+    "每个块以“### [chunk:ID] 位置”开头;/kb/<document_id>/figures.md 是图片的文字清单。\n"
+    "- grep 是**字面**匹配(不是语义检索,区分大小写),适合精确术语、数字、型号、符号、图号;"
+    "用 path 限定到某个 content.md;grep 默认只列文件名,要看命中行必须传 output_mode=\"content\"。命中行不一定带块头:要引用时,用 read_file 的 offset=命中行号-1 读该处,"
+    "读到的窗口会自动从所在块的块头开始。\n"
+    "- read_file 可顺序通读并用 offset/limit 翻页;答案跨块时优先通读而不是反复检索。\n"
+    "- figures.md 只有图的文字描述,核对图内细节仍必须用 inspect_image 看原图。\n"
+    "- 只能引用在块头/图头或工具结果里实际出现过的 ID。\n"
+)
+SYSTEM_PROMPT_KB = _RETRIEVAL_RULES + KB_USAGE_RULES + CITATION_AND_FORMAT_RULES
+
 _CITE_CHUNK_RE = re.compile(r"\[chunk:([A-Za-z0-9_]+)\]")
 _CITE_IMAGE_RE = re.compile(r"\[image:([A-Za-z0-9_]+)\]")
 
@@ -82,7 +97,7 @@ class QAService:
         if document_id and not self.knowledge.allowed_document_ids(conn, ctx, document_id):
             return {"error": "文档不存在、无权限或尚未处理完成", "answer": None, "citations": [], "images": []}
         tools, tracker = self._make_tools(ctx)
-        agent = self._build_agent(tools)
+        agent = self._build_agent(tools, **self._agent_kwargs(ctx, tracker))
         messages = _build_messages(question, document_id, history)
         result = agent.invoke({"messages": messages}, **self._run_kwargs())
         answer_text = _final_answer_text(result.get("messages", []))
@@ -108,7 +123,7 @@ class QAService:
             return
 
         tools, tracker = self._make_tools(ctx)
-        agent = self._build_agent(tools)
+        agent = self._build_agent(tools, **self._agent_kwargs(ctx, tracker))
         messages = _build_messages(question, document_id, history)
 
         answer_parts: list[str] = []
@@ -159,21 +174,50 @@ class QAService:
         # settings 在部分测试里是 SimpleNamespace,取值要带默认;默认关闭 = 升级前行为
         return bool(getattr(self.settings, "qa_subagents_enabled", False))
 
-    def _build_agent(self, tools):
+    def _kb_vfs(self) -> bool:
+        return bool(getattr(self.settings, "qa_kb_vfs_enabled", False))
+
+    def _agent_kwargs(self, ctx: AuthContext, tracker: dict) -> dict:
+        """知识库文件系统开启时,给 _build_agent 传请求级 backend;关闭时返回空字典,
+        _build_agent(tools) 的调用形态与升级前一致(现有测试把它替换成单参数 lambda)。"""
+        if not self._kb_vfs():
+            return {}
+        from .kb_vfs import KB_ROUTE, KnowledgeVFS
+        from deepagents.backends import CompositeBackend, StateBackend
+
+        db_path = self.settings.db_path
+        vfs = KnowledgeVFS(self.knowledge, ctx, lambda: connect(db_path), tracker,
+                           grep_max_docs=getattr(self.settings, "qa_kb_grep_max_docs", 300))
+        # 默认后端 = 临时 StateBackend:deepagents 会把超大工具结果转存到 /large_tool_results/,
+        # 这些路径必须可写;/kb/ 只读且按请求(租户)构造。
+        return {"backend": CompositeBackend(default=StateBackend(), routes={KB_ROUTE: vfs})}
+
+    def _build_agent(self, tools, backend=None):
         if self._delegating():
             from . import subagents
 
             if not self._harness_registered:
-                subagents.register_harness(self.settings.chat_model)
-                self._harness_registered = True
+                self._register_harness()
             return subagents.build_delegating_agent(
                 self._model(), tools,
                 retriever_max_calls=getattr(self.settings, "qa_retriever_max_model_calls", 8),
-                checker_max_calls=getattr(self.settings, "qa_checker_max_model_calls", 4))
+                checker_max_calls=getattr(self.settings, "qa_checker_max_model_calls", 4),
+                backend=backend)
 
         from deepagents import create_deep_agent
 
+        if self._kb_vfs():
+            if not self._harness_registered:
+                self._register_harness()
+            return create_deep_agent(model=self._model(), tools=tools,
+                                     system_prompt=SYSTEM_PROMPT_KB, backend=backend)
         return create_deep_agent(model=self._model(), tools=tools, system_prompt=SYSTEM_PROMPT)
+
+    def _register_harness(self) -> None:
+        from .harness import register_harness
+
+        register_harness(self.settings.chat_model, delegating=self._delegating(), kb_vfs=self._kb_vfs())
+        self._harness_registered = True
 
     def _run_kwargs(self) -> dict:
         """委派模式显式限制主智能体步数(默认 9999)。关闭时返回空字典:

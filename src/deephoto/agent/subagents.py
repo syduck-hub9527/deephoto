@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Callable, Sequence
 
-from .qa import CITATION_AND_FORMAT_RULES
+from .qa import CITATION_AND_FORMAT_RULES, KB_USAGE_RULES
 
 _FS_TOOLS = frozenset({"ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute"})
 
@@ -73,22 +73,16 @@ DELEGATING_RULES = (
 DELEGATING_SYSTEM_PROMPT = DELEGATING_RULES + CITATION_AND_FORMAT_RULES
 
 
-def register_harness(chat_model: str) -> None:
-    """按 openai:<chat_model> 注册 profile:去掉内置文件工具与 general-purpose 子智能体。
+def register_harness(chat_model: str, *, kb_vfs: bool = False) -> None:
+    """委派模式的 profile 注册;实现在 harness.py(01 与 02 共用同一个排除集合计算)。"""
+    from .harness import register_harness as _register
 
-    注册是进程内全局、可叠加(重复注册合并),因此只在开启委派模式时调用,
-    关闭时单智能体路径保持升级前的行为。
-    """
-    from deepagents import HarnessProfile, register_harness_profile
-    from deepagents.profiles import GeneralPurposeSubagentProfile
+    _register(chat_model, delegating=True, kb_vfs=kb_vfs)
 
-    register_harness_profile(
-        f"openai:{chat_model}",
-        HarnessProfile(
-            excluded_tools=_FS_TOOLS,
-            general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-        ),
-    )
+
+# 02:retriever 额外获得只读 /kb/ 文件系统时,把使用说明插在"固定格式"要求之前(RETRIEVER_PROMPT 本身不变)
+_head, _sep, _tail = RETRIEVER_PROMPT.partition("4. 最终回复")
+RETRIEVER_KB_PROMPT = _head + KB_USAGE_RULES + _sep + _tail
 
 
 def _call_limit(n: int):
@@ -99,7 +93,9 @@ def _call_limit(n: int):
 
 
 def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int = 8,
-                         checker_max_calls: int = 4) -> list[dict]:
+                         checker_max_calls: int = 4, kb_vfs: bool = False) -> list[dict]:
+    from .harness import READ_TOOLS, hide_tools_middleware
+
     by_name = {getattr(t, "__name__", getattr(t, "name", "")): t for t in tools}
     missing = {"search_knowledge", "read_chunk", "inspect_image"} - set(by_name)
     if missing:
@@ -108,7 +104,8 @@ def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int 
         {
             "name": RETRIEVER_NAME,
             "description": RETRIEVER_DESCRIPTION,
-            "system_prompt": RETRIEVER_PROMPT,
+            # kb_vfs 开启时 retriever 保留内置的 ls/read_file/glob/grep(写类由 profile 排除)
+            "system_prompt": RETRIEVER_KB_PROMPT if kb_vfs else RETRIEVER_PROMPT,
             "tools": [by_name["search_knowledge"], by_name["read_chunk"]],
             "middleware": [_call_limit(retriever_max_calls)],
         },
@@ -117,19 +114,30 @@ def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int 
             "description": FIGURE_CHECKER_DESCRIPTION,
             "system_prompt": FIGURE_CHECKER_PROMPT,
             "tools": [by_name["inspect_image"]],
-            "middleware": [_call_limit(checker_max_calls)],
+            # 读类文件工具在 kb_vfs 下不再被 profile 排除,figure_checker 不需要它们
+            "middleware": [_call_limit(checker_max_calls)]
+            + ([hide_tools_middleware(READ_TOOLS)] if kb_vfs else []),
         },
     ]
 
 
 def build_delegating_agent(model, tools: Sequence[Callable], *, retriever_max_calls: int = 8,
-                           checker_max_calls: int = 4):
+                           checker_max_calls: int = 4, backend=None):
+    """backend 非 None 即启用 02 的知识库文件系统:retriever 可用 /kb/,主智能体仍只有 task。"""
     from deepagents import create_deep_agent
 
+    from .harness import READ_TOOLS, hide_tools_middleware
+
+    kb_vfs = backend is not None
+    extra: dict = {}
+    if kb_vfs:
+        extra = {"backend": backend, "middleware": [hide_tools_middleware(READ_TOOLS)]}
     return create_deep_agent(
         model=model,
         tools=[],    # 业务工具全部下放给子智能体;主智能体只有 task
         system_prompt=DELEGATING_SYSTEM_PROMPT,
         subagents=build_subagent_specs(
-            tools, retriever_max_calls=retriever_max_calls, checker_max_calls=checker_max_calls),
+            tools, retriever_max_calls=retriever_max_calls, checker_max_calls=checker_max_calls,
+            kb_vfs=kb_vfs),
+        **extra,
     )
