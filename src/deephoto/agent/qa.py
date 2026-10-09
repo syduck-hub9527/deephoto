@@ -31,13 +31,17 @@ from .locator import locator_label
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = (
+_RETRIEVAL_RULES = (
     "你是文档知识库问答助手。回答当前用户的问题时遵守:\n"
     "1. 先用 search_knowledge 检索文档(用户指定了文档就传该 document_id,否则检索全部可访问文档)。\n"
     "2. search_knowledge 返回的正文若 truncated 为 true 且与问题相关,必须先用 read_chunk 读取全文再作答;\n"
     "   答案可能跨块或跨页时,用 read_chunk 的 neighbors=1 一并读取前后块。不要只凭截断的开头下结论。\n"
     "3. 当问题涉及图中的标签、箭头、数值、颜色或空间关系时,必须用 inspect_image 查看完整原图后再作答;"
     "不要只凭图片的文字描述下结论。\n"
+)
+
+# 规则 4-8(引用格式、出处、证据图、公式):单智能体与委派模式共用,保证两条路径的输出契约一致
+CITATION_AND_FORMAT_RULES = (
     "4. 引用证据必须使用固定格式:正文 [chunk:chunk_id],图片 [image:image_occurrence_id];"
     "只能引用工具返回过的 ID,不得编造页码、图号或图片。\n"
     "5. 出处位置由界面根据 [chunk:ID] 自动标注:不要在正文里再手写页码/幻灯片号/章节号,\n"
@@ -53,6 +57,8 @@ SYSTEM_PROMPT = (
     "不要把公式放进代码块,也不要用纯文本或 Unicode 拼凑公式。金额里的美元符号写成 \\$。"
 )
 
+SYSTEM_PROMPT = _RETRIEVAL_RULES + CITATION_AND_FORMAT_RULES
+
 _CITE_CHUNK_RE = re.compile(r"\[chunk:([A-Za-z0-9_]+)\]")
 _CITE_IMAGE_RE = re.compile(r"\[image:([A-Za-z0-9_]+)\]")
 
@@ -62,6 +68,7 @@ class QAService:
         self.settings = settings
         self.knowledge = knowledge
         self._chat_model = None
+        self._harness_registered = False
 
     def _model(self):
         if self._chat_model is None:
@@ -77,7 +84,7 @@ class QAService:
         tools, tracker = self._make_tools(ctx)
         agent = self._build_agent(tools)
         messages = _build_messages(question, document_id, history)
-        result = agent.invoke({"messages": messages})
+        result = agent.invoke({"messages": messages}, **self._run_kwargs())
         answer_text = _final_answer_text(result.get("messages", []))
         extra_chunks, extra_images = _history_cited_ids(history)
         return self._assemble(conn, ctx, answer_text, question, tracker, extra_chunks, extra_images)
@@ -108,7 +115,7 @@ class QAService:
         stream_broken: str | None = None
         seen_chunks = 0
         try:
-            for chunk, _metadata in agent.stream({"messages": messages}, stream_mode="messages"):
+            for chunk, _metadata in agent.stream({"messages": messages}, stream_mode="messages", **self._run_kwargs()):
                 seen_chunks += 1
                 # 只流式 AI 增量:ToolMessage(Chunk) 的 content 是工具返回的 JSON/图片块,必须排除。
                 # 注意 langchain-core 中 AIMessageChunk.type == "AIMessageChunk"(非 "ai")
@@ -148,10 +155,32 @@ class QAService:
 
     # ---- 公共部分 ----
 
+    def _delegating(self) -> bool:
+        # settings 在部分测试里是 SimpleNamespace,取值要带默认;默认关闭 = 升级前行为
+        return bool(getattr(self.settings, "qa_subagents_enabled", False))
+
     def _build_agent(self, tools):
+        if self._delegating():
+            from . import subagents
+
+            if not self._harness_registered:
+                subagents.register_harness(self.settings.chat_model)
+                self._harness_registered = True
+            return subagents.build_delegating_agent(
+                self._model(), tools,
+                retriever_max_calls=getattr(self.settings, "qa_retriever_max_model_calls", 8),
+                checker_max_calls=getattr(self.settings, "qa_checker_max_model_calls", 4))
+
         from deepagents import create_deep_agent
 
         return create_deep_agent(model=self._model(), tools=tools, system_prompt=SYSTEM_PROMPT)
+
+    def _run_kwargs(self) -> dict:
+        """委派模式显式限制主智能体步数(默认 9999)。关闭时返回空字典:
+        调用形态与升级前逐字一致(不传 config)。"""
+        if self._delegating():
+            return {"config": {"recursion_limit": getattr(self.settings, "qa_main_recursion_limit", 40)}}
+        return {}
 
     def _make_tools(self, ctx: AuthContext):
         """构造绑定请求上下文的工具;tracker 由工具副作用记录实际提供过的证据 ID。"""

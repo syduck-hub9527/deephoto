@@ -171,6 +171,12 @@ class Settings:
     max_zip_uncompressed_mb: int = 500   # OOXML(zip)解压总量上限(防压缩炸弹)
     mineru_no_ocr_formats: frozenset = frozenset()  # 这些格式走 MinerU 时 is_ocr=False(§3.4a)
 
+    # 问答委派模式(开发文档 01-subagents):默认关闭 = 单智能体,行为与升级前一致
+    qa_subagents_enabled: bool = False
+    qa_retriever_max_model_calls: int = 8    # 单次检索子智能体最多模型调用数(子智能体自带 9999,必须显式限)
+    qa_checker_max_model_calls: int = 4
+    qa_main_recursion_limit: int = 40
+
     @property
     def embeddings_enabled(self) -> bool:
         return bool(self.embedding_base_url and self.embedding_model)
@@ -206,6 +212,10 @@ def load_settings() -> Settings:
         mineru_api_key=_get("MINERU_API_KEY"),
         mineru_base_url=_get("MINERU_BASE_URL"),
         mineru_dump_dir=_get("MINERU_DUMP_DIR"),
+        qa_subagents_enabled=_get_bool("QA_SUBAGENTS_ENABLED", False),
+        qa_retriever_max_model_calls=_get_int("QA_RETRIEVER_MAX_MODEL_CALLS", 8, minimum=2),
+        qa_checker_max_model_calls=_get_int("QA_CHECKER_MAX_MODEL_CALLS", 4, minimum=2),
+        qa_main_recursion_limit=_get_int("QA_MAIN_RECURSION_LIMIT", 40, minimum=10),
         description_enabled=_get_bool("DESCRIPTION_ENABLED", False),
         description_api_key=_get("DESCRIPTION_API_KEY"),
         description_base_url=_get("DESCRIPTION_BASE_URL"),
