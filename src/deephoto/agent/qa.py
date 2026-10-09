@@ -116,7 +116,7 @@ class QAService:
         self._attach_persistence(agent_kwargs, turn)
         agent = self._build_agent(tools, **agent_kwargs)
         messages = _build_messages(question, document_id, history)
-        result = agent.invoke({"messages": messages}, **self._invoke_kwargs(turn))
+        result = agent.invoke(self._graph_input(messages), **self._invoke_kwargs(turn))
         answer_text = _final_answer_text(result.get("messages", []))
         extra_chunks, extra_images = (self._session_cited_ids(conn, ctx, turn)
                                       if turn is not None else _history_cited_ids(history))
@@ -167,7 +167,7 @@ class QAService:
         stream_broken: str | None = None
         seen_chunks = 0
         try:
-            for chunk, _metadata in agent.stream({"messages": messages}, stream_mode="messages", **self._invoke_kwargs(turn)):
+            for chunk, _metadata in agent.stream(self._graph_input(messages), stream_mode="messages", **self._invoke_kwargs(turn)):
                 seen_chunks += 1
                 # 只流式 AI 增量:ToolMessage(Chunk) 的 content 是工具返回的 JSON/图片块,必须排除。
                 # 注意 langchain-core 中 AIMessageChunk.type == "AIMessageChunk"(非 "ai")
@@ -223,6 +223,25 @@ class QAService:
     def _persistence_enabled(self) -> bool:
         return bool(getattr(self.settings, "qa_persistence_enabled", False))
 
+    def _skills_enabled(self) -> bool:
+        return bool(getattr(self.settings, "qa_skills_enabled", False))
+
+    def _memory_enabled(self) -> bool:
+        return bool(getattr(self.settings, "qa_memory_enabled", False))
+
+    def preference_memory(self):
+        if not self._memory_enabled() or not self._persistence_enabled():
+            raise RuntimeError("回答偏好需要同时启用 QA_MEMORY_ENABLED 与 QA_PERSISTENCE_ENABLED")
+        from .context import PreferenceMemory
+        return PreferenceMemory(self._sessions())
+
+    def _graph_input(self, messages) -> dict:
+        result = {"messages": messages}
+        if self._skills_enabled():
+            # 固定版本 skills_metadata 是线程缓存;每轮明确重新加载当前包的技能目录。
+            result["skills_metadata"] = None
+        return result
+
     def _sessions(self):
         from .persistence import QAPersistence
 
@@ -236,9 +255,14 @@ class QAService:
             return self._session_runtime
 
     def _session_profile(self) -> dict:
-        return {"schema": 1, "model": getattr(self.settings, "chat_model", ""),
-                "subagents": self._delegating(), "kb_vfs": self._kb_vfs(),
-                "middleware": self._middleware_enabled()}
+        profile = {"schema": 1, "model": getattr(self.settings, "chat_model", ""),
+                   "subagents": self._delegating(), "kb_vfs": self._kb_vfs(),
+                   "middleware": self._middleware_enabled()}
+        if self._skills_enabled() or self._memory_enabled():
+            from .context import skill_revision
+            profile.update(schema=2, skills=self._skills_enabled(), memory=self._memory_enabled(),
+                           skill_revision=skill_revision() if self._skills_enabled() else None)
+        return profile
 
     @staticmethod
     def _attach_persistence(kwargs: dict, turn) -> None:
@@ -285,27 +309,41 @@ class QAService:
             result["tool_trace"] = trace.snapshot()
 
     def _agent_kwargs(self, ctx: AuthContext, tracker: dict) -> dict:
-        """按开关传请求级 backend / trace;02 与 04 都关闭时返回空字典,
+        """按开关传请求级 backend / trace;02/04/05 都关闭时返回空字典,
         保持 _build_agent(tools) 形态(现有测试会替换为单参数 lambda)。"""
         kwargs: dict = {}
         if self._middleware_enabled():
             from .middleware import ToolTrace
             kwargs["trace"] = ToolTrace()
-        if not self._kb_vfs():
-            return kwargs
-        from .kb_vfs import KB_ROUTE, KnowledgeVFS
-        from deepagents.backends import CompositeBackend, StateBackend
-
-        db_path = self.settings.db_path
-        vfs = KnowledgeVFS(self.knowledge, ctx, lambda: connect(db_path), tracker,
-                           grep_max_docs=getattr(self.settings, "qa_kb_grep_max_docs", 300))
-        # 默认后端 = StateBackend:超大工具结果转存到 /large_tool_results/。
-        # 03 开启时这些文件随 checkpoint 持久化;/kb/ 只读且按请求(租户)构造。
-        kwargs["backend"] = CompositeBackend(default=StateBackend(), routes={KB_ROUTE: vfs})
+        routes = {}
+        if self._kb_vfs():
+            from .kb_vfs import KB_ROUTE, KnowledgeVFS
+            db_path = self.settings.db_path
+            routes[KB_ROUTE] = KnowledgeVFS(
+                self.knowledge, ctx, lambda: connect(db_path), tracker,
+                grep_max_docs=getattr(self.settings, "qa_kb_grep_max_docs", 300))
+        if self._skills_enabled():
+            from .context import SKILLS_ROUTE, skills_backend, skill_sources
+            routes[SKILLS_ROUTE] = skills_backend()
+            kwargs["skills"] = skill_sources("main")
+        if self._memory_enabled():
+            from .context import MEMORY_ROUTE
+            routes[MEMORY_ROUTE] = self.preference_memory().snapshot(ctx)
+            kwargs["memory_enabled"] = True
+        if routes:
+            from deepagents.backends import CompositeBackend, StateBackend
+            # 默认仍可写:大工具结果和摘要历史转存不应落入只读挂载。
+            kwargs["backend"] = CompositeBackend(default=StateBackend(), routes=routes)
         return kwargs
 
-    def _build_agent(self, tools, backend=None, trace=None, checkpointer=None, store=None):
+    def _build_agent(self, tools, backend=None, trace=None, checkpointer=None, store=None,
+                     skills=None, memory_enabled=False):
         middleware = []
+        memory_sources = None
+        if memory_enabled:
+            from .context import FreshMemoryMiddleware, MEMORY_PATH
+            middleware.append(FreshMemoryMiddleware(backend))
+            memory_sources = [MEMORY_PATH]
         if self._middleware_enabled():
             from langchain.agents.middleware import ModelCallLimitMiddleware
             from .middleware import ToolTraceMiddleware
@@ -326,7 +364,8 @@ class QAService:
                 retriever_max_calls=getattr(self.settings, "qa_retriever_max_model_calls", 8),
                 checker_max_calls=getattr(self.settings, "qa_checker_max_model_calls", 4),
                 backend=backend, middleware=middleware, trace=trace,
-                checkpointer=checkpointer, store=store)
+                checkpointer=checkpointer, store=store, kb_vfs=self._kb_vfs(), skills=skills,
+                memory=memory_sources)
 
         from deepagents import create_deep_agent
 
@@ -335,17 +374,23 @@ class QAService:
             extra["checkpointer"] = checkpointer
         if store is not None:
             extra["store"] = store
-        if self._kb_vfs():
+        if skills is not None:
+            extra["skills"] = skills
+        if memory_sources is not None:
+            extra["memory"] = memory_sources
+        if backend is not None:
+            extra["backend"] = backend
+        if self._kb_vfs() or skills is not None:
             if not self._harness_registered:
                 self._register_harness()
-            return create_deep_agent(model=self._model(), tools=tools,
-                                     system_prompt=SYSTEM_PROMPT_KB, backend=backend, **extra)
-        return create_deep_agent(model=self._model(), tools=tools, system_prompt=SYSTEM_PROMPT, **extra)
+        return create_deep_agent(model=self._model(), tools=tools,
+                                 system_prompt=SYSTEM_PROMPT_KB if self._kb_vfs() else SYSTEM_PROMPT, **extra)
 
     def _register_harness(self) -> None:
         from .harness import register_harness
 
-        register_harness(self.settings.chat_model, delegating=self._delegating(), kb_vfs=self._kb_vfs())
+        register_harness(self.settings.chat_model, delegating=self._delegating(), kb_vfs=self._kb_vfs(),
+                         skills=self._skills_enabled())
         self._harness_registered = True
 
     def _run_kwargs(self) -> dict:

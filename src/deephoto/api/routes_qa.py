@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from ..security import AuthContext
 from ..agent.persistence import SessionError
+from ..agent.context import Preferences
 from .deps import CtxDep, conn_for
 
 router = APIRouter(prefix="/api", tags=["qa"])
@@ -87,4 +88,28 @@ def delete_session(request: Request, session_id: str, ctx: AuthContext = CtxDep)
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    return {"deleted": True}
+
+
+# 05:用户显式管理表达偏好。不是模型工具,不接受自由文本指令。
+def _memory(request: Request):
+    try:
+        return request.app.state.qa_service.preference_memory()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.get("/qa/memory")
+def get_memory(request: Request, ctx: AuthContext = CtxDep):
+    return _memory(request).get(ctx)
+
+
+@router.put("/qa/memory")
+def put_memory(request: Request, body: Preferences, ctx: AuthContext = CtxDep):
+    return _memory(request).put(ctx, body)
+
+
+@router.delete("/qa/memory")
+def delete_memory(request: Request, ctx: AuthContext = CtxDep):
+    _memory(request).delete(ctx)
     return {"deleted": True}

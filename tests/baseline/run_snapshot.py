@@ -186,7 +186,9 @@ def main() -> None:
              "qa_kb_vfs_enabled": getattr(settings, "qa_kb_vfs_enabled", False),
              "qa_middleware_enabled": getattr(settings, "qa_middleware_enabled", False),
              "qa_main_max_model_calls": getattr(settings, "qa_main_max_model_calls", 12),
-             "qa_persistence_enabled": getattr(settings, "qa_persistence_enabled", False)}
+             "qa_persistence_enabled": getattr(settings, "qa_persistence_enabled", False),
+             "qa_skills_enabled": getattr(settings, "qa_skills_enabled", False),
+             "qa_memory_enabled": getattr(settings, "qa_memory_enabled", False)}
     snapshot = {
         "meta": {
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -203,7 +205,9 @@ def main() -> None:
     suffix = ("-subagents" if flags["qa_subagents_enabled"] else "") + \
              ("-kbvfs" if flags["qa_kb_vfs_enabled"] else "") + \
              ("-middleware" if flags["qa_middleware_enabled"] else "") + \
-             ("-persistence" if flags["qa_persistence_enabled"] else "")
+             ("-persistence" if flags["qa_persistence_enabled"] else "") + \
+             ("-skills" if flags["qa_skills_enabled"] else "") + \
+             ("-memory" if flags["qa_memory_enabled"] else "")
     out = SNAPSHOT_DIR / (f"snapshot-{time.strftime('%Y%m%d-%H%M%S')}"
                           f"-deepagents-{versions.get('deepagents') or 'unknown'}{suffix}.json")
     out.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")

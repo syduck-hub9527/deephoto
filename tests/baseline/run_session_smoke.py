@@ -68,15 +68,19 @@ def main() -> None:
             print("    " + (result.get("answer") or "")[:150].replace("\n", " "), flush=True)
     finally:
         # 删除会话:Store 元数据与 checkpoint 都应清除;随后 qa.close 释放框架连接
-        if session_id:
-            qa.delete_session(LOCAL_CTX, session_id)
-            print(f"会话已删除: {session_id}", flush=True)
-        qa.close()
+        try:
+            if session_id:
+                qa.delete_session(LOCAL_CTX, session_id)
+                print(f"会话已删除: {session_id}", flush=True)
+        finally:
+            qa.close()
 
     SNAPSHOT_DIR.mkdir(exist_ok=True)
     out = SNAPSHOT_DIR / f"session-smoke-{time.strftime('%Y%m%d-%H%M%S')}.json"
     out.write_text(json.dumps({"meta": {"created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                                        "chat_model": settings.chat_model},
+                                        "chat_model": settings.chat_model,
+                                        "qa_skills_enabled": settings.qa_skills_enabled,
+                                        "qa_memory_enabled": settings.qa_memory_enabled},
                                "turns": records}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"冒烟记录已保存: {out}")
 

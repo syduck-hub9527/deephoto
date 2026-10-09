@@ -185,6 +185,9 @@ class Settings:
     qa_main_max_model_calls: int = 12
     # 03:服务端会话历史与已验证引用;本阶段仅支持单进程服务
     qa_persistence_enabled: bool = False
+    # 05:技能可独立开启;用户显式偏好依赖 03 的 Store 生命周期。
+    qa_skills_enabled: bool = False
+    qa_memory_enabled: bool = False
 
     @property
     def qa_checkpoint_db_path(self) -> Path:
@@ -238,6 +241,8 @@ def load_settings() -> Settings:
         qa_middleware_enabled=_get_bool("QA_MIDDLEWARE_ENABLED", False),
         qa_main_max_model_calls=_get_int("QA_MAIN_MAX_MODEL_CALLS", 12, minimum=2),
         qa_persistence_enabled=_get_bool("QA_PERSISTENCE_ENABLED", False),
+        qa_skills_enabled=_get_bool("QA_SKILLS_ENABLED", False),
+        qa_memory_enabled=_get_bool("QA_MEMORY_ENABLED", False),
         description_enabled=_get_bool("DESCRIPTION_ENABLED", False),
         description_api_key=_get("DESCRIPTION_API_KEY"),
         description_base_url=_get("DESCRIPTION_BASE_URL"),
@@ -255,7 +260,13 @@ def load_settings() -> Settings:
         max_zip_uncompressed_mb=_get_int("MAX_ZIP_UNCOMPRESSED_MB", 500, minimum=1),
     )
     validate_description(settings)
+    validate_qa_context(settings)
     return settings
+
+
+def validate_qa_context(settings: "Settings") -> None:
+    if settings.qa_memory_enabled and not settings.qa_persistence_enabled:
+        raise ValueError("DEEPHOTO_QA_MEMORY_ENABLED 需要 DEEPHOTO_QA_PERSISTENCE_ENABLED=true")
 
 
 def validate_description(settings: "Settings") -> None:

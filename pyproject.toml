@@ -33,4 +33,5 @@ dev = []
 where = ["src"]
 
 [tool.setuptools.package-data]
-deephoto = ["web/*.html", "web/*.js", "web/vendor/katex/*", "web/vendor/katex/fonts/*"]
+deephoto = ["web/*.html", "web/*.js", "web/vendor/katex/*", "web/vendor/katex/fonts/*",
+            "agent/assets/skills/*/*/SKILL.md"]

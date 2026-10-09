@@ -93,7 +93,8 @@ def _call_limit(n: int):
 
 
 def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int = 8,
-                         checker_max_calls: int = 4, kb_vfs: bool = False, trace=None) -> list[dict]:
+                         checker_max_calls: int = 4, kb_vfs: bool = False, trace=None,
+                         skills_enabled: bool = False) -> list[dict]:
     from .harness import READ_TOOLS, hide_tools_middleware
 
     by_name = {getattr(t, "__name__", getattr(t, "name", "")): t for t in tools}
@@ -107,7 +108,7 @@ def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int 
         from .middleware import ToolTraceMiddleware
         return [ToolTraceMiddleware(trace, role)]
 
-    return [
+    specs = [
         {
             "name": RETRIEVER_NAME,
             "description": RETRIEVER_DESCRIPTION,
@@ -121,40 +122,52 @@ def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int 
             "description": FIGURE_CHECKER_DESCRIPTION,
             "system_prompt": FIGURE_CHECKER_PROMPT,
             "tools": [by_name["inspect_image"]],
-            # 读类文件工具在 kb_vfs 下不再被 profile 排除,figure_checker 不需要它们
+            # 05 的 checker 要 read_file 加载技能,其余读工具仍隐藏;隐藏不是权限控制。
             "middleware": [_call_limit(checker_max_calls)]
             + trace_middleware(FIGURE_CHECKER_NAME)
-            + ([hide_tools_middleware(READ_TOOLS)] if kb_vfs else []),
+            + ([hide_tools_middleware(READ_TOOLS - {"read_file"} if skills_enabled else READ_TOOLS)]
+               if kb_vfs or skills_enabled else []),
         },
     ]
+    if skills_enabled:
+        from .context import skill_sources
+        for spec in specs:
+            spec["skills"] = skill_sources(spec["name"])
+    return specs
 
 
 def build_delegating_agent(model, tools: Sequence[Callable], *, retriever_max_calls: int = 8,
                            checker_max_calls: int = 4, backend=None, middleware=(), trace=None,
-                           checkpointer=None, store=None):
-    """backend 非 None 即启用 02 的知识库文件系统:retriever 可用 /kb/,主智能体仍只有 task。"""
+                           checkpointer=None, store=None, kb_vfs: bool | None = None, skills=None, memory=None):
+    """05 有独立挂载,backend 非空不再总表示启用 /kb/;旧直接调用保留推断。"""
     from deepagents import create_deep_agent
 
     from .harness import READ_TOOLS, hide_tools_middleware
 
-    kb_vfs = backend is not None
+    if kb_vfs is None:
+        kb_vfs = backend is not None
     extra: dict = {}
     if checkpointer is not None:
         extra["checkpointer"] = checkpointer
     if store is not None:
         extra["store"] = store
     main_middleware = list(middleware)
-    if kb_vfs:
+    if backend is not None:
         extra["backend"] = backend
-        main_middleware.append(hide_tools_middleware(READ_TOOLS))
+    if skills is not None:
+        extra["skills"] = skills
+    if memory is not None:
+        extra["memory"] = memory
+    if kb_vfs or skills is not None:
+        main_middleware.append(hide_tools_middleware(READ_TOOLS - {"read_file"} if skills is not None else READ_TOOLS))
     if main_middleware:
         extra["middleware"] = main_middleware
     return create_deep_agent(
         model=model,
-        tools=[],    # 业务工具全部下放给子智能体;主智能体只有 task
+        tools=[],    # 业务工具下放子级;05 开启时主级另有 read_file 加载技能
         system_prompt=DELEGATING_SYSTEM_PROMPT,
         subagents=build_subagent_specs(
             tools, retriever_max_calls=retriever_max_calls, checker_max_calls=checker_max_calls,
-            kb_vfs=kb_vfs, trace=trace),
+            kb_vfs=kb_vfs, trace=trace, skills_enabled=skills is not None),
         **extra,
     )

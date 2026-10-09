@@ -180,6 +180,12 @@ class QAPersistence:
             self.saver.delete_thread(thread_id)
             self.store.delete(namespace, session_id)
 
+    @contextmanager
+    def storage(self):
+        # 05 的短 Store 操作也占用资源租约,避免 close 在访问过程中关闭连接。
+        with self._lease(f"storage:{uuid4().hex}"):
+            yield self.store
+
     def close(self) -> None:
         with self._lock:
             if self._active:
