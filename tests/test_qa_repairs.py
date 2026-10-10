@@ -1,8 +1,13 @@
-"""截图审查的三项修复:历史载荷、预检失败、默认 GP 限额绕过。"""
+"""截图审查的三项修复:历史载荷、预检失败、默认 GP 限额绕过。
+
+复审(review-fixes)补充:持久化轮次 sync 落盘防 checkpoint 写入链死锁,
+图未开始执行的失败(构建智能体失败)不判死健康的已有会话。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,6 +25,7 @@ from langgraph.types import Command
 from deephoto import repo
 from deephoto.agent.persistence import SessionError
 from deephoto.agent.qa import QAService
+from deephoto.db import connect
 
 PAYLOAD = "IMAGE_SENTINEL" + "A" * 200000
 
@@ -209,6 +215,51 @@ class ServiceRepairsTest(_Base):
         tools, tracker = qa._make_tools(self.ctx)
         result = qa._build_agent(tools, **qa._agent_kwargs(self.ctx, tracker)).invoke({"messages": [{"role": "user", "content": "q"}]})
         self.assertTrue(PAYLOAD in str(result["messages"]))
+
+    def test_persisted_turns_use_sync_durability(self):
+        # review-fixes 问题 4:默认 async 持久化在小线程池下可使 checkpoint 写入链死锁(见下一条用例)。
+        qa = self._qa()
+        turn = SimpleNamespace(config={"configurable": {"thread_id": "t"}})
+        self.assertEqual(qa._invoke_kwargs(turn)["durability"], "sync")
+        self.assertNotIn("durability", qa._invoke_kwargs(None))      # 无持久化时调用形态不变
+
+    def test_tiny_thread_pool_does_not_deadlock(self):
+        # max_concurrency=1 模拟单核容器最坏情况;死锁时 20 秒超时判失败而不是挂住套件。
+        qa = self._qa()
+        original = qa._invoke_kwargs
+
+        def tiny_pool(turn=None):
+            kwargs = original(turn)
+            kwargs["config"] = {**kwargs.get("config", {}), "max_concurrency": 1}
+            return kwargs
+        qa._invoke_kwargs = tiny_pool
+        self._model(qa, [{"tool": "search_knowledge", "args": {"query": "x"}},
+                         {"tool": "read_chunk", "args": {"chunk_id": self.c1}},
+                         {"tool": "search_knowledge", "args": {"query": "y"}}, f"答案 [chunk:{self.c1}]"])
+        box = {}
+
+        def run():
+            conn = connect(self.db_path)                   # sqlite 连接不能跨线程,工作线程自己连
+            try:
+                box["r"] = qa.answer(conn, self.ctx, "q")
+            finally:
+                conn.close()
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(20)
+        self.assertFalse(worker.is_alive(), "checkpoint 写入死锁")
+        self.assertEqual(self._metadata(qa, box["r"]["session_id"])["status"], "ready")
+
+    def test_build_failure_before_graph_start_keeps_session(self):
+        # review-fixes 问题 2 补全:图未开始执行的失败没有写过 checkpoint,不判死健康的已有会话。
+        qa = self._qa()
+        self._model(qa, ["first"])
+        sid = qa.answer(self.conn, self.ctx, "q1", document_id=self.doc_a)["session_id"]
+        before = dict(self._metadata(qa, sid))
+        with patch.object(qa, "_build_agent", side_effect=RuntimeError("model init failed")):
+            with self.assertRaises(RuntimeError):
+                qa.answer(self.conn, self.ctx, "q2", document_id=self.doc_a, session_id=sid)
+        self.assertEqual(self._metadata(qa, sid), before)
 
 
 class CompactionFrameworkTest(unittest.TestCase):

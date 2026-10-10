@@ -65,6 +65,13 @@ class SessionTurn:
     thread_id: str
     metadata: dict
     completed: bool = False
+    # 图是否已开始执行。未开始(构建智能体失败等)时没有写过任何 checkpoint,
+    # 会话应原样保留;开始后才可能留下半轮 checkpoint,此时才判 failed。
+    started: bool = False
+    previous: dict | None = None      # 进入本轮前的元数据;新会话为 None
+
+    def mark_started(self) -> None:
+        self.started = True
 
     @property
     def config(self) -> dict:
@@ -168,15 +175,23 @@ class QAPersistence:
             # 预检异常不进入 turn 的失败 finally,旧 metadata/checkpoint 均保持原样。
             if preflight is not None:
                 preflight()
+            previous = dict(item.value) if item is not None else None
             metadata.update(status="running", updated_at=_now())
             self.store.put(namespace, session_id, metadata)
-            turn = SessionTurn(self, namespace, session_id, thread_id, metadata)
+            turn = SessionTurn(self, namespace, session_id, thread_id, metadata, previous=previous)
             try:
                 yield turn
             finally:
                 if not turn.completed:
-                    failed = dict(turn.metadata, status="failed", updated_at=_now())
-                    self.store.put(namespace, session_id, failed)
+                    if previous is not None and not turn.started:
+                        # 已有会话、图未运行(构建智能体失败等):没有写过 checkpoint,原样恢复,
+                        # 不能因为一次与会话本身无关的错误判死一个健康会话。
+                        self.store.put(namespace, session_id, previous)
+                    else:
+                        # 图已开始(可能留下半轮 checkpoint),或这是新会话(客户端已拿到其 ID,
+                        # 保留 failed 占位让下次请求得到明确的"请开启新会话"):判 failed。
+                        failed = dict(turn.metadata, status="failed", updated_at=_now())
+                        self.store.put(namespace, session_id, failed)
 
     def delete(self, ctx, session_id: str) -> None:
         _validate_id(session_id)

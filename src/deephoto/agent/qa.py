@@ -118,6 +118,8 @@ class QAService:
         self._attach_persistence(agent_kwargs, turn)
         agent = self._build_agent(tools, **agent_kwargs)
         messages = _build_messages(question, document_id, history)
+        if turn is not None:
+            turn.mark_started()      # 此后才可能写入 checkpoint;之前的失败不应判死会话
         result = agent.invoke(self._graph_input(messages), **self._invoke_kwargs(turn))
         answer_text = _final_answer_text(result.get("messages", []))
         extra_chunks, extra_images = (self._session_cited_ids(conn, ctx, turn)
@@ -171,6 +173,8 @@ class QAService:
         answer_parts: list[str] = []
         stream_broken: str | None = None
         seen_chunks = 0
+        if turn is not None:
+            turn.mark_started()      # 此后才可能写入 checkpoint;之前的失败不应判死会话
         try:
             for chunk, _metadata in agent.stream(self._graph_input(messages), stream_mode="messages", **self._invoke_kwargs(turn)):
                 seen_chunks += 1
@@ -284,6 +288,11 @@ class QAService:
             config = dict(kwargs.get("config", {}))
             config["configurable"] = turn.config["configurable"]
             kwargs["config"] = config
+            # 默认 durability="async" 时,LangGraph 把每步 checkpoint 写入串成链(每次 put 要等上一次和 delta write),
+            # 且都在同一个线程池(大小 = min(32, CPU 数 + 4))。同时挂起的写入多于线程数时,
+            # 等待者占满线程池,排在后面的解锁任务拿不到线程 → 死锁(1~2 核容器、负载高时偶发,
+            # max_concurrency<=2 时必现)。"sync" 每步同步落盘,不存在写入链,代价是每步多等一次 SQLite 写。
+            kwargs["durability"] = "sync"
         return kwargs
 
     def _session_cited_ids(self, conn: Connection, ctx: AuthContext, turn) -> tuple[set[str], set[str]]:
