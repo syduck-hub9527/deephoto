@@ -2,7 +2,8 @@
 
 ScriptedFakeChatModel 按脚本逐项出招:
 - "任意文本" 或 {"text": "..."}        -> 产生最终回答(流式时切成多块);
-- {"tool": "<name>", "args": {...}}   -> 产生一轮工具调用。
+- {"tool": "<name>", "args": {...}}   -> 产生一轮工具调用;
+- {"tools": [{"name": ..., "args": ...}, ...]} -> 同一条 AI 消息里并发多个工具调用(06 HITL 批次/并行中断用)。
 
 脚本耗尽后的行为由 repeat_last 决定:False 返回兜底文本让图收敛(默认);
 True 重复最后一项,用于"子智能体死循环被调用上限截断"这类测试。
@@ -11,11 +12,15 @@ True 重复最后一项,用于"子智能体死循环被调用上限截断"这类
 供契约断言使用。设 model_name/ls_provider 后,deepagents 的 HarnessProfile
 按 "<ls_provider>:<model_name>" 匹配(如 openai:fake-k3),用于验证
 01-subagents 的工具排除与 general-purpose 关闭。
+
+出招游标有锁保护,并行子智能体(06 U1)可以并发消费脚本;同一并发批次内
+哪一方先拿到下一项不确定,脚本应写成与顺序无关的形式。
 """
 
 from __future__ import annotations
 
 import json
+from threading import Lock
 from typing import Any, Iterator, Sequence
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -30,7 +35,7 @@ STREAM_CHUNK_SIZE = 12
 
 
 class ScriptedFakeChatModel(BaseChatModel):
-    """按脚本出招的假对话模型。不联网、不支持并发(测试单线程使用)。"""
+    """按脚本出招的假对话模型。不联网;游标有锁,可承受并行子智能体并发出招。"""
 
     script: list[Any]
     """逐项消费的出招脚本:str / {"text": ...} / {"tool": name, "args": {...}}。"""
@@ -48,6 +53,7 @@ class ScriptedFakeChatModel(BaseChatModel):
     _requests: list[list[BaseMessage]] = PrivateAttr(default_factory=list)
     _bound_tool_names: list[list[str]] = PrivateAttr(default_factory=list)
     _call_seq: int = PrivateAttr(default=0)
+    _script_lock: Lock = PrivateAttr(default_factory=Lock)
 
     @property
     def _llm_type(self) -> str:
@@ -93,26 +99,28 @@ class ScriptedFakeChatModel(BaseChatModel):
     # ---- 出招 ----
 
     def _next_message(self) -> AIMessage:
-        if self._cursor < len(self.script):
-            step = self.script[self._cursor]
-        elif self.repeat_last and self.script:
-            step = self.script[-1]
-        else:
-            step = {"text": "（假模型脚本已耗尽,兜底收尾）"}
-        self._cursor += 1
-        if isinstance(step, str):
-            step = {"text": step}
-        if "tool" in step:
-            self._call_seq += 1
-            return AIMessage(
-                content="",
-                tool_calls=[{
-                    "name": step["tool"],
-                    "args": step.get("args", {}),
-                    "id": f"call_{self._call_seq}",
-                }],
-            )
-        return AIMessage(content=str(step["text"]))
+        with self._script_lock:
+            if self._cursor < len(self.script):
+                step = self.script[self._cursor]
+            elif self.repeat_last and self.script:
+                step = self.script[-1]
+            else:
+                step = {"text": "（假模型脚本已耗尽,兜底收尾）"}
+            self._cursor += 1
+            if isinstance(step, str):
+                step = {"text": step}
+            tool_items = []
+            if "tool" in step:
+                tool_items = [{"name": step["tool"], "args": step.get("args", {})}]
+            elif "tools" in step:
+                tool_items = [{"name": t["name"], "args": t.get("args", {})} for t in step["tools"]]
+            if tool_items:
+                calls = []
+                for item in tool_items:
+                    self._call_seq += 1
+                    calls.append({"name": item["name"], "args": item["args"], "id": f"call_{self._call_seq}"})
+                return AIMessage(content="", tool_calls=calls)
+            return AIMessage(content=str(step["text"]))
 
     def _generate(
         self,
@@ -134,18 +142,18 @@ class ScriptedFakeChatModel(BaseChatModel):
         self._requests.append(list(messages))
         msg = self._next_message()
         if msg.tool_calls:
-            # 工具调用轮:以单个 tool_call_chunks 块流出(args 为 JSON 字符串)
-            call = msg.tool_calls[0]
-            chunk = AIMessageChunk(
-                content="",
-                tool_call_chunks=[{
-                    "name": call["name"],
-                    "args": json.dumps(call["args"], ensure_ascii=False),
-                    "id": call["id"],
-                    "index": 0,
-                }],
-            )
-            yield ChatGenerationChunk(message=chunk)
+            # 工具调用轮:每个调用一个 tool_call_chunks 块流出(args 为 JSON 字符串)
+            for index, call in enumerate(msg.tool_calls):
+                chunk = AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[{
+                        "name": call["name"],
+                        "args": json.dumps(call["args"], ensure_ascii=False),
+                        "id": call["id"],
+                        "index": index,
+                    }],
+                )
+                yield ChatGenerationChunk(message=chunk)
             return
         text = str(msg.content)
         for i in range(0, max(len(text), 1), STREAM_CHUNK_SIZE):

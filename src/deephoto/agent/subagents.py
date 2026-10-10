@@ -142,8 +142,13 @@ def build_subagent_specs(tools: Sequence[Callable], *, retriever_max_calls: int 
 
 def build_delegating_agent(model, tools: Sequence[Callable], *, retriever_max_calls: int = 8,
                            checker_max_calls: int = 4, backend=None, middleware=(), trace=None,
-                           checkpointer=None, store=None, kb_vfs: bool | None = None, skills=None, memory=None):
-    """05 有独立挂载,backend 非空不再总表示启用 /kb/;旧直接调用保留推断。"""
+                           checkpointer=None, store=None, kb_vfs: bool | None = None, skills=None,
+                           memory=None, interrupt_on=None):
+    """05 有独立挂载,backend 非空不再总表示启用 /kb/;旧直接调用保留推断。
+
+    06:interrupt_on 只放顶层,由不带该键的子智能体规格继承(F3);
+    figure_checker/retriever 的规格中不得写 interrupt_on,哪怕值为 None。
+    """
     from deepagents import create_deep_agent
 
     from .harness import READ_TOOLS, hide_tools_middleware
@@ -155,6 +160,8 @@ def build_delegating_agent(model, tools: Sequence[Callable], *, retriever_max_ca
         extra["checkpointer"] = checkpointer
     if store is not None:
         extra["store"] = store
+    if interrupt_on is not None:
+        extra["interrupt_on"] = interrupt_on
     main_middleware = list(middleware)
     if backend is not None:
         extra["backend"] = backend

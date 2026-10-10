@@ -188,6 +188,10 @@ class Settings:
     # 05:技能可独立开启;用户显式偏好依赖 03 的 Store 生命周期。
     qa_skills_enabled: bool = False
     qa_memory_enabled: bool = False
+    # 06:inspect_image 人工审批闸门;依赖 03(挂起/恢复需要 checkpointer 与会话状态机)
+    qa_hitl_enabled: bool = False
+    qa_hitl_auto_approve_images: int = 2     # 每轮前 N 次看图自动放行;0 = 每次都询问
+    qa_hitl_timeout_seconds: int = 600       # 挂起超过该时长后,下一次请求先按全部拒绝恢复
 
     @property
     def qa_checkpoint_db_path(self) -> Path:
@@ -243,6 +247,9 @@ def load_settings() -> Settings:
         qa_persistence_enabled=_get_bool("QA_PERSISTENCE_ENABLED", False),
         qa_skills_enabled=_get_bool("QA_SKILLS_ENABLED", False),
         qa_memory_enabled=_get_bool("QA_MEMORY_ENABLED", False),
+        qa_hitl_enabled=_get_bool("QA_HITL_ENABLED", False),
+        qa_hitl_auto_approve_images=_get_int("QA_HITL_AUTO_APPROVE_IMAGES", 2, minimum=0),
+        qa_hitl_timeout_seconds=_get_int("QA_HITL_TIMEOUT_SECONDS", 600, minimum=30),
         description_enabled=_get_bool("DESCRIPTION_ENABLED", False),
         description_api_key=_get("DESCRIPTION_API_KEY"),
         description_base_url=_get("DESCRIPTION_BASE_URL"),
@@ -267,6 +274,8 @@ def load_settings() -> Settings:
 def validate_qa_context(settings: "Settings") -> None:
     if settings.qa_memory_enabled and not settings.qa_persistence_enabled:
         raise ValueError("DEEPHOTO_QA_MEMORY_ENABLED 需要 DEEPHOTO_QA_PERSISTENCE_ENABLED=true")
+    if settings.qa_hitl_enabled and not settings.qa_persistence_enabled:
+        raise ValueError("DEEPHOTO_QA_HITL_ENABLED 需要 DEEPHOTO_QA_PERSISTENCE_ENABLED=true")
 
 
 def validate_description(settings: "Settings") -> None:

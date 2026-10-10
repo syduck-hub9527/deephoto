@@ -18,6 +18,7 @@
 - StoreBackend + SqliteStore 的记忆注入系统提示(§3.2)
 - Skills 系统提示只放名称和描述(§3.2)
 - interrupt_on 需要 checkpointer,用 Command(resume=...) 恢复(§3.2)
+- 06 HITL 事实 F1–F12 与待定项 U1/U2/U3(md文档/files/06-human-in-the-loop.md §2)
 """
 
 from __future__ import annotations
@@ -38,8 +39,8 @@ from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.protocol import BackendProtocol, ReadResult
 from deepagents.backends.state import StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
-from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain.agents.middleware import AgentMiddleware, InterruptOnConfig
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
@@ -388,6 +389,297 @@ class HumanInTheLoopContract(unittest.TestCase):
         self.assertEqual(calls, [])
         with self.assertRaises(RuntimeError):
             agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}))
+
+
+class HitlDeepContract(unittest.TestCase):
+    """06 文档 §2 的框架事实 F1–F12 与待验证项 U1/U2/U3(离线探针固化,升级门槛)。
+
+    F1(批准前不执行)与基本 approve 流已由 HumanInTheLoopContract 覆盖,这里不再重复。
+    """
+
+    @staticmethod
+    def _single(model, saver, tools, interrupt_on):
+        return create_deep_agent(model=model, system_prompt="契约测试", tools=tools,
+                                 interrupt_on=interrupt_on, checkpointer=saver)
+
+    @staticmethod
+    def _interrupts(result):
+        return list(result["__interrupt__"])
+
+    def test_f2_subagent_interrupt_bubbles_with_action_requests(self):
+        """F2:子智能体中断冒泡到主图;__interrupt__ 的 value 是 dict,含 action_requests/review_configs。"""
+        probe_tool, _calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "task", "args": {"description": "d", "subagent_type": "worker"}},
+            {"tool": "probe_tool", "args": {"text": "p"}},
+            {"text": "子智能体结论"}, {"text": "主最终"},
+        ])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = create_deep_agent(
+                model=model, system_prompt="契约测试", tools=[],
+                subagents=[{"name": "worker", "description": "d", "system_prompt": "s",
+                            "tools": [probe_tool]}],
+                interrupt_on={"probe_tool": InterruptOnConfig(allowed_decisions=["approve", "reject"])},
+                checkpointer=saver)
+            paused = agent.invoke({"messages": [{"role": "user", "content": "hi"}]},
+                                  config={"configurable": {"thread_id": "f2"}})
+        interrupts = self._interrupts(paused)
+        self.assertEqual(len(interrupts), 1)
+        value = interrupts[0].value
+        self.assertIsInstance(value, dict)
+        self.assertEqual([a["name"] for a in value["action_requests"]], ["probe_tool"])
+        self.assertEqual(value["action_requests"][0]["args"], {"text": "p"})
+        self.assertIn("description", value["action_requests"][0])
+        self.assertEqual(value["review_configs"][0]["allowed_decisions"], ["approve", "reject"])
+
+    def test_f3_top_level_interrupt_on_inherited_only_when_key_absent(self):
+        """F3:规格不带 interrupt_on 键才继承顶层;写 None 或 {} 都会关掉该子智能体的闸门。"""
+        for spec_extra, expect_pause in (({}, True), ({"interrupt_on": None}, False), ({"interrupt_on": {}}, False)):
+            probe_tool, _calls = _make_probe_tool()
+            model = ScriptedFakeChatModel(script=[
+                {"tool": "task", "args": {"description": "d", "subagent_type": "worker"}},
+                {"tool": "probe_tool", "args": {"text": "p"}},
+                {"text": "子智能体结论"}, {"text": "主最终"},
+            ])
+            spec = {"name": "worker", "description": "d", "system_prompt": "s",
+                    "tools": [probe_tool], **spec_extra}
+            with SqliteSaver.from_conn_string(":memory:") as saver:
+                agent = create_deep_agent(
+                    model=model, system_prompt="契约测试", tools=[], subagents=[spec],
+                    interrupt_on={"probe_tool": True}, checkpointer=saver)
+                result = agent.invoke({"messages": [{"role": "user", "content": "hi"}]},
+                                      config={"configurable": {"thread_id": "f3"}})
+            self.assertEqual("__interrupt__" in result, expect_pause, spec_extra)
+
+    def test_f4_approve_executes_once_and_resume_does_not_recall_model(self):
+        """F4:批准后工具恰好执行一次;恢复本身不重新调用模型(下一请求里已有工具结果)。"""
+        probe_tool, calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "probe_tool", "args": {"text": "x"}}, {"text": "完毕"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool], {"probe_tool": True})
+            config = {"configurable": {"thread_id": "f4"}}
+            paused = agent.invoke({"messages": [{"role": "user", "content": "hi"}], }, config=config)
+            self.assertEqual(model.calls_made, 1)
+            resumed = agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}), config=config)
+        self.assertEqual(calls, ["x"])
+        self.assertEqual(model.calls_made, 2)      # 只有一次收尾调用;恢复步骤本身不调模型
+        self.assertIn("probe:x", [str(m.content) for m in model.requests[-1]
+                                  if isinstance(m, ToolMessage)])
+        self.assertEqual(_last_ai_text(resumed), "完毕")
+
+    def test_f5_reject_skips_tool_and_model_receives_rejection_text(self):
+        """F5:拒绝后工具不执行;模型收到拒绝文本并继续收尾。"""
+        probe_tool, calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "probe_tool", "args": {"text": "x"}}, {"text": "无法确认"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool], {"probe_tool": True})
+            config = {"configurable": {"thread_id": "f5"}}
+            agent.invoke({"messages": [{"role": "user", "content": "hi"}]}, config=config)
+            resumed = agent.invoke(Command(resume={"decisions": [{"type": "reject"}]}), config=config)
+        self.assertEqual(calls, [])
+        tool_texts = [str(m.content) for m in model.requests[-1] if isinstance(m, ToolMessage)]
+        self.assertTrue(any("rejected" in t for t in tool_texts))
+        self.assertEqual(_last_ai_text(resumed), "无法确认")
+
+    def test_f6_same_message_calls_batch_into_one_interrupt(self):
+        """F6:同一条 AI 消息的多个受闸门调用合并为一次中断;决定数不符报 ValueError。"""
+        probe_tool, calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tools": [{"name": "probe_tool", "args": {"text": "a"}},
+                       {"name": "probe_tool", "args": {"text": "b"}}]},
+            {"text": "完毕"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool], {"probe_tool": True})
+            config = {"configurable": {"thread_id": "f6"}}
+            paused = agent.invoke({"messages": [{"role": "user", "content": "hi"}]}, config=config)
+            interrupts = self._interrupts(paused)
+            self.assertEqual(len(interrupts), 1)
+            self.assertEqual(len(interrupts[0].value["action_requests"]), 2)
+            with self.assertRaises(ValueError):
+                agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}), config=config)
+
+    def test_f7_wrong_decision_count_poisons_pending_thread(self):
+        """F7:决定数错误的恢复失败后,同一线程再提交正确数量仍报错(线程被毁)。"""
+        probe_tool, _calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tools": [{"name": "probe_tool", "args": {"text": "a"}},
+                       {"name": "probe_tool", "args": {"text": "b"}}]},
+            {"text": "完毕"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool], {"probe_tool": True})
+            config = {"configurable": {"thread_id": "f7"}}
+            agent.invoke({"messages": [{"role": "user", "content": "hi"}]}, config=config)
+            with self.assertRaises(ValueError):
+                agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}), config=config)
+            with self.assertRaises(ValueError):
+                agent.invoke(Command(resume={"decisions": [{"type": "approve"},
+                                                           {"type": "approve"}]}), config=config)
+
+    def test_f8_stream_mode_messages_goes_silent_on_pause(self):
+        """F8:stream_mode="messages" 下挂起没有中断信号:无正文块流出,流静默结束。"""
+        probe_tool, _calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "probe_tool", "args": {"text": "x"}}, {"text": "不应流出"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool], {"probe_tool": True})
+            config = {"configurable": {"thread_id": "f8"}}
+            chunks = [c for c, _meta in agent.stream(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                stream_mode="messages", config=config)]
+            text_chunks = [c for c in chunks
+                           if isinstance(c, AIMessageChunk) and c.content]
+            self.assertEqual(text_chunks, [])        # 挂起前没有任何正文 token
+            state = agent.get_state(config)          # 只能靠 get_state 发现挂起(F9)
+            self.assertTrue(any(t.interrupts for t in state.tasks))
+
+    def test_f9_pending_pause_detectable_via_get_state(self):
+        """F9:get_state 的 next 指向 HumanInTheLoopMiddleware.after_model,tasks 带 interrupts。"""
+        probe_tool, _calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "probe_tool", "args": {"text": "x"}}, {"text": "完毕"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool], {"probe_tool": True})
+            config = {"configurable": {"thread_id": "f9"}}
+            agent.invoke({"messages": [{"role": "user", "content": "hi"}]}, config=config)
+            state = agent.get_state(config)
+        self.assertEqual(state.next, ("HumanInTheLoopMiddleware.after_model",))
+        self.assertTrue(any(t.interrupts for t in state.tasks))
+
+    def test_f10_paused_result_last_ai_text_is_empty(self):
+        """F10:挂起时 invoke 结果的最后一条 AI 消息正文为空串(调用轮消息)。"""
+        probe_tool, _calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "probe_tool", "args": {"text": "x"}}, {"text": "完毕"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool], {"probe_tool": True})
+            paused = agent.invoke({"messages": [{"role": "user", "content": "hi"}]},
+                                  config={"configurable": {"thread_id": "f10"}})
+        last_ai = next(m for m in reversed(paused["messages"]) if isinstance(m, AIMessage))
+        self.assertEqual(str(last_ai.content), "")
+        self.assertTrue(last_ai.tool_calls)
+
+    def test_f11_when_predicate_sees_only_subagent_local_messages(self):
+        """F11:子智能体内的 when 谓词只能读到子智能体自己的 messages(看不到父级问题)。"""
+        probe_tool, _calls = _make_probe_tool()
+        observed: list[list[str]] = []
+
+        def when(req):
+            observed.append([str(getattr(m, "content", "")) for m in req.state["messages"]])
+            return False                                # 不暂停,只观察
+
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "task", "args": {"description": "子任务描述", "subagent_type": "worker"}},
+            {"tool": "probe_tool", "args": {"text": "p"}},
+            {"text": "子智能体结论"}, {"text": "主最终"},
+        ])
+        agent = create_deep_agent(
+            model=model, system_prompt="契约测试", tools=[],
+            subagents=[{"name": "worker", "description": "d", "system_prompt": "s",
+                        "tools": [probe_tool]}],
+            interrupt_on={"probe_tool": InterruptOnConfig(
+                allowed_decisions=["approve", "reject"], when=when)})
+        agent.invoke({"messages": [{"role": "user", "content": "PARENT_MARKER 问题"}]})
+        self.assertEqual(len(observed), 1)
+        flat = "\n".join(observed[0])
+        self.assertNotIn("PARENT_MARKER", flat)         # 父级消息不可见:基于状态的全局计数恒为 0
+        self.assertIn("子任务描述", flat)               # 只有任务说明
+
+    def test_f12_true_expands_to_all_four_decisions(self):
+        """F12:interrupt_on 值为 True 时展开为 approve/edit/reject/respond 全部开放。"""
+        probe_tool, _calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "probe_tool", "args": {"text": "x"}}, {"text": "完毕"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool], {"probe_tool": True})
+            paused = agent.invoke({"messages": [{"role": "user", "content": "hi"}]},
+                                  config={"configurable": {"thread_id": "f12"}})
+        configs = self._interrupts(paused)[0].value["review_configs"]
+        self.assertEqual(configs[0]["allowed_decisions"],
+                         ["approve", "edit", "reject", "respond"])
+
+    def test_u1_parallel_subagent_interrupts_resume_by_id(self):
+        """U1:两个并行子智能体各自中断 -> __interrupt__ 含两项;按 interrupt id 映射恢复。"""
+        probe_tool, calls = _make_probe_tool()
+        model = ScriptedFakeChatModel(script=[
+            {"tools": [{"name": "task", "args": {"description": "A", "subagent_type": "wa"}},
+                       {"name": "task", "args": {"description": "B", "subagent_type": "wb"}}]},
+            {"tool": "probe_tool", "args": {"text": "p"}},
+            {"tool": "probe_tool", "args": {"text": "p"}},
+            {"text": "子结论"}, {"text": "子结论"}, {"text": "主最终"},
+        ])
+        specs = [{"name": n, "description": "d", "system_prompt": "s", "tools": [probe_tool]}
+                 for n in ("wa", "wb")]
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = create_deep_agent(
+                model=model, system_prompt="契约测试", tools=[], subagents=specs,
+                interrupt_on={"probe_tool": True}, checkpointer=saver)
+            config = {"configurable": {"thread_id": "u1"}}
+            paused = agent.invoke({"messages": [{"role": "user", "content": "hi"}]}, config=config)
+            interrupts = self._interrupts(paused)
+            self.assertEqual(len(interrupts), 2)
+            self.assertEqual(len({i.id for i in interrupts}), 2)
+            resume = {i.id: {"decisions": [{"type": "approve"}]} for i in interrupts}
+            done = agent.invoke(Command(resume=resume), config=config)
+        self.assertEqual(sorted(calls), ["p", "p"])
+        self.assertEqual(_last_ai_text(done), "主最终")
+
+    def test_u2_resume_reruns_after_model_and_when(self):
+        """U2:恢复时 after_model 整体重跑,when 谓词对同一 tool_call_id 再次求值。
+
+        这是 ImageApprovalGate 必须按 tool_call_id 记忆决定的原因:重放时计数不能翻倍。
+        """
+        probe_tool, _calls = _make_probe_tool()
+        when_calls: list[str] = []
+
+        def when(req):
+            when_calls.append(req.tool_call["id"])
+            return True
+
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "probe_tool", "args": {"text": "x"}}, {"text": "完毕"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool],
+                                 {"probe_tool": InterruptOnConfig(
+                                     allowed_decisions=["approve", "reject"], when=when)})
+            config = {"configurable": {"thread_id": "u2"}}
+            agent.invoke({"messages": [{"role": "user", "content": "hi"}]}, config=config)
+            self.assertEqual(len(when_calls), 1)
+            agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}), config=config)
+        self.assertEqual(len(when_calls), 2)
+        self.assertEqual(when_calls[0], when_calls[1])
+
+    def test_u3_description_callback_may_open_own_sqlite_connection(self):
+        """U3:description 回调在图节点上下文里执行,自取连接的 sqlite 访问安全。"""
+        probe_tool, _calls = _make_probe_tool()
+        seen_threads: list[str] = []
+
+        def describe(tool_call, state, runtime):
+            import sqlite3
+            import threading
+            seen_threads.append(threading.current_thread().name)
+            conn = sqlite3.connect(":memory:")          # 回调内自取连接,不跨线程复用
+            try:
+                conn.execute("create table t (v text)")
+                conn.execute("insert into t values ('图3 第5页')")
+                row = conn.execute("select v from t").fetchone()
+            finally:
+                conn.close()
+            return f"查看原图 {tool_call['args']['text']}({row[0]})"
+
+        model = ScriptedFakeChatModel(script=[
+            {"tool": "probe_tool", "args": {"text": "occ_1"}}, {"text": "完毕"}])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = self._single(model, saver, [probe_tool],
+                                 {"probe_tool": InterruptOnConfig(
+                                     allowed_decisions=["approve", "reject"],
+                                     description=describe)})
+            paused = agent.invoke({"messages": [{"role": "user", "content": "hi"}]},
+                                  config={"configurable": {"thread_id": "u3"}})
+        request = self._interrupts(paused)[0].value["action_requests"][0]
+        self.assertEqual(request["description"], "查看原图 occ_1(图3 第5页)")
+        self.assertTrue(seen_threads)
 
 
 if __name__ == "__main__":

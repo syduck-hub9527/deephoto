@@ -20,6 +20,8 @@ from sqlite3 import Connection
 from threading import Lock
 from typing import Iterator
 
+from langgraph.types import Command
+
 from .. import repo
 from ..config import Settings
 from ..db import connect
@@ -27,9 +29,10 @@ from ..llm import build_chat_model
 from ..parsing.captions import asks_for_images
 from ..security import AuthContext
 from .answer_format import normalize_image_anchors
+from .hitl import (ApprovalError, approval_items, build_resume_value, validate_decisions)
 from .knowledge import KnowledgeService
 from .locator import locator_label
-from .persistence import DocumentScopeError
+from .persistence import DocumentScopeError, deadline, parked_expired
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,7 @@ class QAService:
                session_id: str | None = None) -> dict:
         if not self._persistence_enabled():
             return self._answer_impl(conn, ctx, question, document_id, history)
+        self._expire_if_needed(ctx, session_id)
         with self._sessions().turn(ctx, session_id, document_id, self._session_profile(),
                                    preflight=lambda: self._validate_scope(conn, ctx, document_id)) as turn:
             # 会话历史以 checkpoint 为准;浏览器历史不导入新会话,也不重复追加。
@@ -116,11 +120,20 @@ class QAService:
         tools, tracker = self._make_tools(ctx)
         agent_kwargs = self._agent_kwargs(ctx, tracker)
         self._attach_persistence(agent_kwargs, turn)
+        gate = self._attach_hitl(agent_kwargs, ctx, turn)
         agent = self._build_agent(tools, **agent_kwargs)
         messages = _build_messages(question, document_id, history)
         if turn is not None:
             turn.mark_started()      # 此后才可能写入 checkpoint;之前的失败不应判死会话
         result = agent.invoke(self._graph_input(messages), **self._invoke_kwargs(turn))
+        if gate is not None:
+            pending = _pending_interrupts(agent, turn)
+            if pending:
+                # 06:审批闸门挂起——不组装、不 complete;元数据由 turn.park 落盘
+                approvals, expires_at = self._park(turn, gate, pending)
+                return {"status": "awaiting_approval", "session_id": turn.session_id,
+                        "approvals": approvals, "expires_at": expires_at,
+                        "answer": None, "citations": [], "images": []}
         answer_text = _final_answer_text(result.get("messages", []))
         extra_chunks, extra_images = (self._session_cited_ids(conn, ctx, turn)
                                       if turn is not None else _history_cited_ids(history))
@@ -133,29 +146,36 @@ class QAService:
     def answer_stream(self, ctx: AuthContext, question: str,
                       document_id: str | None = None, history: list[dict] | None = None,
                       session_id: str | None = None) -> Iterator[dict]:
-        """产出事件:{type: thinking|token|done|error}。done 携带校验后的 citations/images。"""
+        """产出事件:{type: session|thinking|token|approval_required|warning|done|error}。"""
         try:
             if not self._persistence_enabled():
                 yield from self._stream_impl(ctx, question, document_id, history)
             else:
+                self._expire_if_needed(ctx, session_id)
                 with self._sessions().turn(ctx, session_id, document_id, self._session_profile(),
                                            preflight=lambda: self._validate_scope(connect(self.settings.db_path), ctx, document_id)) as turn:
                     yield {"type": "session", "session_id": turn.session_id}
-                    broken = False
-                    for event in self._stream_impl(ctx, question, document_id, None, turn):
-                        if event["type"] in {"warning", "error"}:
-                            broken = True
-                        if event["type"] == "done":
-                            if not broken:
-                                turn.complete(event)
-                            event["session_id"] = turn.session_id
-                            event["session_status"] = "failed" if broken else "ready"
-                        yield event
+                    yield from self._drive_stream(
+                        turn, self._stream_impl(ctx, question, document_id, None, turn))
         except DocumentScopeError as exc:
             yield {"type": "error", "detail": str(exc), "code": "document_scope_unavailable", "recoverable": True}
         except Exception as exc:
             logger.exception("qa stream failed")
             yield {"type": "error", "detail": f"{type(exc).__name__}: {exc}"}
+
+    def _drive_stream(self, turn, events) -> Iterator[dict]:
+        """session 事件之后的公共收尾(提问与审批恢复共用):
+        broken 判定、done 时写回 ready 与已验证引用、附 session_status。"""
+        broken = False
+        for event in events:
+            if event["type"] in {"warning", "error"}:
+                broken = True
+            if event["type"] == "done":
+                if not broken:
+                    turn.complete(event)
+                event["session_id"] = turn.session_id
+                event["session_status"] = "failed" if broken else "ready"
+            yield event
 
     def _stream_impl(self, ctx: AuthContext, question: str,
                      document_id: str | None, history: list[dict] | None, turn=None) -> Iterator[dict]:
@@ -167,16 +187,30 @@ class QAService:
         tools, tracker = self._make_tools(ctx)
         agent_kwargs = self._agent_kwargs(ctx, tracker)
         self._attach_persistence(agent_kwargs, turn)
+        gate = self._attach_hitl(agent_kwargs, ctx, turn)
         agent = self._build_agent(tools, **agent_kwargs)
         messages = _build_messages(question, document_id, history)
+        if turn is not None:
+            turn.mark_started()      # 此后才可能写入 checkpoint;之前的失败不应判死会话
+        yield from self._stream_graph(ctx, agent, self._graph_input(messages),
+                                      turn=turn, gate=gate, tracker=tracker,
+                                      agent_kwargs=agent_kwargs, history=history,
+                                      question=question)
 
+    def _stream_graph(self, ctx: AuthContext, agent, graph_input, *,
+                      turn, gate, tracker, agent_kwargs, history, question: str = "") -> Iterator[dict]:
+        """流式执行图并组装 done;提问与审批恢复共用这一段。
+
+        06:HITL 挂起时流静默结束(F8),必须在"模型未产生回答"的报错分支之前
+        用 get_state 识别(F9),并产出 approval_required 事件而不是 error。
+        审批恢复路径拿不到原问题(question=""):此时不做"用户要求看图"的补图兜底,
+        被驳回的图片不会因 fallback 又被附带进来。
+        """
         answer_parts: list[str] = []
         stream_broken: str | None = None
         seen_chunks = 0
-        if turn is not None:
-            turn.mark_started()      # 此后才可能写入 checkpoint;之前的失败不应判死会话
         try:
-            for chunk, _metadata in agent.stream(self._graph_input(messages), stream_mode="messages", **self._invoke_kwargs(turn)):
+            for chunk, _metadata in agent.stream(graph_input, stream_mode="messages", **self._invoke_kwargs(turn)):
                 seen_chunks += 1
                 # 只流式 AI 增量:ToolMessage(Chunk) 的 content 是工具返回的 JSON/图片块,必须排除。
                 # 注意 langchain-core 中 AIMessageChunk.type == "AIMessageChunk"(非 "ai")
@@ -197,6 +231,15 @@ class QAService:
             logger.exception("model stream interrupted")
             stream_broken = f"{type(exc).__name__}: {exc}"
 
+        if stream_broken is None and gate is not None:
+            pending = _pending_interrupts(agent, turn)
+            if pending:
+                approvals, expires_at = self._park(turn, gate, pending)
+                yield {"type": "approval_required", "session_id": turn.session_id,
+                       "session_status": "awaiting_approval",
+                       "approvals": approvals, "expires_at": expires_at}
+                return                      # 挂起事件之后不发送 done(5.6)
+
         answer_text = "".join(answer_parts)
         if not answer_text.strip():
             detail = f"模型未产生回答(收到 {seen_chunks} 个流块,无正文 token)"
@@ -208,7 +251,7 @@ class QAService:
             yield {"type": "warning", "detail": f"回答可能不完整(流中断:{stream_broken})"}
 
         answer_text = "".join(answer_parts)
-        conn = connect(db_path)
+        conn = connect(self.settings.db_path)
         extra_chunks, extra_images = (self._session_cited_ids(conn, ctx, turn)
                                       if turn is not None else _history_cited_ids(history))
         result = self._assemble(conn, ctx, answer_text, question, tracker,
@@ -216,6 +259,136 @@ class QAService:
         result["type"] = "done"
         self._attach_trace(result, agent_kwargs)
         yield result
+
+    # ---- 06 HITL:审批闸门的挂起/恢复/超时 ----
+
+    def _hitl_enabled(self) -> bool:
+        return bool(getattr(self.settings, "qa_hitl_enabled", False))
+
+    def _attach_hitl(self, agent_kwargs: dict, ctx: AuthContext, turn):
+        """HITL 开启时构造请求级闸门并接线 interrupt_on;返回闸门(挂起时取 snapshot)。
+
+        关闭时 agent_kwargs 不含 interrupt_on 键,agent 构建形态与升级前一致。
+        恢复路径(人工/超时)用元数据里保存的 decided 重建同一闸门(U2:恢复重放时
+        when 会对同一 tool_call_id 再次求值,结论必须不变)。
+        """
+        if not self._hitl_enabled() or turn is None:
+            return None
+        from langchain.agents.middleware import InterruptOnConfig
+        from .hitl import ImageApprovalGate, describe_image_request
+
+        gate = ImageApprovalGate(getattr(self.settings, "qa_hitl_auto_approve_images", 2),
+                                 decided=turn.metadata.get("decided") or {})
+        db_path = self.settings.db_path
+        agent_kwargs["interrupt_on"] = {"inspect_image": InterruptOnConfig(
+            allowed_decisions=["approve", "reject"],
+            when=gate.when,
+            description=lambda tool_call, state, runtime: describe_image_request(db_path, ctx, tool_call))}
+        return gate
+
+    def _park(self, turn, gate, pending) -> tuple[list[dict], str]:
+        """写 awaiting_approval 元数据,返回(对外审批项, 超时时刻)。不组装答案、不写引用。"""
+        items = approval_items(pending)
+        expires_at = deadline(getattr(self.settings, "qa_hitl_timeout_seconds", 600))
+        turn.park(items, gate.snapshot(), expires_at)
+        public = [{"approval_id": i["approval_id"], "tool": i["tool"],
+                   "args": i["args"], "description": i["description"]} for i in items]
+        return public, expires_at
+
+    def approval_pending(self, ctx: AuthContext, session_id: str | None) -> dict | None:
+        """409 探测(5.6):会话停在 awaiting_approval 且未超时 -> 待审批信息,否则 None。
+
+        只读快照,不触发超时恢复:过期清理由实际处理请求的路径惰性执行(5.5)。
+        """
+        if not self._persistence_enabled() or not self._hitl_enabled() or session_id is None:
+            return None
+        meta = self._sessions().inspect(ctx, session_id)
+        if not meta or meta.get("status") != "awaiting_approval" or parked_expired(meta):
+            return None
+        approvals = [{"approval_id": a["approval_id"], "tool": a["tool"],
+                      "args": a["args"], "description": a["description"]}
+                     for a in meta.get("approvals", [])]
+        return {"code": "approval_pending", "approvals": approvals,
+                "expires_at": meta.get("expires_at")}
+
+    def resolve_approvals(self, ctx: AuthContext, session_id: str, decisions) -> Iterator[dict]:
+        """审批恢复(5.4/5.7):校验全部在图外完成(F7),通过后才返回恢复流(SSE)。
+
+        校验失败抛 ApprovalError(路由映射 400),此时图未被触碰,线程仍可恢复。
+        """
+        if not (self._persistence_enabled() and self._hitl_enabled()):
+            raise ApprovalError("人工审批未启用")
+        self._expire_if_needed(ctx, session_id)   # 已超时:先按 5.5 自动拒绝,此后待审批集合为空
+        meta = self._sessions().inspect(ctx, session_id)
+        if meta is None:
+            raise SessionError("会话不存在或无权访问,请开启新会话")
+        if meta.get("status") != "awaiting_approval":
+            raise ApprovalError("会话没有待审批的调用(可能已超时自动拒绝或已处理)")
+        validate_decisions(meta.get("approvals", []), decisions)   # 先验一次:失败不进入流
+        return self._resume_stream(ctx, session_id, meta, decisions)
+
+    def _resume_stream(self, ctx: AuthContext, session_id: str, meta: dict, decisions) -> Iterator[dict]:
+        try:
+            with self._sessions().turn(ctx, session_id, meta.get("document_id"), meta.get("profile"),
+                                       allow_awaiting=True) as turn:
+                yield {"type": "session", "session_id": turn.session_id}
+                # 租约内以最新元数据再校验一次(并发审批请求之间状态可能已变);
+                # 失败抛 ApprovalError,finally 会把 awaiting_approval 元数据原样恢复
+                normalized = validate_decisions(turn.metadata.get("approvals", []), decisions)
+                tools, tracker = self._make_tools(ctx)
+                agent_kwargs = self._agent_kwargs(ctx, tracker)
+                self._attach_persistence(agent_kwargs, turn)
+                gate = self._attach_hitl(agent_kwargs, ctx, turn)
+                agent = self._build_agent(tools, **agent_kwargs)   # interrupt_on 与首次一致(5.4)
+                turn.mark_started()
+                events = self._stream_graph(ctx, agent, Command(resume=build_resume_value(normalized)),
+                                            turn=turn, gate=gate, tracker=tracker,
+                                            agent_kwargs=agent_kwargs, history=None)
+                yield from self._drive_stream(turn, events)
+        except (ApprovalError, SessionError) as exc:
+            yield {"type": "error", "detail": str(exc)}
+        except Exception as exc:
+            logger.exception("qa approvals resume failed")
+            yield {"type": "error", "detail": f"{type(exc).__name__}: {exc}"}
+
+    def _expire_if_needed(self, ctx: AuthContext, session_id: str | None) -> None:
+        """5.5 惰性超时:会话停在 awaiting_approval 且已过 expires_at 时,先自动拒绝再处理请求。"""
+        if not self._persistence_enabled() or not self._hitl_enabled() or session_id is None:
+            return
+        meta = self._sessions().inspect(ctx, session_id)
+        if not meta or meta.get("status") != "awaiting_approval" or not parked_expired(meta):
+            return
+        self._expire_approvals(ctx, session_id, meta)
+
+    def _expire_approvals(self, ctx: AuthContext, session_id: str, meta: dict) -> None:
+        """以全部 reject 恢复挂起线程,运行到结束并**丢弃**输出;元数据恢复为 previous。
+
+        已知代价(06 R2):超时要多花一次纯文本模型调用;被丢弃的回答留在 checkpoint
+        历史中但不展示。拒绝文本已告知模型不要重试;仍持续重试时以 4 轮为上限,
+        超出按失败处理(有界成本)。恢复路径复用 _invoke_kwargs(durability="sync")。
+        """
+        previous = meta.get("previous")
+        if not previous:
+            raise RuntimeError(f"会话 {session_id} 的挂起元数据缺少 previous,无法超时恢复")
+        with self._sessions().turn(ctx, session_id, meta.get("document_id"), meta.get("profile"),
+                                   allow_awaiting=True) as turn:
+            tools, tracker = self._make_tools(ctx)
+            agent_kwargs = self._agent_kwargs(ctx, tracker)
+            self._attach_persistence(agent_kwargs, turn)
+            self._attach_hitl(agent_kwargs, ctx, turn)
+            agent = self._build_agent(tools, **agent_kwargs)
+            turn.mark_started()
+            value = build_resume_value([{**a, "type": "reject"} for a in meta.get("approvals", [])])
+            kwargs = self._invoke_kwargs(turn)
+            for _round in range(4):
+                agent.invoke(Command(resume=value), **kwargs)
+                pending = _pending_interrupts(agent, turn)
+                if not pending:
+                    break
+                value = build_resume_value([{**a, "type": "reject"} for a in approval_items(pending)])
+            else:
+                raise RuntimeError("审批超时自动拒绝未收敛(模型持续重试看图)")
+            turn.restore(previous)     # 引用列表保持进入挂起轮之前的状态
 
     # ---- 公共部分 ----
 
@@ -275,6 +448,9 @@ class QAService:
             from .context import skill_revision
             profile.update(schema=2, skills=self._skills_enabled(), memory=self._memory_enabled(),
                            skill_revision=skill_revision() if self._skills_enabled() else None)
+        # 06:仅开启时加入;关闭时 profile 必须与升级前逐字相同,否则已有会话被判"配置已改变"
+        if self._hitl_enabled():
+            profile["hitl"] = {"auto": getattr(self.settings, "qa_hitl_auto_approve_images", 2)}
         return profile
 
     @staticmethod
@@ -355,7 +531,7 @@ class QAService:
         return kwargs
 
     def _build_agent(self, tools, backend=None, trace=None, checkpointer=None, store=None,
-                     skills=None, memory_enabled=False):
+                     skills=None, memory_enabled=False, interrupt_on=None):
         middleware = []
         if self._persistence_enabled():
             from .history import CompletedRoundMiddleware
@@ -386,7 +562,7 @@ class QAService:
                 checker_max_calls=getattr(self.settings, "qa_checker_max_model_calls", 4),
                 backend=backend, middleware=middleware, trace=trace,
                 checkpointer=checkpointer, store=store, kb_vfs=self._kb_vfs(), skills=skills,
-                memory=memory_sources)
+                memory=memory_sources, interrupt_on=interrupt_on)
 
         from deepagents import create_deep_agent
 
@@ -401,6 +577,9 @@ class QAService:
             extra["memory"] = memory_sources
         if backend is not None:
             extra["backend"] = backend
+        if interrupt_on is not None:
+            # 06:create_deep_agent 在 interrupt_on 非空时自动装配 HumanInTheLoopMiddleware
+            extra["interrupt_on"] = interrupt_on
         if self._kb_vfs() or skills is not None or self._middleware_enabled():
             if not self._harness_registered:
                 self._register_harness()
@@ -524,6 +703,17 @@ def _history_cited_ids(history: list[dict] | None) -> tuple[set[str], set[str]]:
             chunks.update(_CITE_CHUNK_RE.findall(content))
             images.update(_CITE_IMAGE_RE.findall(content))
     return chunks, images
+
+
+def _pending_interrupts(agent, turn) -> list:
+    """F9:挂起只能从 get_state 发现(stream 模式下挂起静默结束、没有中断信号,F8)。
+
+    子智能体内的中断会冒泡到主图(F2),其 interrupt 同样出现在根状态的 tasks 里。
+    """
+    if turn is None:
+        return []
+    state = agent.get_state(turn.config)
+    return [interrupt for task in state.tasks for interrupt in task.interrupts]
 
 
 def _final_answer_text(messages: list) -> str:
