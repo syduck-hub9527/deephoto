@@ -25,10 +25,13 @@ _IMAGE_TEXT_LIMIT = 600
 
 
 class IndexService:
-    def __init__(self, embeddings=None, embedding_version: str | None = None):
-        """embeddings: 带 embed_documents/embed_query 的对象(如 OpenAIEmbeddings),可为 None。"""
+    def __init__(self, embeddings=None, embedding_version: str | None = None, *,
+                 batch_size: int = EMBED_BATCH):
+        """embeddings: 带 embed_documents/embed_query 的对象(如 OrderedEmbeddings),可为 None。
+        batch_size: 每批嵌入条数(≤ 32,BGE-M3 迁移 D3;默认保持 EMBED_BATCH)。"""
         self.embeddings = embeddings
         self.embedding_version = embedding_version
+        self.batch_size = batch_size
 
     # ---- 写入 ----
 
@@ -82,11 +85,12 @@ class IndexService:
 
     def _embed_items(self, conn: Connection, items: list[dict], observer) -> None:
         from ..pipeline import progress as pg
-        total_batches = (len(items) + EMBED_BATCH - 1) // EMBED_BATCH
+        batch_size = self.batch_size
+        total_batches = (len(items) + batch_size - 1) // batch_size
         observer.stage_start("embed_batches", parent="indexing", total=total_batches)
         degraded = 0
-        for batch_no, start in enumerate(range(0, len(items), EMBED_BATCH), start=1):
-            batch = items[start:start + EMBED_BATCH]
+        for batch_no, start in enumerate(range(0, len(items), batch_size), start=1):
+            batch = items[start:start + batch_size]
             observer.item_start("embed_batch", batch_no, label=f"第 {batch_no}/{total_batches} 批")
             try:
                 vectors = self.embeddings.embed_documents([i["searchable_text"] for i in batch])
@@ -125,13 +129,19 @@ class IndexService:
                 continue
             new_item_id = stable_item_id(dst["tenant_id"], dst["id"], dst["ingestion_version"],
                                          item["source_type"], new_source)
+            # 只有与当前版本一致的向量才可复制(D6)
+            same_version = (item["embedding_version"] is not None
+                            and item["embedding_version"] == self.embedding_version)
             repo.upsert_index_item(
                 conn, item_id=new_item_id, tenant_id=dst["tenant_id"], document_id=dst["id"],
                 ingestion_version=dst["ingestion_version"], source_type=item["source_type"],
                 source_id=new_source, embedding_version=item["embedding_version"],
-                searchable_text=item["searchable_text"], index_status=item["index_status"],
+                searchable_text=item["searchable_text"],
+                # 版本守卫(D6):向量只复制版本一致的项;不一致的项置 keyword_only 等待重建,
+                # 保留原版本号便于追溯来源模型
+                index_status=item["index_status"] if same_version else "keyword_only",
             )
-            if item["id"] in vectors:
+            if same_version and item["id"] in vectors:
                 repo.put_embedding(conn, new_item_id, vectors[item["id"]])
 
     # ---- 检索 ----
@@ -177,20 +187,38 @@ class IndexService:
         return {"chunks": chunks, "images": images}
 
     def _vector_scores(self, conn: Connection, query: str, item_ids: list[str]) -> dict[str, float]:
+        """向量分(带版本与维度守卫,D6):只用与当前版本一致的向量;任何维度错配或
+        底层异常都降级返回 {}(走关键词),问答不得因此失败(§1 问题 1、§5.3)。"""
         try:
             query_vec = np.asarray(self.embeddings.embed_query(query), dtype=np.float32)
         except Exception as exc:
             logger.warning("query embedding failed, keyword only: %s", exc)
             return {}
-        stored = repo.get_embeddings(conn, item_ids)
+        stored = repo.get_embeddings_for_version(conn, item_ids, self.embedding_version)
         if not stored:
             return {}
-        ids = list(stored)
-        matrix = np.stack([np.frombuffer(stored[i], dtype=np.float32) for i in ids])
-        q_norm = query_vec / (np.linalg.norm(query_vec) or 1.0)
-        m_norm = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12)
-        sims = m_norm @ q_norm
-        return normalize({item_id: float(max(sims[i], 0.0)) for i, item_id in enumerate(ids)})
+        # 维度守卫:字节长度不符的向量是别的模型/迁移残留,过滤并计数告警(每条查询只报一次)
+        dim = query_vec.shape[0]
+        usable = {item_id: blob for item_id, blob in stored.items() if len(blob) == dim * 4}
+        wrong_dim = len(stored) - len(usable)
+        if wrong_dim:
+            logger.warning("skipped %d stored vectors with dimension mismatch (query dim=%d)",
+                           wrong_dim, dim)
+        if not usable:
+            if wrong_dim == len(stored):
+                logger.warning("query vector dimension %d matches no stored vectors, keyword only",
+                               dim)
+            return {}
+        try:
+            ids = list(usable)
+            matrix = np.stack([np.frombuffer(usable[i], dtype=np.float32) for i in ids])
+            q_norm = query_vec / (np.linalg.norm(query_vec) or 1.0)
+            m_norm = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12)
+            sims = m_norm @ q_norm
+            return normalize({item_id: float(max(sims[i], 0.0)) for i, item_id in enumerate(ids)})
+        except Exception:
+            logger.exception("vector scoring failed, keyword only")
+            return {}
 
 
 def _image_searchable_text(occ: dict) -> str:

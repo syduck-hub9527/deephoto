@@ -18,10 +18,11 @@ from fastapi.staticfiles import StaticFiles
 
 from ..agent.knowledge import KnowledgeService
 from ..agent.qa import QAService
-from ..config import Settings, description_uses_plain_http, load_settings, validate_description, validate_qa_context
+from ..config import (Settings, description_uses_plain_http, load_settings,
+                      validate_description, validate_embeddings, validate_qa_context)
 from ..db import init_db
-from ..indexing.service import IndexService
-from ..llm import build_description_model, build_embeddings
+from ..indexing.probe import build_index_service
+from ..llm import build_description_model
 from ..parsing.pymupdf_parser import PyMuPDFParser
 from ..pipeline.ingest import IngestService
 from ..progress_store import ProgressStore
@@ -37,6 +38,7 @@ _WEB_DIR = Path(__file__).parent.parent / "web"
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
+    validate_embeddings(settings)   # 直传 Settings 时同样校验(幂等);Base URL 形态错误在此拦截
     validate_description(settings)   # 直传 Settings 时也要启动校验(load_settings 内已校验一次,幂等)
     validate_qa_context(settings)
     if description_uses_plain_http(settings):
@@ -54,11 +56,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     store = ObjectStore(settings.object_dir)
     parser = PyMuPDFParser()
-    embeddings = build_embeddings(settings)
-    index_service = IndexService(
-        embeddings=embeddings,
-        embedding_version=settings.embedding_model if embeddings else None,
-    )
+    # 嵌入客户端 + 启动探测(探测失败降级为纯关键词,不阻塞启动;§5.2)
+    index_service = build_index_service(settings)
     ingest_service = IngestService(
         settings, store, parser, index_service,
         # 图片描述专用工厂(与问答模型解耦);问答服务继续走 build_chat_model,互不共享缓存
@@ -74,7 +73,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         worker = IngestWorker(ingest_service, settings.db_path, progress_store=progress_store)
         worker.start()
-        logger.info("deephoto started; embeddings=%s", "on" if embeddings else "off")
+        logger.info("deephoto started; embeddings=%s",
+                    "on" if index_service.embeddings else "off")
         logger.info("image_description enabled=%s model=%s reasoning_effort=%s timeout=%s retries=%s",
                     settings.description_enabled,
                     settings.description_model if settings.description_enabled else "-",

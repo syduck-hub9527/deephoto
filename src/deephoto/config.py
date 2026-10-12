@@ -63,6 +63,20 @@ def _get_int(name: str, default: int, *, minimum: int, maximum: int | None = Non
     return value
 
 
+def _get_int_optional(name: str, *, minimum: int) -> int | None:
+    """可选整数:未设置返回 None;设置时必须合法且 >= minimum(用于 EMBEDDING_DIM)。"""
+    raw = _get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须是整数,当前值无法解析") from None
+    if value < minimum:
+        raise ValueError(f"环境变量 {_ENV_PREFIX}{name} 必须 >= {minimum}")
+    return value
+
+
 def _get_formats() -> frozenset:
     """DEEPHOTO_ALLOWED_FORMATS:逗号分隔的格式 key 白名单;空/未设置 -> 默认可用集。
     未知 key 报错点名变量(与 DESCRIPTION_* 校验同风格)。"""
@@ -142,6 +156,12 @@ class Settings:
     data_dir: Path
     max_upload_mb: int
     ingestion_version: str
+
+    # 嵌入调用参数(BGE-M3 迁移 §4):embedding_version 形如 f"{model}#{dim}",dim 来自启动探测
+    embedding_dim: int | None = None          # 可选;设定后探测维度必须相等,否则关闭向量
+    embedding_batch_size: int = 20            # 1–32(SiliconFlow 单次数组上限)
+    embedding_max_retries: int = 3            # SDK 层重试(429/503 等)
+    embedding_timeout_seconds: float = 60.0   # 单次请求超时,下限 5
 
     # MinerU 云端解析:唯一的 PDF 解析器,写死不可选;Token 仅由服务端环境变量提供
     mineru_api_key: str | None = None
@@ -235,6 +255,10 @@ def load_settings() -> Settings:
         embedding_base_url=_get("EMBEDDING_BASE_URL"),
         embedding_api_key=_get("EMBEDDING_API_KEY"),
         embedding_model=_get("EMBEDDING_MODEL"),
+        embedding_dim=_get_int_optional("EMBEDDING_DIM", minimum=1),
+        embedding_batch_size=_get_int("EMBEDDING_BATCH_SIZE", 20, minimum=1, maximum=32),
+        embedding_max_retries=_get_int("EMBEDDING_MAX_RETRIES", 3, minimum=0),
+        embedding_timeout_seconds=_get_float("EMBEDDING_TIMEOUT_SECONDS", 60.0, minimum=5.0),
         data_dir=Path(_get("DATA_DIR", "./data")).resolve(),
         max_upload_mb=int(_get("MAX_UPLOAD_MB", "100")),
         ingestion_version=_get("INGESTION_VERSION", "v2"),
@@ -274,9 +298,22 @@ def load_settings() -> Settings:
         mineru_no_ocr_formats=_get_no_ocr_formats(),
         max_zip_uncompressed_mb=_get_int("MAX_ZIP_UNCOMPRESSED_MB", 500, minimum=1),
     )
+    validate_embeddings(settings)
     validate_description(settings)
     validate_qa_context(settings)
     return settings
+
+
+def validate_embeddings(settings: "Settings") -> None:
+    """嵌入端点配置校验(BGE-M3 迁移 §4):报配置变量名,不输出变量值或密钥。未配置时不校验。"""
+    url = (settings.embedding_base_url or "").strip()
+    if not url:
+        return
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("DEEPHOTO_EMBEDDING_BASE_URL 必须以 http:// 或 https:// 开头")
+    if url.rstrip("/").endswith("/embeddings"):
+        # 客户端会自动拼接 /embeddings;写成 …/v1/embeddings 会请求 …/embeddings/embeddings 得到 404
+        raise ValueError("DEEPHOTO_EMBEDDING_BASE_URL 请填到 /v1 为止的 Base URL,不要包含 /embeddings")
 
 
 def validate_qa_context(settings: "Settings") -> None:

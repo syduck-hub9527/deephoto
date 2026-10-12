@@ -281,6 +281,70 @@ def get_embeddings(conn: Connection, item_ids: list[str]) -> dict[str, bytes]:
     return {r["item_id"]: r["vector"] for r in rows}
 
 
+# ---- 嵌入版本守卫与批量重建(embedding-bge-m3-migration §5.4)----
+
+def get_embeddings_for_version(conn: Connection, item_ids: list[str], version: str | None) -> dict[str, bytes]:
+    """只返回 index_items.embedding_version == version 的向量(检索的版本守卫,D6)。"""
+    if not item_ids:
+        return {}
+    marks = ",".join("?" for _ in item_ids)
+    rows = conn.execute(
+        f"SELECT e.item_id, e.vector FROM embeddings e"
+        f" JOIN index_items i ON i.id = e.item_id"
+        f" WHERE i.embedding_version = ? AND e.item_id IN ({marks})",
+        [version, *item_ids]).fetchall()
+    return {r["item_id"]: r["vector"] for r in rows}
+
+
+def items_missing_vector(conn: Connection, version: str | None,
+                         limit: int, after_id: str = "") -> list[dict]:
+    """没有当前版本向量的索引项(id、searchable_text),按 id 升序分页(重建取批)。
+
+    "没有"= index_items.embedding_version 与当前版本不一致,或一致但尚无向量记录。
+    空 searchable_text 的项本来就不向量化(§6 第 5 步验收 carve-out),不进入重建。
+    """
+    rows = conn.execute(
+        "SELECT i.id, i.searchable_text FROM index_items i"
+        " LEFT JOIN embeddings e ON e.item_id = i.id AND i.embedding_version = ?"
+        " WHERE e.item_id IS NULL AND TRIM(i.searchable_text) != '' AND i.id > ?"
+        " ORDER BY i.id LIMIT ?",
+        (version, after_id, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_items_missing_vector(conn: Connection, version: str | None) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) c FROM index_items i"
+        " LEFT JOIN embeddings e ON e.item_id = i.id AND i.embedding_version = ?"
+        " WHERE e.item_id IS NULL AND TRIM(i.searchable_text) != ''",
+        (version,)).fetchone()
+    return row["c"]
+
+
+def set_item_version(conn: Connection, item_id: str, version: str, index_status: str) -> None:
+    """重建成功后更新 embedding_version 与 index_status。"""
+    conn.execute("UPDATE index_items SET embedding_version = ?, index_status = ? WHERE id = ?",
+                 (version, index_status, item_id))
+
+
+def prune_old_vectors(conn: Connection, version: str | None) -> int:
+    """删除不属于当前版本的向量;只在全部重建成功后调用(§6 第 6 步)。"""
+    cur = conn.execute(
+        "DELETE FROM embeddings WHERE item_id IN"
+        " (SELECT e.item_id FROM embeddings e JOIN index_items i ON i.id = e.item_id"
+        "  WHERE i.embedding_version IS NOT ?)",
+        (version,))
+    return cur.rowcount
+
+
+def count_documents_by_status(conn: Connection, statuses: tuple[str, ...]) -> int:
+    """处于给定状态的文档数(重建前检查是否有正在进行的入库任务,§5.5)。"""
+    marks = ",".join("?" for _ in statuses)
+    row = conn.execute(
+        f"SELECT COUNT(*) c FROM documents WHERE status IN ({marks})", statuses).fetchone()
+    return row["c"]
+
+
 def delete_stale_index_items(conn: Connection, document_id: str, keep_ids: list[str]) -> None:
     """删除该文档不在 keep_ids 中的索引项及其向量(重复入库一致性)。"""
     existing = [r["id"] for r in conn.execute(

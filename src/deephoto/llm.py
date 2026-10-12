@@ -70,18 +70,57 @@ def build_description_model(settings: Settings, *, max_tokens: int | None = None
     return ChatOpenAI(**kwargs)
 
 
+class OrderedEmbeddings:
+    """薄嵌入客户端(embedding-bge-m3-migration §5.1):按批调用 OpenAI 兼容 /embeddings。
+
+    用 openai 原生客户端而不是 langchain OpenAIEmbeddings(§5.1 备选路径):langchain 1.7.0
+    的 embed_documents 直接按 response["data"] 的返回顺序与文本配对,不按 index 排序,也没有
+    可截获原始响应的扩展点(已在锁定版本源码确认,embeddings/base.py 的
+    `embeddings.extend(r["embedding"] for r in response["data"])`);SiliconFlow 未承诺 data
+    有序(S6),乱序会把向量静默错配到文本(R2)。这里每批按 data[].index 归位后再拼接。
+    接口与 IndexService 现有调用方一致(embed_documents / embed_query);
+    check_embedding_ctx_length 随 langchain 一起退役(不再经过它的 tiktoken 预切分)。
+    """
+
+    def __init__(self, *, model: str, api_key: str, base_url: str, batch_size: int,
+                 max_retries: int, timeout: float):
+        from openai import OpenAI
+
+        self._model = model
+        self._batch_size = batch_size
+        self._client = OpenAI(api_key=api_key, base_url=base_url,
+                              max_retries=max_retries, timeout=timeout)
+
+    @property
+    def client(self):
+        """测试捕获请求参数用(patch.object(emb.client, "create"))。"""
+        return self._client.embeddings
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self._batch_size):
+            batch = texts[start:start + self._batch_size]
+            response = self._client.embeddings.create(
+                model=self._model, input=batch,
+                encoding_format="float")      # D2;bge-m3 不传 dimensions(D4/S3)
+            data = response.model_dump()["data"]
+            data.sort(key=lambda item: item["index"])         # S6:按 index 归位
+            vectors.extend(item["embedding"] for item in data)
+        return vectors
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
+
 def build_embeddings(settings: Settings):
     """可选嵌入模型(OpenAI 兼容端点)。未配置返回 None,检索退化为纯关键词。"""
     if not settings.embeddings_enabled:
         return None
-    from langchain_openai import OpenAIEmbeddings
-    from pydantic import SecretStr
-
-    return OpenAIEmbeddings(
-        model=settings.embedding_model, # type: ignore
-        api_key=SecretStr(settings.embedding_api_key or "not-needed"),
+    return OrderedEmbeddings(
+        model=settings.embedding_model,
+        api_key=settings.embedding_api_key or "not-needed",   # 自建端点可能不校验 key
         base_url=settings.embedding_base_url,
-        # 默认 True 会先 tiktoken 切成 token ID 数组再请求;
-        # 百炼等兼容端点只接受字符串,必须关掉
-        check_embedding_ctx_length=False,
+        batch_size=settings.embedding_batch_size,       # ≤ 32,SiliconFlow 数组上限(D3/S2)
+        max_retries=settings.embedding_max_retries,     # D9:429/503 由 SDK 层重试
+        timeout=settings.embedding_timeout_seconds,     # D9
     )

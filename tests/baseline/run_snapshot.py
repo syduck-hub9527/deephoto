@@ -28,8 +28,7 @@ from deephoto.agent.knowledge import KnowledgeService  # noqa: E402
 from deephoto.agent.qa import QAService  # noqa: E402
 from deephoto.config import load_settings  # noqa: E402
 from deephoto.db import connect  # noqa: E402
-from deephoto.indexing.service import IndexService  # noqa: E402
-from deephoto.llm import build_embeddings  # noqa: E402
+from deephoto.indexing.probe import build_index_service  # noqa: E402
 from deephoto.security import LOCAL_CTX  # noqa: E402
 from deephoto.storage import ObjectStore  # noqa: E402
 
@@ -46,11 +45,7 @@ def _pkg_version(name: str) -> str | None:
 def _build_qa(settings) -> tuple[QAService, KnowledgeService]:
     """与 api/app.py 同一套接线(只取问答所需部分,不起入库 worker)。"""
     store = ObjectStore(settings.object_dir)
-    embeddings = build_embeddings(settings)
-    index_service = IndexService(
-        embeddings=embeddings,
-        embedding_version=settings.embedding_model if embeddings else None,
-    )
+    index_service = build_index_service(settings)   # 与 app.py 一致的嵌入探测装配(§5.2)
     knowledge = KnowledgeService(store, index_service)
     return QAService(settings, knowledge), knowledge
 

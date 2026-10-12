@@ -46,7 +46,8 @@ pip freeze > requirements.lock.txt
 | `MOONSHOT_BASE_URL` | Kimi Code 会员路由 `https://api.kimi.com/coding/v1`;直连 API 用 `https://api.moonshot.cn/v1` | coding 路由 |
 | `CHAT_MODEL` | coding 路由用 `k3`;直连 API 用 `kimi-k3`(不可混用) | `k3` |
 | `CHAT_TEMPERATURE` | 采样温度 | `1` |
-| `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_API_KEY` | 可选嵌入端点(任意 OpenAI 兼容,如阿里云百炼 `https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen3.7-text-embedding`)。**不配置时自动降级为纯关键词检索** | 关闭 |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_API_KEY` | 可选嵌入端点(OpenAI 兼容)。推荐 SiliconFlow 托管 `BAAI/bge-m3`(国内站 `https://api.siliconflow.cn/v1`,稠密维度 1024);Base URL 填到 `/v1` 为止,不要包含 `/embeddings`。**不配置时自动降级为纯关键词检索** | 关闭 |
+| `EMBEDDING_DIM` / `EMBEDDING_BATCH_SIZE` / `EMBEDDING_MAX_RETRIES` / `EMBEDDING_TIMEOUT_SECONDS` | 嵌入调优:显式期望维度(设定后启动探测必须相等)/ 每批条数(1–32)/ SDK 重试 / 单次超时(≥5s) | 无 / `20` / `3` / `60` |
 | `DATA_DIR` | 数据库与对象存储目录 | `./data` |
 | `MAX_UPLOAD_MB` | 上传大小上限 | `100` |
 | `INGESTION_VERSION` | 解析/索引版本;去重复用的判定维度之一 | `v2` |
@@ -131,6 +132,7 @@ MinerU 是唯一的 PDF 解析器(代码中写死,租户不可选择)。Token �
 
 - 多栏排版阅读顺序为近似(未做栏检测);跨页图、复杂子图依赖 `needs_review` 抽检(§3.2 已声明需额外校验)。
 - 描述输出非合法 JSON 的图/表会在首轮全部完成后自动集中重试(默认 2 轮,疑似截断的按轮翻倍输出上限);重试用尽仍失败的保持空描述降级,不影响文档 `ready`,仅以图注和正文参与检索(`DESCRIPTION_PARSE_RETRY_ROUNDS=0` 恢复旧行为)。
+- 嵌入向量按 `模型#维度` 版本隔离:切换嵌入模型后,旧向量不参与检索也不随去重克隆复制;基于已存文本重建(无需重新解析):`python -m deephoto.indexing.reembed --dry-run` 预估,`--sleep 0.5` 执行,验收后 `--prune` 清理旧向量。重建期间问答可用(未重建的项走关键词)。启动探测失败(模型不可达/维度不符)不阻塞服务,自动降级为纯关键词并记错误日志。
 - 扫描版 PDF 同样整份交给 MinerU 解析;MinerU 不可用时对应文档标记 `failed`,无本地 OCR 兜底。
 - 无鉴权,仅本地单机使用;如需暴露到网络,必须先接入真实身份系统(数据层的 tenant 过滤结构保留)。
 - worker 为单进程内线程;多副本部署需换真实队列。
