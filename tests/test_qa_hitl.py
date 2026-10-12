@@ -24,7 +24,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from deephoto import repo
 from deephoto.agent.hitl import (ApprovalError, ImageApprovalGate, approval_items,
                                  build_resume_value, describe_image_request, validate_decisions)
-from deephoto.agent.persistence import SessionError
+from deephoto.agent.persistence import SessionError, SessionTurn
 from deephoto.agent.qa import QAService, _seed_tracker
 from deephoto.db import connect
 
@@ -517,6 +517,77 @@ class HitlTimeoutTest(_ServiceCase):
         with self.assertRaisesRegex(ApprovalError, "没有待审批"):
             qa.resolve_approvals(self.ctx, sid, [{"approval_id": "ap_1", "type": "approve"}])
         self.assertEqual(model.calls_made, 2)                      # 自动拒绝跑完一轮
+        self.assertEqual(self._metadata(qa, sid)["status"], "ready")
+
+
+class HitlTimeoutRaceTest(_ServiceCase):
+    """REV-4(md文档/06-hitl-review-fixes.md §4.3):超时自动拒绝不得在并发下重复执行。"""
+
+    # §4.3-1:顺序重复触发,第二次不产生任何模型调用;持陈旧 meta 直接调用同样不动图
+    def test_repeated_expire_runs_nothing_after_first(self):
+        qa = self._qa()
+        sid, _parked, model = self._park_first_turn(qa)
+        self._backdate_expiry(qa, sid)
+        qa._expire_if_needed(self.ctx, sid)
+        self.assertEqual(model.calls_made, 2)              # 挂起 1 + 自动拒绝收尾恰好 1
+        self.assertEqual(self._metadata(qa, sid)["status"], "ready")
+        qa._expire_if_needed(self.ctx, sid)                # 第二次:inspect 读到 ready 即返回
+        self.assertEqual(model.calls_made, 2)
+        # 拿租约外读到的陈旧 meta 直接再调:租约内重新校验(turn.previous)应直接返回
+        stale = {**self._metadata(qa, sid), "status": "awaiting_approval",
+                 "expires_at": "2020-01-01T00:00:00+00:00", "previous": {"status": "ready"}}
+        qa._expire_approvals(self.ctx, sid, stale)
+        self.assertEqual(model.calls_made, 2)
+        self.assertEqual(self._metadata(qa, sid)["status"], "ready")
+
+    # §4.3-2:并发超时恢复:reject 恢复只执行一次;后到者得到不含内部异常文本的忙碌错误
+    def test_concurrent_expire_rejects_once_and_reports_busy_cleanly(self):
+        qa = self._qa()
+        model = self._model(qa, [
+            {"tool": "inspect_image", "args": {"image_occurrence_id": self.occ}},
+            "EXPIRED_DISCARD",                             # 自动拒绝的收尾(应被丢弃)
+            "甲线程的回答"])
+        first = list(qa.answer_stream(self.ctx, "q1", self.doc_a))
+        sid = first[-1]["session_id"]
+        self._backdate_expiry(qa, sid)
+
+        # 确定性重叠(比 barrier 碰运气更稳):把先进入超时恢复的线程停在 restore 里,
+        # 后到线程此刻发起 answer_stream,必然撞上租约
+        restore_entered = threading.Event()
+        release_restore = threading.Event()
+        original_restore = SessionTurn.restore
+
+        def gated_restore(turn, metadata):
+            restore_entered.set()
+            if not release_restore.wait(10):
+                raise RuntimeError("test gate timeout")
+            original_restore(turn, metadata)
+
+        outcomes = {}
+
+        def worker(name, question):
+            outcomes[name] = list(qa.answer_stream(self.ctx, question, self.doc_a,
+                                                   session_id=sid))
+
+        with patch.object(SessionTurn, "restore", gated_restore):
+            t1 = threading.Thread(target=worker, args=("t1", "甲问"), daemon=True)
+            t1.start()
+            self.assertTrue(restore_entered.wait(10))      # t1 已持租约并停在 restore
+            t2 = threading.Thread(target=worker, args=("t2", "乙问"), daemon=True)
+            t2.start()
+            t2.join(30)                                    # t2 应迅速以忙碌错误结束
+            self.assertFalse(t2.is_alive())
+            release_restore.set()
+            t1.join(30)
+            self.assertFalse(t1.is_alive())
+
+        self.assertEqual(model.calls_made, 3)              # 挂起 1 + 拒绝收尾恰好 1 + 甲回答 1
+        t1_events, t2_events = outcomes["t1"], outcomes["t2"]
+        self.assertEqual(t1_events[-1]["type"], "done")
+        self.assertEqual(t1_events[-1]["answer"], "甲线程的回答")
+        self.assertNotIn("EXPIRED_DISCARD", json.dumps(t1_events))
+        self.assertEqual(t2_events[-1]["type"], "error")
+        self.assertEqual(t2_events[-1]["detail"], "该会话正在回答,请等待本轮结束")
         self.assertEqual(self._metadata(qa, sid)["status"], "ready")
 
 

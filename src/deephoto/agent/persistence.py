@@ -37,6 +37,14 @@ class SessionError(ValueError):
     """会话不存在、范围不匹配或上轮未完成。"""
 
 
+class SessionBusyError(RuntimeError):
+    """会话租约冲突:同一会话已有正在进行的轮次。
+
+    继承 RuntimeError 保持既有路由映射(503)与既有测试的异常口径;
+    流式路径单独捕获它,以下发不含内部异常类型名的"会话正在处理"提示(REV-4)。
+    """
+
+
 class DocumentScopeError(SessionError):
     """文档暂不可用,图尚未执行,不改变健康会话状态。"""
 
@@ -191,7 +199,7 @@ class QAPersistence:
         with self._lock:
             self._open()
             if thread_id in self._active:
-                raise RuntimeError("该会话正在回答,请等待本轮结束")
+                raise SessionBusyError("该会话正在回答,请等待本轮结束")
             self._active.add(thread_id)
         try:
             yield

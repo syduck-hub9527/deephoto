@@ -32,7 +32,8 @@ from .answer_format import normalize_image_anchors
 from .hitl import (ApprovalError, approval_items, build_resume_value, validate_decisions)
 from .knowledge import KnowledgeService
 from .locator import locator_label
-from .persistence import DocumentScopeError, deadline, parked_expired
+from .persistence import (DocumentScopeError, SessionBusyError, SessionError, deadline,
+                          parked_expired)
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,10 @@ class QAService:
                         turn, self._stream_impl(ctx, question, document_id, None, turn))
         except DocumentScopeError as exc:
             yield {"type": "error", "detail": str(exc), "code": "document_scope_unavailable", "recoverable": True}
+        except (SessionError, SessionBusyError) as exc:
+            # 会话状态/租约冲突是用户可理解的"会话正在处理"类信号(REV-4):
+            # 只下发面向用户的文案,不带内部异常类型名
+            yield {"type": "error", "detail": str(exc)}
         except Exception as exc:
             logger.exception("qa stream failed")
             yield {"type": "error", "detail": f"{type(exc).__name__}: {exc}"}
@@ -352,7 +357,7 @@ class QAService:
                                             turn=turn, gate=gate, tracker=tracker,
                                             agent_kwargs=agent_kwargs, history=None)
                 yield from self._drive_stream(turn, events)
-        except (ApprovalError, SessionError) as exc:
+        except (ApprovalError, SessionError, SessionBusyError) as exc:
             yield {"type": "error", "detail": str(exc)}
         except Exception as exc:
             logger.exception("qa approvals resume failed")
@@ -379,6 +384,12 @@ class QAService:
             raise RuntimeError(f"会话 {session_id} 的挂起元数据缺少 previous,无法超时恢复")
         with self._sessions().turn(ctx, session_id, meta.get("document_id"), meta.get("profile"),
                                    allow_awaiting=True) as turn:
+            # REV-4:租约内以进入本轮前读到的状态(turn.previous)重新校验。两个并发请求可能
+            # 都在租约外读到"已超时";先完成自动拒绝的一方已把会话写回 ready,后到者不得再对
+            # 该线程执行恢复(ready 线程没有待审批中断,恢复会出错或产生多余模型调用)。
+            state = turn.previous or {}
+            if state.get("status") != "awaiting_approval" or not parked_expired(state):
+                return
             tools, tracker = self._make_tools(ctx)
             # REV-1:与人工恢复路径同样预填证据;输出虽被丢弃,两条路径行为保持一致
             _seed_tracker(tracker, turn.metadata.get("evidence"))
@@ -387,7 +398,7 @@ class QAService:
             self._attach_hitl(agent_kwargs, ctx, turn)
             agent = self._build_agent(tools, **agent_kwargs)
             turn.mark_started()
-            value = build_resume_value([{**a, "type": "reject"} for a in meta.get("approvals", [])])
+            value = build_resume_value([{**a, "type": "reject"} for a in state.get("approvals", [])])
             kwargs = self._invoke_kwargs(turn)
             for _round in range(4):
                 agent.invoke(Command(resume=value), **kwargs)
@@ -397,7 +408,7 @@ class QAService:
                 value = build_resume_value([{**a, "type": "reject"} for a in approval_items(pending)])
             else:
                 raise RuntimeError("审批超时自动拒绝未收敛(模型持续重试看图)")
-            turn.restore(previous)     # 引用列表保持进入挂起轮之前的状态
+            turn.restore(state.get("previous") or previous)     # 引用列表保持进入挂起轮之前的状态
 
     # ---- 公共部分 ----
 
