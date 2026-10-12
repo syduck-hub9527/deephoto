@@ -42,12 +42,18 @@ def describe_image(
     caption: str | None,
     section: str | None,
     context_text: str | None,
+    *,
+    retry_hint: str | None = None,
 ) -> dict:
     """返回 {visible_summary, ..., uncertain_details, diagnostic}。
 
     diagnostic["result"]: "ok" 调用完成且 JSON 解析成功;"parse_failed" 调用完成
     但输出不是有效 JSON(内容降级为空描述,不能按成功计数)。观测据此区分
     正常描述与格式失败;不根据描述是否为空猜结果(空也可能是合法的"不清楚")。
+    parse_failed 时 diagnostic 另含机读字段 reason/code(失败分类)与
+    truncated(截断信号),供集中重试决定 max_tokens 与提示词(§4.5);
+    ok 返回不含这些键,保持原有结构不变。
+    retry_hint:重试时追加在提示词与上下文之后的格式提醒(不改动 _PROMPT 本体)。
     """
     from langchain_core.messages import HumanMessage
 
@@ -60,13 +66,30 @@ def describe_image(
         meta_lines.append(f"相关正文摘录:{context_text[:800]}")
     meta = "\n".join(meta_lines) or "(无图注与正文上下文)"
 
+    text = _PROMPT + "\n\n" + meta
+    if retry_hint:
+        text += "\n\n" + retry_hint
     data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode()}"
     message = HumanMessage(content=[
-        {"type": "text", "text": _PROMPT + "\n\n" + meta},
+        {"type": "text", "text": text},
         {"type": "image_url", "image_url": {"url": data_url}},
     ])
     response = chat_model.invoke([message])
-    return parse_description_json(_response_text(response.content))
+    raw = _response_text(response.content)
+    result = parse_description_json(raw)
+    if result["diagnostic"]["result"] != "ok":
+        result["diagnostic"]["truncated"] = _truncated(response, raw)
+    return result
+
+
+def _truncated(response, raw: str) -> bool:
+    """截断信号:优先响应元数据 finish_reason == "length";取不到时用启发式
+    (原始文本中 { 多于 })。是否截断决定重试是否升级 max_tokens(§4.4)。"""
+    metadata = getattr(response, "response_metadata", None) or {}
+    finish_reason = metadata.get("finish_reason")
+    if finish_reason is not None:
+        return finish_reason == "length"
+    return raw.count("{") > raw.count("}")
 
 
 def _response_text(content) -> str:
@@ -86,22 +109,26 @@ def parse_description_json(raw: str) -> dict:
 
     空输出、截断、非法 JSON、非对象根值、字段类型不匹配一律 parse_failed,
     不能当成功(空字符串字段值本身可能是合法的"不清楚",不按内容判)。
+    失败分支的 diagnostic["code"] 机读分类:empty / no_json / invalid_json /
+    not_object / field_type,供重试选择 max_tokens 与提示策略(§4.4)。
     """
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
-        return _fallback("模型未返回 JSON 对象")
+        if not raw.strip():
+            return _fallback("模型未返回内容(空输出)", "empty")
+        return _fallback("模型未返回 JSON 对象", "no_json")
     try:
         data = json.loads(match.group(0))
     except json.JSONDecodeError as exc:
-        return _fallback(f"JSON 解析失败:{type(exc).__name__}")
+        return _fallback(f"JSON 解析失败:{type(exc).__name__}", "invalid_json")
     if not isinstance(data, dict):
-        return _fallback("模型返回的 JSON 不是对象")
+        return _fallback("模型返回的 JSON 不是对象", "not_object")
     for key in ("visible_summary", "caption", "context_summary"):
         if data.get(key) is not None and not isinstance(data[key], str):
-            return _fallback(f"{key} 字段不是字符串")
+            return _fallback(f"{key} 字段不是字符串", "field_type")
     for key in ("visible_labels", "uncertain_details"):
         if data.get(key) is not None and not isinstance(data[key], list):
-            return _fallback(f"{key} 字段不是列表")
+            return _fallback(f"{key} 字段不是列表", "field_type")
     return {
         "visible_summary": str(data.get("visible_summary") or ""),
         "visible_labels": [str(x) for x in data.get("visible_labels") or []][:20],
@@ -112,12 +139,12 @@ def parse_description_json(raw: str) -> dict:
     }
 
 
-def _fallback(reason: str) -> dict:
+def _fallback(reason: str, code: str) -> dict:
     return {
         "visible_summary": "",
         "visible_labels": [],
         "caption": "",
         "context_summary": "",
         "uncertain_details": [reason],
-        "diagnostic": {"result": "parse_failed"},
+        "diagnostic": {"result": "parse_failed", "reason": reason, "code": code},
     }

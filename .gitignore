@@ -15,3 +15,4 @@ claude-web-md/
 tests/baseline/snapshots/
 # Linux 虚拟环境(Windows 环境在 venv/)
 .venv/
+CLAUDE.md

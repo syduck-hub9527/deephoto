@@ -161,6 +161,11 @@ class Settings:
     # 描述并发度:数据类默认 1(串行,与旧行为一致,现有测试依赖调用次序);
     # 生产经 load_settings 默认 4。上限 16(滑动窗口内存 = 在途图字节数 × 并发度)
     description_concurrency: int = 1
+    # parse_failed 集中重试(DEV_describe_parse_retry):数据类默认 0 = 关闭
+    # (直接构造保持旧行为,首轮立即告警);生产经 load_settings 默认 2 轮
+    description_parse_retry_rounds: int = 0
+    description_retry_max_tokens_cap: int = 4096    # 重试 max_tokens 上限(>= description_max_tokens)
+    description_retry_backoff_seconds: float = 2.0  # 相邻两轮之间的等待秒数
 
     # 多格式:上传白名单(formats.FormatInfo.key);默认只开当前有可用引擎的格式
     allowed_formats: frozenset = frozenset(
@@ -259,6 +264,9 @@ def load_settings() -> Settings:
         description_max_retries=_get_int("DESCRIPTION_MAX_RETRIES", 1, minimum=0),
         description_max_tokens=_get_int("DESCRIPTION_MAX_TOKENS", 1024, minimum=1),
         description_concurrency=_get_int("DESCRIPTION_CONCURRENCY", 4, minimum=1, maximum=16),
+        description_parse_retry_rounds=_get_int("DESCRIPTION_PARSE_RETRY_ROUNDS", 2, minimum=0, maximum=5),
+        description_retry_max_tokens_cap=_get_int("DESCRIPTION_RETRY_MAX_TOKENS_CAP", 4096, minimum=1),
+        description_retry_backoff_seconds=_get_float("DESCRIPTION_RETRY_BACKOFF_SECONDS", 2.0, minimum=0.0),
         allowed_formats=_get_formats(),
         markdown_data_uri_max_mb=_get_int("MARKDOWN_DATA_URI_MAX_MB", 10, minimum=1),
         docx_parser=_get_choice("DOCX_PARSER", "local", ("local", "mineru")),
@@ -280,6 +288,9 @@ def validate_qa_context(settings: "Settings") -> None:
 
 def validate_description(settings: "Settings") -> None:
     """启用描述时启动校验:报配置变量名,不输出变量值或密钥。关闭时不要求 key/URL。"""
+    if settings.description_retry_max_tokens_cap < settings.description_max_tokens:
+        # 跨字段一致性:重试上限低于首轮上限会让"截断后加倍"反而变小;关闭描述时同样拦截
+        raise ValueError("DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP 必须 >= DEEPHOTO_DESCRIPTION_MAX_TOKENS")
     if not settings.description_enabled:
         return
     problems = []

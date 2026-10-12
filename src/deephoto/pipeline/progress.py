@@ -19,6 +19,9 @@ STAGE_CHUNKS = "chunks_and_links"
 STAGE_DESCRIBING = "describing"
 STAGE_INDEXING = "indexing"
 STAGE_FINALIZING = "finalizing"
+# describing 的子阶段:首轮全部跑完后集中重试 parse_failed 项(DEV_describe_parse_retry);
+# 子阶段不入 TOP_STAGES(与 mineru_split / embed_batches 同),经 parent= 挂到 describing
+STAGE_DESCRIBE_RETRY = "describing_retry"
 
 TOP_STAGES = (STAGE_QUEUED, STAGE_DEDUP, STAGE_REUSE, STAGE_PARSING, STAGE_FIGURES,
               STAGE_CHUNKS, STAGE_DESCRIBING, STAGE_INDEXING, STAGE_FINALIZING)
@@ -38,6 +41,7 @@ STAGE_NAMES = {
     "mineru_merge": "合并解析结果",
     "index_prepare": "整理检索内容",
     "embed_batches": "生成语义向量",   # indexing 的子阶段;缺了会把内部标识原样显示给用户
+    STAGE_DESCRIBE_RETRY: "重试描述失败项",   # describing 的子阶段;缺了同样会把内部标识露给用户
 }
 
 # ---- 结果口径 ----

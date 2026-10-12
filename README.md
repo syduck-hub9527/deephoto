@@ -62,6 +62,8 @@ pip freeze > requirements.lock.txt
 | `DESCRIPTION_REASONING_EFFORT` | 顶层关思考参数;空字符串表示不发送该参数 | `none` |
 | `DESCRIPTION_TIMEOUT_SECONDS` / `DESCRIPTION_MAX_RETRIES` / `DESCRIPTION_MAX_TOKENS` | 单次请求超时 / SDK 重试上限 / 输出上限(以顶层 `max_tokens` 发送,非 `max_completion_tokens`) | `90` / `1` / `1024` |
 | `DESCRIPTION_CONCURRENCY` | 图片描述并发调用数(1–16);需按服务商配额调,出现"疑似被服务商限流"告警时调低。设为 `1` 等价于旧版逐张串行行为 | `4` |
+| `DESCRIPTION_PARSE_RETRY_ROUNDS` | 首轮描述全部完成后,对输出非合法 JSON(`parse_failed`)的图/表集中重试的最大轮数(0–5),`0` 关闭;重试完成于索引之前,疑似截断的项按轮翻倍输出上限 | `2` |
+| `DESCRIPTION_RETRY_MAX_TOKENS_CAP` / `DESCRIPTION_RETRY_BACKOFF_SECONDS` | 重试输出上限的封顶(必须 ≥ `DESCRIPTION_MAX_TOKENS`)/ 相邻两轮重试之间的等待秒数 | `4096` / `2.0` |
 
 > ⚠️ **升级注意：图片描述默认关闭。** 早期版本复用聊天模型(Moonshot)生成图片描述;
 > 从本版本起描述使用独立的 `DESCRIPTION_*` 配置,仅填了旧聊天配置的用户**不会再自动描述图片**
@@ -128,6 +130,7 @@ MinerU 是唯一的 PDF 解析器(代码中写死,租户不可选择)。Token �
 ## 已知限制(首版)
 
 - 多栏排版阅读顺序为近似(未做栏检测);跨页图、复杂子图依赖 `needs_review` 抽检(§3.2 已声明需额外校验)。
+- 描述输出非合法 JSON 的图/表会在首轮全部完成后自动集中重试(默认 2 轮,疑似截断的按轮翻倍输出上限);重试用尽仍失败的保持空描述降级,不影响文档 `ready`,仅以图注和正文参与检索(`DESCRIPTION_PARSE_RETRY_ROUNDS=0` 恢复旧行为)。
 - 扫描版 PDF 同样整份交给 MinerU 解析;MinerU 不可用时对应文档标记 `failed`,无本地 OCR 兜底。
 - 无鉴权,仅本地单机使用;如需暴露到网络,必须先接入真实身份系统(数据层的 tenant 过滤结构保留)。
 - worker 为单进程内线程;多副本部署需换真实队列。

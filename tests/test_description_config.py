@@ -19,6 +19,9 @@ _DESC_VARS = [
     "DEEPHOTO_DESCRIPTION_REASONING_EFFORT", "DEEPHOTO_DESCRIPTION_TIMEOUT_SECONDS",
     "DEEPHOTO_DESCRIPTION_MAX_RETRIES", "DEEPHOTO_DESCRIPTION_MAX_TOKENS",
     "DEEPHOTO_DESCRIPTION_CONCURRENCY",
+    "DEEPHOTO_DESCRIPTION_PARSE_RETRY_ROUNDS",
+    "DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP",
+    "DEEPHOTO_DESCRIPTION_RETRY_BACKOFF_SECONDS",
 ]
 
 
@@ -111,6 +114,67 @@ class ConcurrencyConfigTest(EnvTestBase):
             os.environ["DEEPHOTO_DESCRIPTION_CONCURRENCY"] = raw
             with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_CONCURRENCY"):
                 load_settings()
+
+
+class RetryConfigTest(EnvTestBase):
+    """parse_failed 集中重试配置(DEV_describe_parse_retry §5/§8)。"""
+
+    def test_dataclass_defaults_off(self):
+        s = _base_settings()                       # 直接构造:重试默认关闭,保持旧行为
+        self.assertEqual(s.description_parse_retry_rounds, 0)
+        self.assertEqual(s.description_retry_max_tokens_cap, 4096)
+        self.assertEqual(s.description_retry_backoff_seconds, 2.0)
+
+    def test_defaults_via_load_settings(self):
+        s = load_settings()                        # 生产默认:2 轮、上限 4096、退避 2 秒
+        self.assertEqual(s.description_parse_retry_rounds, 2)
+        self.assertEqual(s.description_retry_max_tokens_cap, 4096)
+        self.assertEqual(s.description_retry_backoff_seconds, 2.0)
+
+    def test_explicit_values_and_types(self):
+        os.environ.update({
+            "DEEPHOTO_DESCRIPTION_PARSE_RETRY_ROUNDS": "3",
+            "DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP": "8192",
+            "DEEPHOTO_DESCRIPTION_RETRY_BACKOFF_SECONDS": "0.5",
+        })
+        s = load_settings()
+        self.assertEqual(s.description_parse_retry_rounds, 3)
+        self.assertEqual(s.description_retry_max_tokens_cap, 8192)
+        self.assertEqual(s.description_retry_backoff_seconds, 0.5)
+
+    def test_rounds_bounds_name_variable(self):
+        for raw in ("-1", "6", "abc"):             # 0–5,必须整数
+            os.environ["DEEPHOTO_DESCRIPTION_PARSE_RETRY_ROUNDS"] = raw
+            with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_PARSE_RETRY_ROUNDS"):
+                load_settings()
+
+    def test_cap_and_backoff_invalid_name_variable(self):
+        os.environ["DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP"] = "0"      # 下限 1
+        with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP"):
+            load_settings()
+        os.environ["DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP"] = "abc"
+        with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP"):
+            load_settings()
+        os.environ.pop("DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP")
+        os.environ["DEEPHOTO_DESCRIPTION_RETRY_BACKOFF_SECONDS"] = "-0.5"  # 下限 0
+        with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_RETRY_BACKOFF_SECONDS"):
+            load_settings()
+
+    def test_cap_below_max_tokens_rejected(self):
+        # 跨字段一致性:重试上限低于首轮上限会让"截断后加倍"反而变小;关闭描述也拦截
+        os.environ.update({
+            "DEEPHOTO_DESCRIPTION_MAX_TOKENS": "2048",
+            "DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP": "1024",
+        })
+        with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP"):
+            load_settings()
+
+    def test_cap_equal_max_tokens_ok(self):
+        os.environ.update({
+            "DEEPHOTO_DESCRIPTION_MAX_TOKENS": "2048",
+            "DEEPHOTO_DESCRIPTION_RETRY_MAX_TOKENS_CAP": "2048",
+        })
+        self.assertEqual(load_settings().description_retry_max_tokens_cap, 2048)
 
 
 class ValidationTest(EnvTestBase):

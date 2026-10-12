@@ -34,12 +34,14 @@ def build_chat_model(settings: Settings):
     )
 
 
-def build_description_model(settings: Settings):
+def build_description_model(settings: Settings, *, max_tokens: int | None = None):
     """图片描述专用模型(OpenAI 兼容,如百炼 qwen3.8-omni-flash;与问答/嵌入配置解耦)。
 
     未启用(DEEPHOTO_DESCRIPTION_ENABLED 非 true)返回 None——这是明确的"已关闭"
     状态,与初始化失败严格区分:启用后配置缺项在 load_settings 启动校验时已报出;
     其余初始化异常直接上抛,由入库失败路径记录真实失败,不伪装成未配置。
+    max_tokens:默认沿用 settings.description_max_tokens;parse_failed 重试按轮
+    升级输出上限时显式传入(DEV_describe_parse_retry §4.4)。
     """
     if not settings.description_enabled:
         return None
@@ -55,7 +57,8 @@ def build_description_model(settings: Settings):
         # 不用 max_tokens= 字段:langchain-openai 会把它改写成 max_completion_tokens
         # (已在 0.3.0 / 0.3.35 / 1.6.6 实测),第三方兼容端点未必接受。
         # 经 extra_body 直接发经典的顶层 max_tokens,各版本行为一致。
-        extra_body={"max_tokens": settings.description_max_tokens},
+        extra_body={"max_tokens": (max_tokens if max_tokens is not None
+                                   else settings.description_max_tokens)},
         # 官方 HTTP 指南推荐流式;invoke 由 LangChain 聚合为完整响应后再解析一次 JSON,
         # 流式中断的半段 JSON 不会被当成成功
         streaming=True,

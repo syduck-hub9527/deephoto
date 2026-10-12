@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
@@ -33,14 +34,21 @@ logger = logging.getLogger(__name__)
 
 _MIME_BY_PIL_FORMAT = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
 
+# 重试提示(DEV_describe_parse_retry §4.4):追加在原提示词与上下文之后,不改动 _PROMPT 本体;
+# {reason} 为该项上一轮的机读失败原因(field_type 类原因本身已点名出错字段)
+_RETRY_HINT = ("上一次输出无法解析为 JSON(原因:{reason})。请只输出一个紧凑的 JSON 对象,"
+               "不要使用 Markdown 代码块,不要在 JSON 前后写任何文字;visible_summary 控制在 300 字以内,"
+               "表格只概括结构与关键列,不要逐行抄录。")
 
-def _call_model(model, image_bytes, mime_type, caption, section, context_text):
+
+def _call_model(model, image_bytes, mime_type, caption, section, context_text, retry_hint=None):
     """工作线程唯一职责:调用描述模型。纯函数,不碰数据库/observer/共享可变状态(§3.1)。
 
     describe_image 在调用时从模块全局解析,测试的模块级 patch 对本函数同样生效。
     """
     return describe_image(model, image_bytes, mime_type,
-                          caption=caption, section=section, context_text=context_text)
+                          caption=caption, section=section, context_text=context_text,
+                          retry_hint=retry_hint)
 
 
 def _looks_rate_limited(exc: Exception) -> bool:
@@ -64,7 +72,7 @@ def _display_label(occ: dict) -> str | None:
 class IngestService:
     def __init__(self, settings: Settings, store: ObjectStore, parser: LayoutParser,
                  index_service, chat_model_factory=None, progress_store=None,
-                 mineru_client_factory=None):
+                 mineru_client_factory=None, retry_model_factory=None, sleep=None):
         self.settings = settings
         self.store = store
         self.parser = parser
@@ -73,6 +81,11 @@ class IngestService:
         self._chat_model = None
         self._progress_store = progress_store            # 观测存储;None 时全部走 NoOpObserver
         self._mineru_client_factory = mineru_client_factory  # 测试注入假客户端(on_progress) -> client
+        # parse_failed 集中重试(DEV_describe_parse_retry §4.3/§4.4)的装配参数:
+        # retry_model_factory(max_tokens)->按输出上限另建的模型;sleep 为轮间退避,测试注入空函数
+        self._retry_model_factory = retry_model_factory
+        self._sleep = sleep or time.sleep
+        self._retry_models = {}   # 按 max_tokens 缓存重试模型(同一进程内一个值只建一次,§4.4)
 
     def ingest(self, document_id: str) -> None:
         conn = connect(self.settings.db_path)
@@ -118,6 +131,12 @@ class IngestService:
             "入库耗时汇总 doc=%s: 排队=%s 解析=%s 描述=%s 索引=%s%s,警告 %d 条",
             doc["id"], ms(pg.STAGE_QUEUED), ms(pg.STAGE_PARSING), ms(pg.STAGE_DESCRIBING),
             ms(pg.STAGE_INDEXING), slow_txt, len(detail["summary"]["warnings"]))
+        retry_counts = (stages.get(pg.STAGE_DESCRIBE_RETRY) or {}).get("counts")
+        if retry_counts:
+            # 描述重试汇总(DEV_describe_parse_retry §4.7.5):子阶段存在才输出
+            logger.info("描述重试 doc=%s: 共 %s 项,恢复 %s 项,仍失败 %s 项",
+                        doc["id"], retry_counts.get("total"), retry_counts.get("recovered"),
+                        retry_counts.get("still_failed"))
 
     # ---- 内部 ----
 
@@ -172,8 +191,14 @@ class IngestService:
             observer.stage_end(pg.STAGE_DESCRIBING, pg.RESULT_SKIPPED,
                                detail={"reason": "图片描述已关闭(DEEPHOTO_DESCRIPTION_ENABLED 未开启)"})
         else:
+            # 结果按最终统计计算:重试恢复后 failed 归零即 succeeded(§4.7.4)
             result = pg.RESULT_SUCCEEDED if not stats["failed"] else pg.RESULT_PARTIAL
-            observer.stage_end(pg.STAGE_DESCRIBING, result)
+            # 重试单项的 item_end 会同步推进 describing 的 counts(观测层同步所有在途阶段),
+            # 跑过重试时按首轮口径修正,避免 completed 超过 total 露给前端(§4.7.1)
+            counts = ({"completed": len(occurrences), "total": len(occurrences),
+                       "succeeded": stats["ok"], "failed": stats["failed"], "degraded": 0}
+                      if stats.get("retry") else None)
+            observer.stage_end(pg.STAGE_DESCRIBING, result, counts=counts)
 
         # 4) 索引
         repo.update_document_status(conn, document_id, "indexing")
@@ -291,35 +316,62 @@ class IngestService:
 
     def _describe_all(self, conn, doc: dict, parsed: ParsedDocument, occurrences: list[dict],
                       chunks: list[dict], observer) -> dict:
-        """逐张描述并记录进度;返回统计 {model, ok, failed, rate_limited}(failed 含异常与格式失败)。
+        """首轮逐张描述并记录进度;随后对 parse_failed 项集中重试(DEV_describe_parse_retry)。
 
+        返回统计 {model, ok, failed, rate_limited, parse_failed_items[, retry]}
+        (failed 含异常与格式失败;retry 键仅在跑了重试子阶段时出现)。
         并发度 1 走原同步循环(顺序、进度、结果与旧版完全一致);>1 走滑动窗口:
         工作线程只调 describe_image(纯函数),读库/写库/观测全部留在本线程(§3.1)。
         """
         model = self._get_chat_model()
-        stats = {"model": model, "ok": 0, "failed": 0, "rate_limited": 0}
+        stats = {"model": model, "ok": 0, "failed": 0, "rate_limited": 0, "parse_failed_items": []}
         if model is None:
             logger.warning("图片描述已关闭,跳过(仅以图注检索)")
             return stats
         desc_model_tag = f"{self.settings.description_model}:{DESC_PROMPT_VERSION}"
-        if self.settings.description_concurrency > 1 and len(occurrences) > 1:
-            self._describe_concurrent(conn, parsed, occurrences, chunks, observer,
-                                      stats, model, desc_model_tag)
-        else:
-            self._describe_sequential(conn, parsed, occurrences, chunks, observer,
-                                      stats, model, desc_model_tag)
+        work = [(seq, occ, None) for seq, occ in enumerate(occurrences, start=1)]   # 首轮无重试提示
+
+        def on_result(conn, occ, seq, label, result):
+            self._settle_description(conn, occ, seq, label, result, desc_model_tag,
+                                     observer, stats)
+
+        def on_error(conn, occ, seq, label, exc):
+            self._fail_description(conn, occ, seq, label, exc, desc_model_tag,
+                                   observer, stats)
+
+        self._dispatch_describe(conn, parsed, work, chunks, observer,
+                                kind="image", model=model,
+                                on_result=on_result, on_error=on_error)
+        # 首轮全部结束后才集中重试(§4.1):重试不占用首轮并发窗口,且完成于 indexing 之前
+        self._retry_parse_failed(conn, parsed, chunks, observer, stats, desc_model_tag)
         if stats["rate_limited"]:
             observer.warn(f"图片描述有 {stats['rate_limited']} 张疑似被服务商限流,"
                           "可调低 DEEPHOTO_DESCRIPTION_CONCURRENCY")
         return stats
 
-    def _describe_sequential(self, conn, parsed, occurrences, chunks, observer,
-                             stats, model, desc_model_tag) -> None:
-        for seq, occ in enumerate(occurrences, start=1):
+    def _dispatch_describe(self, conn, parsed, work, chunks, observer, *,
+                           kind, model, on_result, on_error) -> None:
+        """首轮与重试轮共用的调度入口:work 为 (seq, occ, retry_hint) 清单(§6 调度参数化)。
+
+        kind 为观测单项类型("image" / "image_retry");并发 >1 且待处理多于 1 项时走
+        滑动窗口,否则顺序执行;落库回调由调用方按轮次提供。
+        """
+        if self.settings.description_concurrency > 1 and len(work) > 1:
+            self._describe_concurrent(conn, parsed, work, chunks, observer,
+                                      kind=kind, model=model,
+                                      on_result=on_result, on_error=on_error)
+        else:
+            self._describe_sequential(conn, parsed, work, chunks, observer,
+                                      kind=kind, model=model,
+                                      on_result=on_result, on_error=on_error)
+
+    def _describe_sequential(self, conn, parsed, work, chunks, observer, *,
+                           kind, model, on_result, on_error) -> None:
+        for seq, occ, hint in work:
             full = repo.get_occurrence(conn, occ["id"])
             asset = repo.get_asset(conn, full["image_asset_id"])
             label = _display_label(occ) or f"第 {seq} 张"
-            observer.item_start("image", seq, label=label,
+            observer.item_start(kind, seq, label=label,
                                 page=occ["page_number"], figure=occ["figure_number"])
             try:
                 image_bytes = self.store.get(asset["original_object_key"])
@@ -328,22 +380,21 @@ class IngestService:
                     caption=occ["caption"],
                     section=_section_for_page(parsed, occ["page_number"]),
                     context_text=_context_for_occurrence(occ, chunks, parsed),
+                    retry_hint=hint,
                 )
-                self._settle_description(conn, occ, seq, label, result, desc_model_tag,
-                                         observer, stats)
+                on_result(conn, occ, seq, label, result)
             except Exception as exc:
-                self._fail_description(conn, occ, seq, label, exc, desc_model_tag,
-                                       observer, stats)
+                on_error(conn, occ, seq, label, exc)
 
-    def _describe_concurrent(self, conn, parsed, occurrences, chunks, observer,
-                             stats, model, desc_model_tag) -> None:
+    def _describe_concurrent(self, conn, parsed, work, chunks, observer, *,
+                             kind, model, on_result, on_error) -> None:
         """滑动窗口:任一时刻至多 N 个在途调用。
 
         item_start 在提交时(而非排队时)调用,duration_ms 是单次调用真实耗时,
         不含排队;读图与上下文计算在提交前做,失败按单图失败处理,不占窗口(§3.6)。
         """
         limit = self.settings.description_concurrency
-        pending = deque(enumerate(occurrences, start=1))
+        pending = deque(work)
         inflight: dict = {}          # future -> (seq, occ, label)
         executor = ThreadPoolExecutor(max_workers=limit)
 
@@ -353,16 +404,16 @@ class IngestService:
                 return
             seq, occ, label = min(inflight.values())   # 最久在途:已等待时间按它算
             if len(inflight) > 1:
-                observer.item_update("image", seq, label=f"{len(inflight)} 张并发处理中")
+                observer.item_update(kind, seq, label=f"{len(inflight)} 张并发处理中")
             else:
-                observer.item_update("image", seq, label=label)
+                observer.item_update(kind, seq, label=label)
 
         def submit_one() -> None:
-            seq, occ = pending.popleft()
+            seq, occ, hint = pending.popleft()
             full = repo.get_occurrence(conn, occ["id"])
             asset = repo.get_asset(conn, full["image_asset_id"])
             label = _display_label(occ) or f"第 {seq} 张"
-            observer.item_start("image", seq, label=label,
+            observer.item_start(kind, seq, label=label,
                                 page=occ["page_number"], figure=occ["figure_number"])
             try:
                 # 与串行路径同一 try 口径(§3.6):读图与上下文计算的失败都只算单图失败
@@ -370,12 +421,11 @@ class IngestService:
                 section = _section_for_page(parsed, occ["page_number"])
                 context_text = _context_for_occurrence(occ, chunks, parsed)
             except Exception as exc:
-                self._fail_description(conn, occ, seq, label, exc, desc_model_tag,
-                                       observer, stats)
+                on_error(conn, occ, seq, label, exc)
                 return
             future = executor.submit(
                 _call_model, model, image_bytes, asset["mime_type"],
-                occ["caption"], section, context_text)
+                occ["caption"], section, context_text, hint)
             inflight[future] = (seq, occ, label)
             refresh_current_label()
 
@@ -390,16 +440,13 @@ class IngestService:
                     seq, occ, label = inflight.pop(future)
                     exc = future.exception()
                     if exc is not None:
-                        self._fail_description(conn, occ, seq, label, exc, desc_model_tag,
-                                               observer, stats)
+                        on_error(conn, occ, seq, label, exc)
                     else:
                         try:
                             # 与串行路径同一 try 口径(§3.6):settle 出错也只算单图失败
-                            self._settle_description(conn, occ, seq, label, future.result(),
-                                                     desc_model_tag, observer, stats)
+                            on_result(conn, occ, seq, label, future.result())
                         except Exception as settle_exc:
-                            self._fail_description(conn, occ, seq, label, settle_exc,
-                                                   desc_model_tag, observer, stats)
+                            on_error(conn, occ, seq, label, settle_exc)
                 refresh_current_label()
         finally:
             # 主线程异常上抛时:取消未开始的任务;已开始的最多再跑一个超时周期
@@ -407,7 +454,7 @@ class IngestService:
 
     def _settle_description(self, conn, occ, seq, label, result, desc_model_tag,
                             observer, stats) -> None:
-        """主线程:成功调用的落库与观测(两条路径共用)。"""
+        """主线程:首轮成功调用的落库与观测(两条路径共用)。"""
         repo.update_occurrence_description(
             conn, occ["id"], visible_summary=result["visible_summary"],
             visible_labels=result["visible_labels"],
@@ -420,10 +467,26 @@ class IngestService:
         if diag == "ok":
             stats["ok"] += 1
             observer.item_end("image", seq, pg.ITEM_OK)
+            return
+        # 调用完成但输出不是有效 JSON:按格式失败计数,不能算成功
+        stats["failed"] += 1
+        observer.item_end("image", seq, pg.ITEM_PARSE_FAILED)
+        if self.settings.description_parse_retry_rounds > 0:
+            # 重试开启:登记进集中重试清单,首轮暂不逐条 warn;
+            # 重试全部结束后仍失败才统一告警(§4.7.3)
+            diagnostic = result.get("diagnostic") or {}
+            item = {
+                "occ": occ, "seq": seq, "label": label,
+                "reason": diagnostic.get("reason") or "输出不是有效 JSON",
+                "code": diagnostic.get("code"),
+                "truncated": bool(diagnostic.get("truncated")),
+                "max_tokens": self.settings.description_max_tokens,   # 升级起点:首轮上限
+            }
+            # 首轮诊断已决定第 1 个重试轮的目标上限(截断翻倍,§4.4)
+            self._raise_retry_target(item)
+            stats["parse_failed_items"].append(item)
         else:
-            # 调用完成但输出不是有效 JSON:按格式失败计数,不能算成功
-            stats["failed"] += 1
-            observer.item_end("image", seq, pg.ITEM_PARSE_FAILED)
+            # 重试关闭:保持旧行为,首轮立即 warn(§4.7.3)
             observer.warn(f"第 {seq} 张({label})描述格式解析失败,已降级")
 
     def _fail_description(self, conn, occ, seq, label, exc, desc_model_tag,
@@ -442,6 +505,139 @@ class IngestService:
         if _looks_rate_limited(exc):
             stats["rate_limited"] += 1
         observer.item_end("image", seq, pg.ITEM_ERROR, error_kind=type(exc).__name__)
+
+    # ---- parse_failed 集中重试(DEV_describe_parse_retry §4)----
+
+    def _retry_parse_failed(self, conn, parsed, chunks, observer, stats, desc_model_tag) -> None:
+        """首轮结束后对 parse_failed 项集中重试;全部完成于 indexing 之前。
+
+        每轮按清单内最大目标 max_tokens 构造一个共用模型,逐项带原因提示(§4.4);
+        恢复的项覆盖描述并移出清单。模型/配置异常只放弃重试,绝不使文档 failed(§4.6/§7)。
+        """
+        items = stats["parse_failed_items"]
+        rounds = self.settings.description_parse_retry_rounds
+        if not items or rounds <= 0:
+            return
+        total = len(items)
+        # 子阶段不带 total:counts 由 stage_end 按 {total, recovered, still_failed, rounds}
+        # 自定义(§4.7.1),避免重试单项的 item_end 把子阶段也同步成首轮计数口径
+        observer.stage_start(pg.STAGE_DESCRIBE_RETRY, parent=pg.STAGE_DESCRIBING,
+                             detail={"rounds": rounds})
+        rounds_run = 0
+        try:
+            for round_no in range(1, rounds + 1):
+                if not items:
+                    break
+                if round_no > 1:
+                    self._sleep(self.settings.description_retry_backoff_seconds)   # §4.3 轮间退避
+                rounds_run = round_no
+                model, round_tokens = self._retry_model_for_round(items, stats["model"])
+                retry_tag = f"{desc_model_tag}+r{round_no}"      # 恢复项可追溯(§4.6)
+                by_id = {it["occ"]["id"]: it for it in items}
+                recovered: list[str] = []
+
+                def on_result(conn, occ, seq, label, result,
+                              _r=round_no, _mt=round_tokens, _tag=retry_tag):
+                    if self._settle_retry(conn, by_id[occ["id"]], result, _tag,
+                                          observer, stats, _r, _mt):
+                        recovered.append(occ["id"])
+
+                def on_error(conn, occ, seq, label, exc,
+                             _r=round_no, _mt=round_tokens):
+                    self._fail_retry(conn, by_id[occ["id"]], exc, observer, stats, _r, _mt)
+
+                work = [(it["seq"], it["occ"], _RETRY_HINT.format(reason=it["reason"]))
+                        for it in items]
+                self._dispatch_describe(conn, parsed, work, chunks, observer,
+                                        kind="image_retry", model=model,
+                                        on_result=on_result, on_error=on_error)
+                items = [it for it in items if it["occ"]["id"] not in recovered]
+        except Exception as exc:
+            # 轮级异常(含 retry_model_factory 抛错):告警并放弃后续轮次,不得使文档 failed(§7)
+            summary = error_summary(exc, self._secret_values())
+            logger.error("describe retry aborted: %s", summary)
+            logger.debug("describe retry abort traceback", exc_info=True)
+            observer.warn(f"描述重试中断({summary}),剩余 {len(items)} 项保持降级")
+        # 收尾:仍失败项保留首轮降级记录,仅 uncertain_details 追加留痕并统一 warn(§4.1/§4.7.3)
+        for it in items:
+            self._mark_retry_exhausted(conn, it, rounds_run, desc_model_tag)
+            observer.warn(f"第 {it['seq']} 张({it['label']})描述格式解析失败,"
+                          f"已重试 {rounds_run} 次,已降级")
+        stats["retry"] = {"total": total, "recovered": total - len(items),
+                          "still_failed": len(items), "rounds": rounds_run}
+        observer.stage_end(pg.STAGE_DESCRIBE_RETRY,
+                           pg.RESULT_SUCCEEDED if not items else pg.RESULT_PARTIAL,
+                           counts=stats["retry"])
+
+    def _retry_model_for_round(self, items, base_model):
+        """本轮共用模型与输出上限:取清单内最大目标 max_tokens,整轮共用不做逐项差异化;
+        未装配 retry_model_factory 时复用首轮模型(只有提示词变化,§4.4)。"""
+        target = max(it["max_tokens"] for it in items)
+        if self._retry_model_factory is None:
+            return base_model, target
+        if target not in self._retry_models:
+            self._retry_models[target] = self._retry_model_factory(target)   # 异常由轮级捕获(§7)
+        return self._retry_models[target], target
+
+    def _settle_retry(self, conn, item, result, desc_model_tag, observer, stats,
+                      round_no, max_tokens) -> bool:
+        """重试轮成功调用的落库与观测;返回是否恢复。仍 parse_failed 不写库,留待下一轮(§4.6)。"""
+        occ, seq = item["occ"], item["seq"]
+        diag = result.get("diagnostic") or {}
+        detail = {"round": round_no, "max_tokens": max_tokens}
+        if diag.get("result", "ok") == "ok":
+            repo.update_occurrence_description(
+                conn, occ["id"], visible_summary=result["visible_summary"],
+                visible_labels=result["visible_labels"],
+                caption=result["caption"] or (occ["caption"] or ""),
+                context_summary=result["context_summary"],
+                uncertain_details=result["uncertain_details"],
+                description_model=desc_model_tag,
+            )
+            stats["ok"] += 1
+            stats["failed"] -= 1            # 恢复一项,抵消首轮的格式失败计数(§4.7.4)
+            observer.item_end("image_retry", seq, pg.ITEM_OK, detail=detail)
+            return True
+        # 仍失败:更新机读原因供下一轮决定 max_tokens 与提示;不覆盖首轮降级记录
+        item["reason"] = diag.get("reason") or item["reason"]
+        item["code"] = diag.get("code")
+        item["truncated"] = bool(diag.get("truncated"))
+        self._raise_retry_target(item)
+        observer.item_end("image_retry", seq, pg.ITEM_PARSE_FAILED, detail=detail)
+        return False
+
+    def _fail_retry(self, conn, item, exc, observer, stats, round_no, max_tokens) -> bool:
+        """重试轮异常:视为该项本轮失败,进入下一轮;限流沿用现有口径(§4.6/§7)。绝不向上抛。"""
+        summary = error_summary(exc, self._secret_values())
+        logger.error("describe retry failed for %s: %s", item["occ"]["id"], summary)
+        logger.debug("describe retry failure traceback", exc_info=True)
+        item["reason"] = f"描述生成失败:{summary}"      # 供重试用尽时留痕
+        item["code"] = None
+        item["truncated"] = False                       # 异常不带截断信号,目标不升级
+        if _looks_rate_limited(exc):
+            stats["rate_limited"] += 1
+        observer.item_end("image_retry", item["seq"], pg.ITEM_ERROR,
+                          error_kind=type(exc).__name__,
+                          detail={"round": round_no, "max_tokens": max_tokens})
+        return False
+
+    def _raise_retry_target(self, item) -> None:
+        """下一轮目标 max_tokens:截断(含保守判定的 invalid_json)翻倍并封顶 CAP;其余不变(§4.4)。"""
+        if item["truncated"] or item["code"] == "invalid_json":
+            item["max_tokens"] = min(item["max_tokens"] * 2,
+                                     self.settings.description_retry_max_tokens_cap)
+
+    def _mark_retry_exhausted(self, conn, item, rounds_run, desc_model_tag) -> None:
+        """重试用尽:保留首轮降级内容,仅 uncertain_details 追加留痕(§4.6)。幂等覆盖写。"""
+        cur = repo.get_occurrence(conn, item["occ"]["id"])
+        note = f"已重试 {rounds_run} 次仍失败:{item['reason']}"
+        repo.update_occurrence_description(
+            conn, item["occ"]["id"],
+            visible_summary=cur["description"], visible_labels=cur["visible_labels"],
+            caption=cur["caption"] or "", context_summary=cur["context_summary"],
+            uncertain_details=(cur["uncertain_details"] or []) + [note],
+            description_model=cur["description_model"] or desc_model_tag,
+        )
 
     def _secret_values(self) -> list[str | None]:
         """脱敏用:所有已配置的密钥原值(任何一个出现在异常文本里都要抹掉)。"""

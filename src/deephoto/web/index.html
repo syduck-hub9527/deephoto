@@ -407,6 +407,9 @@ function renderProgDetail(p) {
 function stageCount(s) {
   const c = s.counts;
   if (!c) return "";
+  // 描述重试子阶段:计数口径是"重试/恢复/仍失败",没有 completed,不能套 x/y
+  if (c.recovered != null && c.total != null)
+    return `(${c.total} 项·恢复 ${c.recovered}${c.still_failed ? `·仍失败 ${c.still_failed}` : ""})`;
   if (c.total) return `(${c.completed || 0}/${c.total})`;
   if (c.pages != null) return `(${c.pages} ${SEG.locatorUnit(c.unit)})`;
   if (c.chunks != null) return `(${c.chunks} 块)`;

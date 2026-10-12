@@ -63,6 +63,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings, store, parser, index_service,
         # 图片描述专用工厂(与问答模型解耦);问答服务继续走 build_chat_model,互不共享缓存
         chat_model_factory=lambda: build_description_model(settings),
+        # parse_failed 重试按轮升级输出上限,按 max_tokens 另建模型(DEV_describe_parse_retry §4.4)
+        retry_model_factory=lambda mt: build_description_model(settings, max_tokens=mt),
         progress_store=progress_store,
     )
     knowledge = KnowledgeService(store, index_service)

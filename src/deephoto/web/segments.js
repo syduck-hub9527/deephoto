@@ -456,7 +456,7 @@
     parsing: "解析文档", persist_figures: "保存图片", chunks_and_links: "整理正文与图文关系",
     describing: "生成图片描述", indexing: "准备检索", finalizing: "完成保存",
     mineru_split: "读取与拆分", mineru_merge: "合并解析结果", index_prepare: "整理检索内容",
-    embed_batches: "生成语义向量",
+    embed_batches: "生成语义向量", describing_retry: "重试描述失败项",
   };
 
   // 解析阶段计数的单位:docx/md 的"页"是虚拟分段,不是 Word 的真实页码
