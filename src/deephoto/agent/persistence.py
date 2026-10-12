@@ -30,7 +30,7 @@ SESSION_RE = re.compile(r"sess_[0-9a-f]{32}\Z")
 EVIDENCE_LIMIT = 2048
 
 # 06:挂起元数据特有的键;complete/restore 写 ready 时必须剥掉,不带到下一轮
-_PARK_KEYS = ("approvals", "decided", "expires_at", "previous")
+_PARK_KEYS = ("approvals", "decided", "expires_at", "previous", "evidence")
 
 
 class SessionError(ValueError):
@@ -104,18 +104,21 @@ class SessionTurn:
     def config(self) -> dict:
         return {"configurable": {"thread_id": self.thread_id}}
 
-    def park(self, approvals: list, decided: dict, expires_at: str) -> None:
+    def park(self, approvals: list, decided: dict, expires_at: str,
+             evidence: dict | None = None) -> None:
         """本轮在审批闸门挂起:立即写 awaiting_approval 元数据(不判 failed)。
 
         立即落盘而不是等 finally:approval_required 事件发出后,客户端可能马上
         调审批接口,那时状态必须已可读。恢复所需的 approvals/decided/expires_at
         与超时恢复落点 previous 一并随元数据保存。
+        evidence(REV-1):挂起前 tracker 的证据快照 {"chunks": [...], "images": [...]},
+        恢复轮预填 tracker,挂起前命中的 ID 仍能通过引用校验;restore/complete 时剥离。
         """
         self.parked = True
         awaiting = dict(self.metadata)
         awaiting.update(status="awaiting_approval", updated_at=_now(),
                         approvals=approvals, decided=decided, expires_at=expires_at,
-                        previous=self.park_previous)
+                        previous=self.park_previous, evidence=evidence)
         self.runtime.store.put(self.namespace, self.session_id, awaiting)
         self.metadata = awaiting
 

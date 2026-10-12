@@ -130,7 +130,7 @@ class QAService:
             pending = _pending_interrupts(agent, turn)
             if pending:
                 # 06:审批闸门挂起——不组装、不 complete;元数据由 turn.park 落盘
-                approvals, expires_at = self._park(turn, gate, pending)
+                approvals, expires_at = self._park(turn, gate, pending, tracker)
                 return {"status": "awaiting_approval", "session_id": turn.session_id,
                         "approvals": approvals, "expires_at": expires_at,
                         "answer": None, "citations": [], "images": []}
@@ -234,7 +234,7 @@ class QAService:
         if stream_broken is None and gate is not None:
             pending = _pending_interrupts(agent, turn)
             if pending:
-                approvals, expires_at = self._park(turn, gate, pending)
+                approvals, expires_at = self._park(turn, gate, pending, tracker)
                 yield {"type": "approval_required", "session_id": turn.session_id,
                        "session_status": "awaiting_approval",
                        "approvals": approvals, "expires_at": expires_at}
@@ -286,11 +286,15 @@ class QAService:
             description=lambda tool_call, state, runtime: describe_image_request(db_path, ctx, tool_call))}
         return gate
 
-    def _park(self, turn, gate, pending) -> tuple[list[dict], str]:
-        """写 awaiting_approval 元数据,返回(对外审批项, 超时时刻)。不组装答案、不写引用。"""
+    def _park(self, turn, gate, pending, tracker) -> tuple[list[dict], str]:
+        """写 awaiting_approval 元数据,返回(对外审批项, 超时时刻)。不组装答案、不写引用。
+
+        tracker 快照随元数据保存(REV-1):恢复轮预填后,挂起前检索到的块与图片候选
+        仍能通过引用校验;同一轮再次挂起时快照累计,不会退回更小的集合。
+        """
         items = approval_items(pending)
         expires_at = deadline(getattr(self.settings, "qa_hitl_timeout_seconds", 600))
-        turn.park(items, gate.snapshot(), expires_at)
+        turn.park(items, gate.snapshot(), expires_at, evidence=_evidence_snapshot(tracker))
         public = [{"approval_id": i["approval_id"], "tool": i["tool"],
                    "args": i["args"], "description": i["description"]} for i in items]
         return public, expires_at
@@ -336,6 +340,9 @@ class QAService:
                 # 失败抛 ApprovalError,finally 会把 awaiting_approval 元数据原样恢复
                 normalized = validate_decisions(turn.metadata.get("approvals", []), decisions)
                 tools, tracker = self._make_tools(ctx)
+                # REV-1:预填挂起前的证据(取租约内最新元数据,不是进入租约前读到的 meta),
+                # 否则恢复轮的引用校验会静默丢弃挂起前命中的块与图片候选
+                _seed_tracker(tracker, turn.metadata.get("evidence"))
                 agent_kwargs = self._agent_kwargs(ctx, tracker)
                 self._attach_persistence(agent_kwargs, turn)
                 gate = self._attach_hitl(agent_kwargs, ctx, turn)
@@ -373,6 +380,8 @@ class QAService:
         with self._sessions().turn(ctx, session_id, meta.get("document_id"), meta.get("profile"),
                                    allow_awaiting=True) as turn:
             tools, tracker = self._make_tools(ctx)
+            # REV-1:与人工恢复路径同样预填证据;输出虽被丢弃,两条路径行为保持一致
+            _seed_tracker(tracker, turn.metadata.get("evidence"))
             agent_kwargs = self._agent_kwargs(ctx, tracker)
             self._attach_persistence(agent_kwargs, turn)
             self._attach_hitl(agent_kwargs, ctx, turn)
@@ -714,6 +723,23 @@ def _pending_interrupts(agent, turn) -> list:
         return []
     state = agent.get_state(turn.config)
     return [interrupt for task in state.tasks for interrupt in task.interrupts]
+
+
+def _evidence_snapshot(tracker: dict) -> dict:
+    """挂起时随元数据持久化的证据快照(REV-1):有序字符串列表,便于 JSON 落盘与断言。"""
+    return {"chunks": sorted(tracker["chunks"]), "images": sorted(tracker["images"])}
+
+
+def _seed_tracker(tracker: dict, evidence: dict | None) -> None:
+    """恢复轮预填证据(REV-1):把挂起前命中的 ID 合并进 tracker 的两个集合。
+
+    预填只用于引用校验,不决定工具是否执行;恢复轮中被批准的 inspect_image 仍照常
+    执行并登记。evidence 为 None 或缺少键时不做任何改动(兼容没有该键的旧挂起元数据)。
+    """
+    if not evidence or "chunks" not in evidence or "images" not in evidence:
+        return
+    tracker["chunks"].update(evidence["chunks"])
+    tracker["images"].update(evidence["images"])
 
 
 def _final_answer_text(messages: list) -> str:

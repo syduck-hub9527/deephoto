@@ -25,7 +25,7 @@ from deephoto import repo
 from deephoto.agent.hitl import (ApprovalError, ImageApprovalGate, approval_items,
                                  build_resume_value, describe_image_request, validate_decisions)
 from deephoto.agent.persistence import SessionError
-from deephoto.agent.qa import QAService
+from deephoto.agent.qa import QAService, _seed_tracker
 from deephoto.db import connect
 
 
@@ -373,6 +373,112 @@ class HitlParkResumeTest(_ServiceCase):
         self.assertEqual(resumed[-1]["answer"], f"图中箭头向右\n\n[image:{self.occ}]")
         self.assertEqual(self.image_calls, [self.occ])
         self.assertEqual(model.calls_made, 4)                     # 主 task + 子收尾 + 主收尾(+挂起前的子调用)
+
+
+class HitlEvidenceTest(_ServiceCase):
+    """REV-1(md文档/06-hitl-review-fixes.md §1.4):挂起前的证据在恢复后仍可用于引用校验。"""
+
+    def _script(self):
+        return [
+            {"tool": "search_knowledge", "args": {"query": "绪论"}},
+            {"tool": "inspect_image", "args": {"image_occurrence_id": self.occ}},
+            f"依据正文 [chunk:{self.c1}] 作答,图见 [image:{self.occ}]",
+        ]
+
+    # 附录 A 对照组:不挂起(预算放行)的同一问题,引用完整保留,行为不变
+    def test_control_auto_approved_no_pause(self):
+        qa = self._qa(budget=2)
+        self._model(qa, self._script())
+        result = qa.answer(self.conn, self.ctx, "q1", document_id=self.doc_a)
+        self.assertEqual([c["chunk_id"] for c in result["citations"]], [self.c1])
+
+    # §1.4-1:批准恢复后,挂起前 search 命中的块引用保留(附录 A 转正)
+    def test_approve_resume_keeps_pre_pause_chunk_citation(self):
+        qa = self._qa(budget=0)
+        self._model(qa, self._script())
+        events = list(qa.answer_stream(self.ctx, "q1", self.doc_a))
+        self.assertEqual(events[-1]["type"], "approval_required")
+        sid = events[-1]["session_id"]
+        events = list(qa.resolve_approvals(self.ctx, sid,
+                                           [{"approval_id": "ap_1", "type": "approve"}]))
+        done = events[-1]
+        self.assertEqual([c["chunk_id"] for c in done.get("citations", [])], [self.c1])
+        # 被批准的 inspect_image 照常执行并登记,图片引用不受影响(§1.3d)
+        self.assertEqual([i["image_occurrence_id"] for i in done.get("images", [])], [self.occ])
+        self.assertEqual(self.image_calls, [self.occ])
+
+    # §1.4-2:拒绝恢复后,挂起前命中的块引用同样保留;被拒图片不出现
+    def test_reject_resume_keeps_pre_pause_chunk_citation(self):
+        qa = self._qa(budget=0)
+        self._model(qa, self._script())
+        events = list(qa.answer_stream(self.ctx, "q1", self.doc_a))
+        sid = events[-1]["session_id"]
+        events = list(qa.resolve_approvals(
+            self.ctx, sid, [{"approval_id": "ap_1", "type": "reject", "message": "不用看图"}]))
+        done = events[-1]
+        self.assertEqual([c["chunk_id"] for c in done.get("citations", [])], [self.c1])
+        self.assertEqual(done.get("images", []), [])
+        self.assertEqual(self.image_calls, [])                    # 拒绝后工具未执行
+
+    # §1.4-3:挂起前 search 返回的图片候选(从未执行 inspect)恢复后可被引用
+    def test_resume_keeps_pre_pause_image_candidate(self):
+        asset = repo.get_or_create_asset(self.conn, tenant_id="ta", sha256="s" * 64,
+                                         object_key="img2", width=10, height=10,
+                                         mime_type="image/png")
+        occ_s = repo.insert_occurrence(
+            self.conn, tenant_id="ta", document_id=self.doc_a, ingestion_version="v1",
+            image_asset_id=asset, page_number=5, bbox=None, figure_number="7",
+            caption="图7 对照组", extraction_method="embedded_bitmap", needs_review=False)
+        repo.update_occurrence_description(
+            self.conn, occ_s, visible_summary="对照曲线", visible_labels=[],
+            caption="", context_summary="", uncertain_details=[], description_model="t")
+        self.conn.commit()
+        qa = self._qa(budget=0)
+        # search 只返回 occ_s 候选;被闸门的是 self.occ(与候选不同)
+        qa.knowledge.search = lambda *args: {
+            "chunks": [], "images": [{"image_occurrence_id": occ_s}]}
+        self._model(qa, [
+            {"tool": "search_knowledge", "args": {"query": "图"}},
+            {"tool": "inspect_image", "args": {"image_occurrence_id": self.occ}},
+            f"候选图见 [image:{occ_s}]"])
+        events = list(qa.answer_stream(self.ctx, "q1", self.doc_a))
+        sid = events[-1]["session_id"]
+        done = list(qa.resolve_approvals(self.ctx, sid,
+                                         [{"approval_id": "ap_1", "type": "approve"}]))[-1]
+        self.assertEqual([i["image_occurrence_id"] for i in done.get("images", [])], [occ_s])
+        self.assertEqual(self.image_calls, [self.occ])            # occ_s 只来自挂起前搜索
+
+    # §1.4-4:挂起元数据持久化证据快照(挂起发生在 inspect 执行前,images 为空)
+    def test_park_persists_evidence(self):
+        qa = self._qa(budget=0)
+        self._model(qa, self._script())
+        events = list(qa.answer_stream(self.ctx, "q1", self.doc_a))
+        meta = self._metadata(qa, events[-1]["session_id"])
+        self.assertEqual(meta["evidence"]["chunks"], [self.c1])
+        self.assertEqual(meta["evidence"]["images"], [])
+
+    # §1.4-5:超时恢复写回 ready 时剥离 evidence,不得残留
+    def test_expired_restore_strips_evidence(self):
+        qa = self._qa(budget=0)
+        self._model(qa, self._script() + ["超时后的正常回答"])
+        events = list(qa.answer_stream(self.ctx, "q1", self.doc_a))
+        sid = events[-1]["session_id"]
+        self.assertIn("evidence", self._metadata(qa, sid))
+        self._backdate_expiry(qa, sid)
+        result = qa.answer(self.conn, self.ctx, "q2", document_id=self.doc_a, session_id=sid)
+        self.assertEqual(result["answer"], "超时后的正常回答")   # 自动拒绝后按新请求处理
+        meta = self._metadata(qa, sid)
+        self.assertEqual(meta["status"], "ready")
+        self.assertNotIn("evidence", meta)
+
+    # §1.4-6:evidence 为 None、{} 或缺键时 _seed_tracker 不做任何改动(兼容旧挂起元数据)
+    def test_seed_tracker_noop_without_evidence(self):
+        tracker = {"chunks": {"keep_c"}, "images": {"keep_i"}}
+        for bad in (None, {}, {"chunks": ["c1"]}, {"images": ["i1"]}):
+            _seed_tracker(tracker, bad)
+            self.assertEqual(tracker, {"chunks": {"keep_c"}, "images": {"keep_i"}})
+        _seed_tracker(tracker, {"chunks": ["c1"], "images": ["i1"]})
+        self.assertEqual(tracker, {"chunks": {"keep_c", "c1"}, "images": {"keep_i", "i1"}})
 
 
 class HitlTimeoutTest(_ServiceCase):
