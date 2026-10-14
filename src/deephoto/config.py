@@ -134,6 +134,10 @@ def _description_url_error(url: str) -> str | None:
         return "不能包含查询参数"
     if parsed.path.rstrip("/").endswith("/chat/completions"):
         return "请填到 /v1 为止的 Base URL,不要包含 /chat/completions"
+    if "anthropic" in {seg.lower() for seg in parsed.path.split("/")}:
+        # …/anthropic 是 Anthropic Messages 协议端点;描述客户端走 OpenAI Chat Completions,
+        # 会拼出 …/anthropic/chat/completions 得到 404(实测 api.deepseek.com/anthropic)
+        return "指向 Anthropic 协议端点;图片描述走 OpenAI 兼容协议,请改用 /v1 形式的 Base URL"
     if "{" in url or "}" in url or "YOUR_" in url.upper():
         return "含有未替换的占位符,请按控制台调用示例填写真实地址"
     return None

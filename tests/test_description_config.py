@@ -198,6 +198,7 @@ class ValidationTest(EnvTestBase):
     def test_bad_urls_rejected(self):
         for bad in ("not-a-url", "https://user:pass@example.cn/v1",
                     "https://example.cn/v1?x=1", "https://example.cn/v1/chat/completions",
+                    "https://api.deepseek.com/anthropic", "https://example.cn/anthropic/v1",
                     "https://{workspace}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
                     "https://YOUR_WORKSPACE_ID.example.cn/v1"):
             self._enabled(DEEPHOTO_DESCRIPTION_BASE_URL=bad)
