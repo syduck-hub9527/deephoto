@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from . import pdf_backend
 from .content_list import ContentElement, parse_content_list
@@ -43,6 +43,12 @@ DEFAULT_MAX_CHUNKS = 200
 # 结果 ZIP 下载:最多尝试次数与退避基数(秒,指数增长,单次上限 30 秒)
 DOWNLOAD_MAX_ATTEMPTS = 4
 DOWNLOAD_BACKOFF_SECONDS = 2.0
+
+# 文件上传(OSS 预签名地址)与结果下载(CDN)一律直连,不走代理:
+# urlopen 会读取 HTTP(S)_PROXY / 系统代理,代理把 CDN 域名转到不可达节点时
+# 表现为 TLS 握手被掐断(SSL: UNEXPECTED_EOF_WHILE_READING)。
+# ProxyHandler({}) 显式置空代理表,build_opener 便不再追加读取环境变量的默认 ProxyHandler。
+_DIRECT_OPENER = build_opener(ProxyHandler({}))
 
 
 class MinerUError(RuntimeError):
@@ -80,6 +86,8 @@ class MinerUClient:
         self.max_pages_per_chunk = min(max_pages_per_chunk, DEFAULT_MAX_PAGES_PER_CHUNK)
         self.max_bytes_per_chunk = min(max_bytes_per_chunk, DEFAULT_MAX_BYTES)
         self._opener = opener or urlopen
+        # 结果下载专用:默认直连(忽略代理);测试注入 opener 时沿用同一个替身
+        self._download_opener = opener or _DIRECT_OPENER.open
         self._sleep = sleep
         self.dump_dir = Path(dump_dir) if dump_dir else None
         self._on_progress = on_progress
@@ -220,6 +228,7 @@ class MinerUClient:
     def _upload_pdf(self, upload_url: str, pdf_bytes: bytes) -> None:
         # OSS 预签名 URL 对头部敏感:urllib 会自动塞 Content-Type 导致 403。
         # 用 http.client 裸 PUT,只带 Host / Content-Length。
+        # http.client 不读取任何代理设置,且这里不调用 set_tunnel,因此上传始终直连。
         parsed = urlparse(upload_url)
         conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
         conn = conn_cls(parsed.netloc, timeout=120)
@@ -282,7 +291,8 @@ class MinerUClient:
             headers = {"Range": f"bytes={len(data)}-"} if resuming else {}
             status = None
             try:
-                response = self._opener(Request(url, method="GET", headers=headers), timeout=120)
+                response = self._download_opener(
+                    Request(url, method="GET", headers=headers), timeout=120)
                 status = getattr(response, "status", None)
                 body = response.read()
             except http.client.IncompleteRead as exc:

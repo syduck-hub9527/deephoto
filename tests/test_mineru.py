@@ -486,3 +486,81 @@ class DownloadRetryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoProxyTest(unittest.TestCase):
+    """上传与结果下载必须直连:即使环境里配置了 HTTP(S)_PROXY 也不走代理。"""
+
+    PROXY_ENV = {"HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9",
+                 "https_proxy": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"}
+
+    def test_download_opener_ignores_proxy_env(self):
+        from unittest import mock
+        from urllib.request import ProxyHandler
+        from urllib.request import build_opener
+
+        def proxy_routes(opener):
+            return [h for proto in ("http", "https")
+                    for h in opener.handle_open.get(proto, []) if isinstance(h, ProxyHandler)]
+
+        with mock.patch.dict(os.environ, self.PROXY_ENV):
+            # 对照:默认 opener 在有代理环境变量时会经 ProxyHandler 转发
+            self.assertTrue(proxy_routes(build_opener()))
+            client = MinerUClient(api_key="tok")
+            self.assertEqual(proxy_routes(client._download_opener.__self__), [])
+
+    def test_download_uses_direct_opener_not_api_opener(self):
+        client = MinerUClient(api_key="tok", sleep=lambda s: None)
+        calls = []
+
+        class _R:
+            status = 200
+
+            def read(self):
+                return b"zip"
+
+        def direct(request, timeout):
+            calls.append(request.full_url)
+            return _R()
+
+        client._download_opener = direct
+        client._opener = lambda *a, **k: self.fail("下载不应走 API opener(会读取代理)")
+        self.assertEqual(client._download("https://cdn.example/z.zip"), b"zip")
+        self.assertEqual(calls, ["https://cdn.example/z.zip"])
+
+    def test_upload_connects_directly_to_target_host(self):
+        from unittest import mock
+        seen = {}
+
+        class _Conn:
+            def __init__(self, host, timeout=None):
+                seen["host"] = host
+
+            def set_tunnel(self, *a, **k):
+                seen["tunnel"] = True
+
+            def putrequest(self, *a, **k):
+                pass
+
+            def putheader(self, *a, **k):
+                pass
+
+            def endheaders(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                class _Resp:
+                    status = 200
+
+                    def read(self):
+                        return b""
+                return _Resp()
+
+            def close(self):
+                pass
+
+        with mock.patch.dict(os.environ, self.PROXY_ENV), \
+                mock.patch.object(http.client, "HTTPSConnection", _Conn):
+            MinerUClient(api_key="tok")._upload_pdf("https://oss.example/up?sig=1", b"%PDF")
+        self.assertEqual(seen.get("host"), "oss.example")
+        self.assertNotIn("tunnel", seen)
