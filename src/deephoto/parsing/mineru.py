@@ -281,11 +281,12 @@ class MinerUClient:
         data = b""
         retried = False
         last_error: Exception | None = None
+        host = urlparse(url).hostname or "?"   # 只记域名,不记带签名的完整地址
         for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
             if attempt > 1:
                 retried = True
-                logger.warning("MinerU 结果下载重试 %d/%d(已收到 %d 字节): %s",
-                               attempt, DOWNLOAD_MAX_ATTEMPTS, len(data), last_error)
+                logger.warning("MinerU 结果下载重试 %d/%d(直连 %s,已收到 %d 字节): %s",
+                               attempt, DOWNLOAD_MAX_ATTEMPTS, host, len(data), last_error)
                 self._sleep(min(DOWNLOAD_BACKOFF_SECONDS * 2 ** (attempt - 2), 30.0))
             resuming = len(data) > 0
             headers = {"Range": f"bytes={len(data)}-"} if resuming else {}
@@ -305,7 +306,7 @@ class MinerUClient:
                     data, last_error = b"", exc
                     continue
                 if exc.code < 500:                       # 4xx:链接过期/无权限,重试无意义
-                    raise MinerUError(f"MineU 结果下载失败: {exc}") from exc
+                    raise MinerUError(f"MineU 结果下载失败(直连 {host}): {exc}") from exc
                 last_error = exc
                 continue
             except (URLError, OSError, http.client.HTTPException) as exc:   # 含超时、连接重置
@@ -318,7 +319,8 @@ class MinerUClient:
                 return data
             data, last_error = b"", MinerUError("续传拼接后的 ZIP 不完整")
         raise MinerUError(
-            f"MineU 结果下载失败(已重试 {DOWNLOAD_MAX_ATTEMPTS} 次): {last_error}") from last_error
+            f"MineU 结果下载失败(已重试 {DOWNLOAD_MAX_ATTEMPTS} 次,直连 {host}): {last_error}"
+        ) from last_error
 
     def _request_json(self, method: str, path: str, payload: dict | None) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
