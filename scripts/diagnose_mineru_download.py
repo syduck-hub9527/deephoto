@@ -10,7 +10,10 @@
 from __future__ import annotations
 
 import ipaddress
+import os
+import shutil
 import socket
+import subprocess
 import ssl
 import sys
 import time
@@ -51,19 +54,42 @@ def check(url: str) -> None:
         _bad("解析到 198.18.x.x 假 IP:代理软件开了 TUN/fake-ip 模式,"
              "所有连接都会被系统层面接管,代码里设置直连无效")
 
-    # 2. 裸 TCP + TLS 握手(与 deephoto 下载相同的 Python ssl 默认配置)
-    ctx = ssl.create_default_context()
-    start = time.monotonic()
-    try:
-        with socket.create_connection((host, port), timeout=15) as sock:
-            _ok(f"TCP 连接成功 -> {sock.getpeername()[0]}")
-            with ctx.wrap_socket(sock, server_hostname=host) as tls:
-                _ok(f"TLS 握手成功 {tls.version()} {tls.cipher()[0]} "
-                    f"({int((time.monotonic() - start) * 1000)} ms)")
-    except ssl.SSLError as exc:
-        _bad(f"TLS 握手失败: {exc}")
-    except OSError as exc:
-        _bad(f"TCP 连接失败: {exc}")
+    # 2. 裸 TCP + TLS 握手:分别用默认配置、仅 TLS1.2、仅 TLS1.3 尝试。
+    #    默认失败而 TLS1.2 成功 → 握手包(如 OpenSSL 3.5 的抗量子密钥分组)被 CDN/中间设备丢弃
+    for label, lo, hi in (("默认", None, None),
+                          ("仅TLS1.2", ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_2),
+                          ("仅TLS1.3", ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_3)):
+        ctx = ssl.create_default_context()
+        if lo:
+            ctx.minimum_version, ctx.maximum_version = lo, hi
+        start = time.monotonic()
+        try:
+            with socket.create_connection((host, port), timeout=15) as sock:
+                peer = sock.getpeername()[0]
+                with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                    _ok(f"TLS[{label}] 握手成功 -> {peer} {tls.version()} {tls.cipher()[0]} "
+                        f"({int((time.monotonic() - start) * 1000)} ms)")
+        except ssl.SSLError as exc:
+            _bad(f"TLS[{label}] 握手失败: {exc}")
+        except OSError as exc:
+            _bad(f"TLS[{label}] TCP 连接失败: {exc}")
+
+    # 2b. 对照:系统 curl(不同的 TLS 实现)能否连通
+    curl = shutil.which("curl")
+    if curl:
+        try:
+            out = subprocess.run(
+                [curl, "-sS", "--noproxy", "*", "-o", os.devnull, "-m", "30",
+                 "-w", "%{http_code}", url],
+                capture_output=True, text=True, timeout=40)
+            if out.returncode == 0:
+                _ok(f"curl 直连: HTTP {out.stdout.strip()}")
+            else:
+                _bad(f"curl 直连失败: {(out.stderr or out.stdout).strip()}")
+        except Exception as exc:  # noqa: BLE001
+            _bad(f"curl 运行失败: {exc}")
+    else:
+        print("  (未找到 curl,跳过对照)")
 
     # 3. 与 deephoto 一致的直连 HTTP 请求(忽略代理环境变量);4xx 也说明链路是通的
     opener = build_opener(ProxyHandler({}))
