@@ -22,6 +22,13 @@ const E2 = { image_occurrence_id: "occ_b", document_id: "doc1", figure_number: "
              source_page_url: "/api/documents/doc1/pages/5" };
 const done = (content, images) => ({ role: "assistant", content, images, citations: [], validated: true });
 
+for (const flag of ["broken", "error", "warning", "sessionFailed"]) {
+  check(`${flag} 触发会话复查`, SEG.needsSessionRecheck({ [flag]: true }) === true);
+}
+check("正常完成无需复查", SEG.needsSessionRecheck(done("answer", [])) === false);
+check("待审批无需复查", SEG.needsSessionRecheck({ approvals: [] }) === false);
+check("空消息无需复查", SEG.needsSessionRecheck(null) === false);
+
 // ---- 既有行为 ----
 
 // 1. 文字 A + 图 A + 文字 B:DOM 顺序严格为文字、figure、文字

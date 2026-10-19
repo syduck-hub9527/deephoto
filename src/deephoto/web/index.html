@@ -558,9 +558,9 @@ async function initConversationMode() {
     restoreLocalChat();   // 03 关闭:保留原有单段浏览器对话
   } else {
     const sessionId = localStorage.getItem("deephoto_session");
-    if (sessionId && historySessions.some(s => s.session_id === sessionId)) {
-      await openSession(sessionId);
-    } else {
+    const opened = sessionId ? await openSession(sessionId) : false;
+    if (!opened) {
+      // 打不开就清除 ID,避免下一次提问续到看不见历史的会话。
       localStorage.removeItem("deephoto_session");
       messages = [];
       setReadonlyReason(null);
@@ -631,8 +631,8 @@ function newChat() {
 }
 
 async function openSession(id) {
-  if (sending) { toast("请等待当前回答结束"); return; }
-  if (openingSession) return;
+  if (sending) { toast("请等待当前回答结束"); return false; }
+  if (openingSession) return false;
   openingSession = true;
   try {
     const r = await fetch("/api/qa/sessions/" + id);
@@ -643,7 +643,7 @@ async function openSession(id) {
       setReadonlyReason(null);
       renderThread();
       renderSessions();
-      return;
+      return false;
     }
     if (!r.ok) {
       const j = await r.json().catch(() => ({}));
@@ -661,6 +661,7 @@ async function openSession(id) {
       syncingScope = false;
     }
     const listed = historySessions.findIndex(s => s.session_id === id);
+    // 未加载到的会话不插到列表顶部,保留按更新时间分页的顺序。
     if (listed >= 0) historySessions[listed] = data.session;
 
     if (data.pending_approval) {
@@ -674,8 +675,10 @@ async function openSession(id) {
     setReadonlyReason(data.continuable ? null : data.readonly_reason);
     renderThread();
     renderSessions();
+    return true;
   } catch (e) {
     toast("会话加载失败:" + (e.message || e));
+    return false;
   } finally {
     openingSession = false;
   }
@@ -723,6 +726,21 @@ function persistChat() {
   localStorage.setItem("deephoto_chat", JSON.stringify(stripped));
 }
 
+// 只刷新只读状态与列表条目,保留当前消息的正文与思考过程。
+async function recheckCurrentSession() {
+  const id = localStorage.getItem("deephoto_session");
+  if (!historyEnabled || !id) return;
+  try {
+    const r = await fetch("/api/qa/sessions/" + id);
+    if (!r.ok) return;
+    const data = await r.json();
+    setReadonlyReason(data.continuable ? null : data.readonly_reason);
+    const i = historySessions.findIndex(s => s.session_id === id);
+    if (i >= 0) historySessions[i] = data.session;
+    renderThread();
+  } catch (e) { /* 网络错误:保持现状 */ }
+}
+
 async function send() {
   const question = $("input").value.trim();
   if (!question || sending || readonlyReason || !historyModeReady) return;
@@ -768,7 +786,10 @@ async function send() {
   if (historyEnabled) window.removeEventListener("beforeunload", warnBeforeUnload);
   updateComposer();
   renderThread();
-  if (historyEnabled) await refreshSessions();   // 成功/失败都刷新标题、排序与状态点
+  if (historyEnabled) {
+    if (SEG.needsSessionRecheck(msg)) await recheckCurrentSession();
+    await refreshSessions();
+  }
 }
 
 // ---- 审批卡片(06)----
@@ -874,6 +895,7 @@ async function consumeSSE(body, msg) {
         continue;
       }
       if (ev.type === "done" && !ev.session_id) localStorage.removeItem("deephoto_session");
+      if (ev.type === "done" && ev.session_status === "failed") msg.sessionFailed = true;
       SEG.applyStreamEvent(msg, ev);   // token/thinking/done/warning/error 的状态迁移在 segments.js
       renderThread();   // token 级刷新;量不大,直接重渲染
     }

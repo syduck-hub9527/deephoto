@@ -127,6 +127,128 @@ class ServicePersistenceTest(_Base):
             turn.complete({"answer": "done", "citations": [], "images": []})
             return turn.session_id
 
+    def test_snapshot_reports_lease_atomically(self):
+        qa = self._qa()
+        sid = self._first(qa)["session_id"]
+        runtime = qa._sessions()
+        meta = self._metadata(qa, sid)
+        _, thread_id = runtime._keys(self.ctx, sid)
+        original_get = runtime.store.get
+
+        def locked_get(*args, **kwargs):
+            self.assertTrue(runtime._lock.locked())
+            return original_get(*args, **kwargs)
+
+        with patch.object(runtime.store, "get", locked_get):
+            self.assertEqual(runtime.snapshot(self.ctx, sid), (meta, False))
+            with runtime._lease(thread_id):
+                self.assertEqual(runtime.snapshot(self.ctx, sid), (meta, True))
+            self.assertEqual(runtime.snapshot(self.ctx, "sess_" + "0" * 32), (None, False))
+            self.assertEqual(runtime.snapshot(AuthContext("ta", "other"), sid), (None, False))
+        with self.assertRaises(SessionError):
+            runtime.snapshot(self.ctx, "invalid")
+
+    def test_session_snapshots_and_list_sessions_compat(self):
+        qa = self._qa()
+        sid = self._first(qa)["session_id"]
+        runtime = qa._sessions()
+        meta = self._metadata(qa, sid)
+        _, thread_id = runtime._keys(self.ctx, sid)
+        original_search = runtime.store.search
+
+        def locked_search(*args, **kwargs):
+            self.assertTrue(runtime._lock.locked())
+            return original_search(*args, **kwargs)
+
+        with patch.object(runtime.store, "search", locked_search):
+            self.assertEqual(runtime.session_snapshots(self.ctx, limit=30, offset=0), [(sid, meta, False)])
+            with runtime._lease(thread_id):
+                self.assertEqual(runtime.session_snapshots(self.ctx, limit=30, offset=0), [(sid, meta, True)])
+                self.assertEqual(runtime.list_sessions(self.ctx, limit=30, offset=0), [(sid, meta)])
+            self.assertEqual(runtime.list_sessions(self.ctx, limit=30, offset=0), [(sid, meta)])
+            self.assertEqual(runtime.session_snapshots(self.ctx, limit=30, offset=1), [])
+            self.assertEqual(runtime.session_snapshots(AuthContext("ta", "other"), limit=30, offset=0), [])
+
+    def test_stale_running_is_shown_as_failed_without_writing_store(self):
+        qa = self._qa()
+        sid = self._first(qa)["session_id"]
+        runtime = qa._sessions()
+        namespace, _ = runtime._keys(self.ctx, sid)
+        meta = {**self._metadata(qa, sid), "status": "running"}
+        runtime.store.put(namespace, sid, meta)
+        history = qa.session_history(self.conn, self.ctx, sid)
+        self.assertFalse(history["continuable"])
+        self.assertIn("上一轮未完成", history["readonly_reason"])
+        self.assertEqual(history["messages"][-1]["status"], "complete")
+        self.assertEqual(history["session"]["status"], "failed")
+        self.assertEqual(qa.list_sessions(self.conn, self.ctx, limit=30, offset=0)[0]["status"], "failed")
+        self.assertEqual(self._metadata(qa, sid), meta)
+        events = list(qa.answer_stream(self.ctx, "q", session_id=sid))
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertIn("上一轮会话未完成", events[-1]["detail"])
+
+    def test_live_running_still_reported_as_answering(self):
+        qa = self._qa()
+        sid = self._first(qa)["session_id"]
+        runtime = qa._sessions()
+        namespace, thread_id = runtime._keys(self.ctx, sid)
+        runtime.store.put(namespace, sid, {**self._metadata(qa, sid), "status": "running"})
+        with runtime._lease(thread_id):
+            history = qa.session_history(self.conn, self.ctx, sid)
+            self.assertFalse(history["continuable"])
+            self.assertEqual(history["readonly_reason"], "该会话正在回答")
+            self.assertEqual(history["session"]["status"], "running")
+            self.assertEqual(qa.list_sessions(self.conn, self.ctx, limit=30, offset=0)[0]["status"], "running")
+
+    def test_stale_running_incomplete_checkpoint_is_interrupted(self):
+        class BrokenModel(ScriptedFakeChatModel):
+            def _next_message(self):
+                raise RuntimeError("PROVIDER_FAILURE")
+
+        qa = self._qa()
+        qa._chat_model = BrokenModel(script=[])
+        events = list(qa.answer_stream(self.ctx, "unfinished question"))
+        sid = events[0]["session_id"]
+        runtime = qa._sessions()
+        namespace, thread_id = runtime._keys(self.ctx, sid)
+        meta = {**self._metadata(qa, sid), "status": "running"}
+        runtime.store.put(namespace, sid, meta)
+        with runtime._lease(thread_id):
+            live = qa.session_history(self.conn, self.ctx, sid)
+            self.assertEqual(live["messages"][-1]["status"], "running")
+            self.assertEqual(live["readonly_reason"], "该会话正在回答")
+        stale = qa.session_history(self.conn, self.ctx, sid)
+        self.assertEqual(stale["messages"][-1]["status"], "interrupted")
+        self.assertEqual(stale["session"]["status"], "failed")
+        self.assertFalse(stale["continuable"])
+        self.assertIn("上一轮未完成", stale["readonly_reason"])
+        self.assertEqual(self._metadata(qa, sid), meta)
+
+    def test_session_history_holds_storage_lease_during_get_state(self):
+        qa = self._qa()
+        sid = self._first(qa)["session_id"]
+        runtime = qa._sessions()
+        original_build = qa._build_agent
+        reads = []
+
+        def build(*args, **kwargs):
+            agent = original_build(*args, **kwargs)
+
+            def get_state(config):
+                self.assertTrue(any(k.startswith("storage:") for k in runtime._active))
+                with self.assertRaisesRegex(RuntimeError, "仍有问答运行"):
+                    runtime.close()
+                reads.append(config)
+                return agent.get_state(config)
+
+            return SimpleNamespace(get_state=get_state)
+
+        with patch.object(qa, "_build_agent", build):
+            history = qa.session_history(self.conn, self.ctx, sid)
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(history["messages"][0]["content"], "q1")
+        self.assertFalse(any(k.startswith("storage:") for k in runtime._active))
+
     def test_title_and_session_list_use_store_metadata(self):
         qa = self._qa()
         first = self._completed_metadata_session(qa, "第一段会话")

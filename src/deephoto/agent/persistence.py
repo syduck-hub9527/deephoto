@@ -306,13 +306,32 @@ class QAPersistence:
             item = self.store.get(namespace, session_id)
         return dict(item.value) if item is not None else None
 
-    def list_sessions(self, ctx, *, limit: int, offset: int) -> list[tuple[str, dict]]:
-        """按 Store item.updated_at 倒序返回会话快照;只读,不进租约。"""
+    def snapshot(self, ctx, session_id: str) -> tuple[dict | None, bool]:
+        """同一临界区内读取元数据与本进程租约状态;只读,不进租约。"""
+        _validate_id(session_id)
+        namespace, thread_id = self._keys(ctx, session_id)
+        with self._lock:
+            self._open()
+            item = self.store.get(namespace, session_id)
+            active = thread_id in self._active
+        return (dict(item.value) if item is not None else None), active
+
+    def session_snapshots(self, ctx, *, limit: int, offset: int) -> list[tuple[str, dict, bool]]:
+        """按 Store 更新时间倒序,原子读取 (session_id, metadata, active)。"""
         namespace = self._namespace(ctx)
         with self._lock:
             self._open()
             items = self.store.search(namespace, limit=limit, offset=offset)
-        return [(item.key, dict(item.value)) for item in items if SESSION_RE.fullmatch(item.key)]
+            rows = []
+            for item in items:
+                if SESSION_RE.fullmatch(item.key):
+                    _, thread_id = self._keys(ctx, item.key)
+                    rows.append((item.key, dict(item.value), thread_id in self._active))
+        return rows
+
+    def list_sessions(self, ctx, *, limit: int, offset: int) -> list[tuple[str, dict]]:
+        """按 Store item.updated_at 倒序返回会话快照;只读,不进租约。"""
+        return [(sid, meta) for sid, meta, _ in self.session_snapshots(ctx, limit=limit, offset=offset)]
 
     def rename(self, ctx, session_id: str, title: str) -> dict:
         _validate_id(session_id)

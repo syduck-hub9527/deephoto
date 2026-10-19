@@ -518,10 +518,10 @@ class QAService:
         return self._persistence_enabled()
 
     def _session_entries(self, conn: Connection, ctx: AuthContext, rows) -> list[dict]:
-        document_ids = {meta.get("document_id") for _, meta in rows if meta.get("document_id")}
+        document_ids = {meta.get("document_id") for _, meta, _ in rows if meta.get("document_id")}
         briefs = repo.documents_brief(conn, document_ids)
         entries = []
-        for session_id, meta in rows:
+        for session_id, meta, active in rows:
             document_id = meta.get("document_id")
             brief = briefs.get(document_id) if document_id else None
             entries.append({
@@ -531,7 +531,7 @@ class QAService:
                 "document_name": (brief or {}).get("filename"),
                 "document_available": document_id is None or bool(
                     self.knowledge.allowed_document_ids(conn, ctx, document_id)),
-                "status": meta.get("status"),
+                "status": _display_status(meta, active),
                 "created_at": meta.get("created_at"),
                 "updated_at": meta.get("updated_at"),
             })
@@ -540,23 +540,25 @@ class QAService:
     def list_sessions(self, conn: Connection, ctx: AuthContext, *, limit: int, offset: int) -> list[dict]:
         if not self._persistence_enabled():
             raise RuntimeError("问答持久化未启用")
-        rows = self._sessions().list_sessions(ctx, limit=limit, offset=offset)
+        rows = self._sessions().session_snapshots(ctx, limit=limit, offset=offset)
         return self._session_entries(conn, ctx, rows)
 
     def session_history(self, conn: Connection, ctx: AuthContext, session_id: str) -> dict:
-        """只读原生 checkpoint 的逐轮问答;不进租约、不改状态、不调用模型。"""
+        """只读原生 checkpoint 的逐轮问答;仅占资源租约,不改状态、不调用模型。"""
         if not self._persistence_enabled():
             raise RuntimeError("问答持久化未启用")
         runtime = self._sessions()
-        meta = runtime.inspect(ctx, session_id)
+        meta, active = runtime.snapshot(ctx, session_id)
         if meta is None:
             raise SessionError("会话不存在或无权访问")
+        status = _display_status(meta, active)
 
         tools, tracker = self._make_tools(ctx)
         kwargs = self._agent_kwargs(ctx, tracker)
         kwargs.update(checkpointer=runtime.saver, store=runtime.store)
         agent = self._build_agent(tools, **kwargs)
-        state = agent.get_state(runtime.thread_config(ctx, session_id))
+        with runtime.storage():
+            state = agent.get_state(runtime.thread_config(ctx, session_id))
         stored_messages = state.values.get("messages", [])
 
         rounds = []
@@ -585,24 +587,23 @@ class QAService:
                 })
                 continue
             is_last = index == len(rounds) - 1
-            if is_last and meta.get("status") == "awaiting_approval":
-                status = "awaiting_approval"
-            elif is_last and meta.get("status") == "running":
-                status = "running"
+            if is_last and status == "awaiting_approval":
+                message_status = "awaiting_approval"
+            elif is_last and status == "running":
+                message_status = "running"
             else:
-                status = "interrupted"
+                message_status = "interrupted"
             history_messages.append({
-                "role": "assistant", "message_id": None, "status": status,
+                "role": "assistant", "message_id": None, "status": message_status,
                 "answer": "", "citations": [], "images": [],
             })
 
-        session = self._session_entries(conn, ctx, [(session_id, meta)])[0]
+        session = self._session_entries(conn, ctx, [(session_id, meta, active)])[0]
         if not meta.get("title"):
             first_user = next((m for m in history_messages if m["role"] == "user"), None)
             if first_user is not None:
                 session["title"] = make_title(first_user["content"])
 
-        status = meta.get("status")
         readonly_reason = None
         if status == "running":
             readonly_reason = "该会话正在回答"
@@ -827,6 +828,12 @@ _SCOPE_PREFIX_RE = re.compile(r"\A\(目标文档 ID:[^)\n]*\)\n")
 
 def _strip_scope_prefix(text: str) -> str:
     return _SCOPE_PREFIX_RE.sub("", text, count=1)
+
+
+def _display_status(metadata: dict, active: bool) -> str | None:
+    """将进程中断遗留的 running 展示为 failed,不写回 Store。"""
+    status = metadata.get("status")
+    return "failed" if status == "running" and not active else status
 
 
 def _build_messages(question: str, document_id: str | None, history: list[dict] | None) -> list[dict]:

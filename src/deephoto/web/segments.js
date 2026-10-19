@@ -624,6 +624,10 @@
 
   // ---- 历史会话:服务端消息映射与本地日历分组 ----
 
+  function needsSessionRecheck(msg) {
+    return !!(msg && (msg.broken || msg.error || msg.warning || msg.sessionFailed));
+  }
+
   function fromHistoryMessage(m) {
     if (m.role === "user") return { role: "user", content: m.content };
     return {
@@ -670,7 +674,7 @@
 
   return { esc, extractMath, figLabel, pageLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
            imageCardHTML, figureDomId, newMessageId, createAssistantMessage,
-           applyStreamEvent, finishStream, restoreMessages, fromHistoryMessage, groupSessions, relativeTime,
+           applyStreamEvent, finishStream, restoreMessages, needsSessionRecheck, fromHistoryMessage, groupSessions, relativeTime,
            PROG_STAGE_NAMES, PROG_STAGE_STATE, locatorUnit, formatElapsed, progressLine, createDocPoller,
            renderChunks, renderImageItems, renderBatchItems, createProgDetailLoader };
 });
