@@ -752,14 +752,20 @@ class ServicePersistenceTest(_Base):
         with self.assertRaises(RuntimeError):
             qa.answer(self.conn, self.ctx, "q")
 
-    def test_settings_default_off_and_bad_boolean_rejected(self):
-        with patch.dict("os.environ", {"DEEPHOTO_QA_PERSISTENCE_ENABLED": "false"}):
-            settings = load_settings()
-            self.assertFalse(settings.qa_persistence_enabled)
+    def test_settings_fixed_on_and_legacy_env_only_warns(self):
+        # 03/04/05 偏好已固定开启:旧环境变量(含非法值)被忽略,只告警不报错
+        for raw in ("false", "unknown"):
+            env = {"DEEPHOTO_QA_PERSISTENCE_ENABLED": raw, "DEEPHOTO_QA_MIDDLEWARE_ENABLED": raw,
+                   "DEEPHOTO_QA_MEMORY_ENABLED": raw}
+            with patch.dict("os.environ", env), self.assertLogs("deephoto.config", level="WARNING") as logs:
+                settings = load_settings()
+            self.assertTrue(settings.qa_persistence_enabled)
+            self.assertTrue(settings.qa_middleware_enabled)
+            self.assertTrue(settings.qa_memory_enabled)
             self.assertEqual(settings.qa_checkpoint_db_path.name, "qa-checkpoints.db")
-        with patch.dict("os.environ", {"DEEPHOTO_QA_PERSISTENCE_ENABLED": "unknown"}):
-            with self.assertRaisesRegex(ValueError, "QA_PERSISTENCE_ENABLED"):
-                load_settings()
+            output = "\n".join(logs.output)
+            for name in env:
+                self.assertIn(name, output)
 
 
 class PersistenceApiTest(unittest.TestCase):
@@ -770,14 +776,16 @@ class PersistenceApiTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _app(self, script, *, enabled=True):
+        from dataclasses import replace
         from deephoto.api.app import create_app
         with patch.dict("os.environ", {"DEEPHOTO_DATA_DIR": self.tmp.name,
-                                       "DEEPHOTO_QA_PERSISTENCE_ENABLED": "true" if enabled else "false",
                                        "DEEPHOTO_QA_SUBAGENTS_ENABLED": "false",
-                                       "DEEPHOTO_QA_KB_VFS_ENABLED": "false",
-                                       "DEEPHOTO_QA_MIDDLEWARE_ENABLED": "false",
-                                       "DEEPHOTO_DESCRIPTION_ENABLED": "false"}):
-            app = create_app(load_settings())
+                                       "DEEPHOTO_QA_KB_VFS_ENABLED": "false"}):
+            settings = load_settings()
+        if not enabled:
+            # 生产入口已固定开启 03;关闭态(及依赖它的 05 偏好)只能直接构造配置来覆盖
+            settings = replace(settings, qa_persistence_enabled=False, qa_memory_enabled=False)
+        app = create_app(settings)
         app.state.qa_service._chat_model = ScriptedFakeChatModel(script=script)
         return app
 

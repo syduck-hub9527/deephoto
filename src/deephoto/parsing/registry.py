@@ -68,7 +68,7 @@ def engine_for(fmt: FormatInfo, settings: Settings) -> str:
             return "local"              # 降级:整图入库,靠描述模型检索(§3.4f)
         raise EngineUnavailable(
             "图片文件需要 MinerU OCR(配置 DEEPHOTO_MINERU_API_KEY)"
-            "或图片描述模型(配置 DEEPHOTO_DESCRIPTION_* 并启用 DESCRIPTION_ENABLED)")
+            "或图片描述模型(填写 DEEPHOTO_DESCRIPTION_API_KEY / BASE_URL / MODEL)")
     raise EngineUnavailable(_UNAVAILABLE.get(fmt.key, f"暂不支持 {fmt.key} 格式"))
 
 

@@ -132,7 +132,7 @@ Python 要求为 3.11 及以上。开发时使用安装了项目依赖的虚拟�
 - 引用和图片锚点使用真实 `[chunk:ID]` / `[image:ID]`；沿用 tracker、会话中已验证证据与当前访问权限的校验链路，不放宽为“模型说存在就存在”。
 - 不混用聊天、图片描述、嵌入和解析服务的配置。模型协议兼容在 `llm.py` 集中处理，保留当前工具循环需要的多模态与 reasoning 字段。
 - 观测记录有界元数据，不记录密钥、原始图片载荷或完整文档。观测不能改变业务结果。
-- 六个现有开关是 `QA_SUBAGENTS_ENABLED`、`QA_KB_VFS_ENABLED`、`QA_PERSISTENCE_ENABLED`、`QA_MIDDLEWARE_ENABLED`、`QA_SKILLS_ENABLED`、`QA_MEMORY_ENABLED`，环境变量统一加 `DEEPHOTO_` 前缀，当前默认关闭；Memory 依赖 Persistence。
+- 03 Persistence、04 Middleware、05 Memory 已由用户决定固定开启：`load_settings()` 不再读取对应环境变量（残留只告警），`Settings` 数据类默认值保持 False 仅供测试构造最小配置；图片描述按 `DESCRIPTION_API_KEY` / `BASE_URL` 是否填写自动启用。仍可选的开关是 `QA_SUBAGENTS_ENABLED`、`QA_KB_VFS_ENABLED`、`QA_SKILLS_ENABLED`、`QA_HITL_ENABLED`，环境变量统一加 `DEEPHOTO_` 前缀，默认关闭；HITL 依赖 Persistence（已固定满足）。
 - “优先使用框架”不授权擅自把开关全开、修改默认模式或扩大现有工具权限。改变默认行为须属于当前任务，并说明迁移与回退方式。
 
 ## 验证与交付

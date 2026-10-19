@@ -189,7 +189,7 @@ class IngestService:
         conn.commit()
         if stats["model"] is None:
             observer.stage_end(pg.STAGE_DESCRIBING, pg.RESULT_SKIPPED,
-                               detail={"reason": "图片描述已关闭(DEEPHOTO_DESCRIPTION_ENABLED 未开启)"})
+                               detail={"reason": "图片描述未配置(DEEPHOTO_DESCRIPTION_API_KEY / BASE_URL 未填写)"})
         else:
             # 结果按最终统计计算:重试恢复后 failed 归零即 succeeded(§4.7.4)
             result = pg.RESULT_SUCCEEDED if not stats["failed"] else pg.RESULT_PARTIAL

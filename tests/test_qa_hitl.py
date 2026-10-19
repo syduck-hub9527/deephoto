@@ -634,13 +634,15 @@ class HitlConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "QA_HITL_ENABLED"):
                 create_app(self._settings(td, qa_hitl_enabled=True, qa_persistence_enabled=False))
 
-    def test_hitl_requires_persistence_via_env(self):
+    def test_hitl_env_can_no_longer_disable_persistence(self):
+        # 03 已固定开启:即使旧 .env 写了 PERSISTENCE=false,HITL 也能正常加载
         from deephoto.config import load_settings
         with patch.dict("os.environ", {"DEEPHOTO_QA_HITL_ENABLED": "true",
                                        "DEEPHOTO_QA_PERSISTENCE_ENABLED": "false"}), \
                 patch("deephoto.config._load_dotenv"):
-            with self.assertRaisesRegex(ValueError, "QA_HITL_ENABLED"):
-                load_settings()
+            settings = load_settings()
+        self.assertTrue(settings.qa_hitl_enabled)
+        self.assertTrue(settings.qa_persistence_enabled)
 
     def test_env_defaults_and_bounds(self):
         from deephoto.config import load_settings

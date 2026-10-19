@@ -37,7 +37,7 @@ def build_chat_model(settings: Settings):
 def build_description_model(settings: Settings, *, max_tokens: int | None = None):
     """图片描述专用模型(OpenAI 兼容,如百炼 qwen3.8-omni-flash;与问答/嵌入配置解耦)。
 
-    未启用(DEEPHOTO_DESCRIPTION_ENABLED 非 true)返回 None——这是明确的"已关闭"
+    未启用(DEEPHOTO_DESCRIPTION_API_KEY / BASE_URL 均未填写)返回 None——这是明确的"已关闭"
     状态,与初始化失败严格区分:启用后配置缺项在 load_settings 启动校验时已报出;
     其余初始化异常直接上抛,由入库失败路径记录真实失败,不伪装成未配置。
     max_tokens:默认沿用 settings.description_max_tokens;parse_failed 重试按轮

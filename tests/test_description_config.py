@@ -80,20 +80,16 @@ class EnvParsingTest(EnvTestBase):
         self.assertEqual((s.description_timeout_seconds, s.description_max_retries,
                           s.description_max_tokens), (45.5, 0, 512))
 
-    def test_bool_variants(self):
-        os.environ.update({   # true 分支需通过启动校验
-            "DEEPHOTO_DESCRIPTION_API_KEY": "k",
-            "DEEPHOTO_DESCRIPTION_BASE_URL": "https://example.cn/v1",
-        })
-        for raw, expected in (("true", True), ("false", False), ("1", True), ("0", False),
-                              ("yes", True), ("no", False)):
+    def test_enabled_follows_configuration_and_legacy_flag_is_ignored(self):
+        # 不再读取 DESCRIPTION_ENABLED:任何旧值(含非法值)都不影响结果,只告警
+        self.assertFalse(load_settings().description_enabled)          # 未填写 Key/URL -> 关闭
+        os.environ.update({"DEEPHOTO_DESCRIPTION_API_KEY": "k",
+                           "DEEPHOTO_DESCRIPTION_BASE_URL": "https://example.cn/v1"})
+        for raw in ("false", "0", "no", "maybe"):
             os.environ["DEEPHOTO_DESCRIPTION_ENABLED"] = raw
-            self.assertIs(load_settings().description_enabled, expected, raw)
-
-    def test_bool_invalid_names_variable(self):
-        os.environ["DEEPHOTO_DESCRIPTION_ENABLED"] = "maybe"
-        with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_ENABLED"):
-            load_settings()
+            with self.assertLogs("deephoto.config", level="WARNING") as logs:
+                self.assertTrue(load_settings().description_enabled, raw)
+            self.assertIn("DEEPHOTO_DESCRIPTION_ENABLED", "\n".join(logs.output))
 
     def test_number_invalid_even_when_disabled(self):
         os.environ["DEEPHOTO_DESCRIPTION_MAX_RETRIES"] = "abc"   # 关闭时数字仍应合法
@@ -186,14 +182,18 @@ class ValidationTest(EnvTestBase):
         })
         os.environ.update(extra)
 
-    def test_missing_key_and_url_names_variable_without_value(self):
-        os.environ["DEEPHOTO_DESCRIPTION_ENABLED"] = "true"
+    def test_partial_config_names_missing_variable_without_value(self):
+        # 只填了一半:视为要启用,启动校验报出缺失的变量名,且不泄露已填的值
+        os.environ["DEEPHOTO_DESCRIPTION_API_KEY"] = "secret-should-not-leak"
         with self.assertRaises(ValueError) as ctx:
             load_settings()
         msg = str(ctx.exception)
-        self.assertIn("DEEPHOTO_DESCRIPTION_API_KEY", msg)
         self.assertIn("DEEPHOTO_DESCRIPTION_BASE_URL", msg)
         self.assertNotIn("secret", msg.lower())
+        del os.environ["DEEPHOTO_DESCRIPTION_API_KEY"]
+        os.environ["DEEPHOTO_DESCRIPTION_BASE_URL"] = "https://example.cn/v1"
+        with self.assertRaisesRegex(ValueError, "DEEPHOTO_DESCRIPTION_API_KEY"):
+            load_settings()
 
     def test_bad_urls_rejected(self):
         for bad in ("not-a-url", "https://user:pass@example.cn/v1",

@@ -521,7 +521,7 @@ class LateFixesTest(ProgressTestBase):
 
     def test_description_model_recorded_and_skip_reason_updated(self):
         # 成功与异常两处都记录实际描述模型配置名(不再残留 settings.chat_model);
-        # 关闭时跳过原因明确为"已关闭"
+        # 未配置描述模型时跳过原因明确为"未配置"
         calls = {"n": 0}
 
         def one_bad(*a, **k):
@@ -540,7 +540,7 @@ class LateFixesTest(ProgressTestBase):
 
         doc2 = self._new_doc(b"%PDF-1.4 other")
         self._ingest(doc2, describe=None)
-        self.assertIn("已关闭", self._stages(doc2)["describing"]["detail"]["reason"])
+        self.assertIn("未配置", self._stages(doc2)["describing"]["detail"]["reason"])
 
     def test_description_init_error_not_swallowed_as_unconfigured(self):
         # 初始化异常不得伪装成"未配置":应进入入库失败路径,记录真实失败

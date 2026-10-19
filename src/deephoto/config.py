@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,29 @@ def _get(name: str, default: str) -> str: ...
 def _get(name: str, default: None = None) -> str | None: ...
 def _get(name: str, default: str | None = None) -> str | None:
     return os.environ.get(_ENV_PREFIX + name, default)
+
+
+logger = logging.getLogger(__name__)
+
+# 已固定的功能:不再读取以下环境变量(.env 里残留时只告警、不报错)。
+# 03 会话持久化 / 04 调用限制与轨迹 / 05 显式偏好记忆始终开启;图片描述按配置是否填写自动启用。
+_FIXED_FLAGS = {
+    "QA_PERSISTENCE_ENABLED": "会话持久化已固定开启",
+    "QA_MIDDLEWARE_ENABLED": "调用限制与工具轨迹已固定开启",
+    "QA_MEMORY_ENABLED": "回答偏好记忆已固定开启",
+    "DESCRIPTION_ENABLED": "图片描述改为按 DEEPHOTO_DESCRIPTION_API_KEY / BASE_URL 是否填写自动启用",
+}
+
+
+def _warn_fixed_flags() -> None:
+    for name, reason in _FIXED_FLAGS.items():
+        if _get(name) is not None:
+            logger.warning("%s%s 已不再生效(%s),可从 .env 中删除", _ENV_PREFIX, name, reason)
+
+
+def _description_configured() -> bool:
+    """填写了 Key 或 Base URL 即视为要启用图片描述;完整性由 validate_description 校验。"""
+    return bool((_get("DESCRIPTION_API_KEY") or "").strip() or (_get("DESCRIPTION_BASE_URL") or "").strip())
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -173,7 +197,7 @@ class Settings:
     # 调试:设置后把 MinerU 返回的原始结果 ZIP 存到该目录,用于核对真实字段格式
     mineru_dump_dir: str | None = None
 
-    # 图片描述模型:独立于问答/Embedding/MinerU;默认关闭(显式 DESCRIPTION_ENABLED=true 启用)
+    # 图片描述模型:独立于问答/Embedding/MinerU;load_settings 按 Key/URL 是否填写自动启用(数据类默认 False 供测试)
     description_enabled: bool = False
     description_api_key: str | None = None
     description_base_url: str | None = None
@@ -209,12 +233,12 @@ class Settings:
     qa_kb_vfs_enabled: bool = False
     qa_kb_grep_max_docs: int = 300     # 单次 grep 最多覆盖的文档数(每次都要整篇渲染进内存)
 
-    # 04:工具轨迹 + 主智能体调用上限;默认关闭,返回契约保持原样
+    # 04:工具轨迹 + 主智能体调用上限;生产由 load_settings 固定开启(数据类默认 False 供测试构造最小配置)
     qa_middleware_enabled: bool = False
     qa_main_max_model_calls: int = 12
-    # 03:服务端会话历史与已验证引用;本阶段仅支持单进程服务
+    # 03:服务端会话历史与已验证引用;仅支持单进程服务;生产由 load_settings 固定开启
     qa_persistence_enabled: bool = False
-    # 05:技能可独立开启;用户显式偏好依赖 03 的 Store 生命周期。
+    # 05:技能可独立开启;用户显式偏好依赖 03 的 Store 生命周期,生产由 load_settings 固定开启。
     qa_skills_enabled: bool = False
     qa_memory_enabled: bool = False
     # 06:inspect_image 人工审批闸门;依赖 03(挂起/恢复需要 checkpointer 与会话状态机)
@@ -249,8 +273,13 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    """从环境变量加载配置。支持 .env 文件(简单解析,不引入额外依赖)。"""
+    """从环境变量加载配置。支持 .env 文件(简单解析,不引入额外依赖)。
+
+    生产唯一入口:03 持久化 / 04 middleware / 05 偏好记忆在此固定为 True,图片描述按配置自动启用。
+    Settings 数据类的默认值保持 False,只供测试构造最小配置。
+    """
     _load_dotenv()
+    _warn_fixed_flags()
     settings = Settings(
         moonshot_api_key=_get("MOONSHOT_API_KEY"),
         moonshot_base_url=_get("MOONSHOT_BASE_URL", "https://api.kimi.com/coding/v1"),
@@ -275,15 +304,15 @@ def load_settings() -> Settings:
         qa_main_recursion_limit=_get_int("QA_MAIN_RECURSION_LIMIT", 40, minimum=10),
         qa_kb_vfs_enabled=_get_bool("QA_KB_VFS_ENABLED", False),
         qa_kb_grep_max_docs=_get_int("QA_KB_GREP_MAX_DOCS", 300, minimum=1),
-        qa_middleware_enabled=_get_bool("QA_MIDDLEWARE_ENABLED", False),
+        qa_middleware_enabled=True,       # 固定开启(不再读取环境变量)
         qa_main_max_model_calls=_get_int("QA_MAIN_MAX_MODEL_CALLS", 12, minimum=2),
-        qa_persistence_enabled=_get_bool("QA_PERSISTENCE_ENABLED", False),
+        qa_persistence_enabled=True,      # 固定开启(不再读取环境变量)
         qa_skills_enabled=_get_bool("QA_SKILLS_ENABLED", False),
-        qa_memory_enabled=_get_bool("QA_MEMORY_ENABLED", False),
+        qa_memory_enabled=True,           # 固定开启(不再读取环境变量)
         qa_hitl_enabled=_get_bool("QA_HITL_ENABLED", False),
         qa_hitl_auto_approve_images=_get_int("QA_HITL_AUTO_APPROVE_IMAGES", 2, minimum=0),
         qa_hitl_timeout_seconds=_get_int("QA_HITL_TIMEOUT_SECONDS", 600, minimum=30),
-        description_enabled=_get_bool("DESCRIPTION_ENABLED", False),
+        description_enabled=_description_configured(),   # 填了 Key/URL 即启用,完整性在 validate_description 校验
         description_api_key=_get("DESCRIPTION_API_KEY"),
         description_base_url=_get("DESCRIPTION_BASE_URL"),
         description_model=_get("DESCRIPTION_MODEL", "qwen3.8-omni-flash"),

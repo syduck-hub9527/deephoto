@@ -594,7 +594,7 @@ async function refreshSessions(append = false) {
 function renderSessions() {
   const box = $("convList");
   if (!historyEnabled) {
-    box.innerHTML = '<div class="conv-empty">未开启会话持久化：新建会话会清空当前对话。设置 DEEPHOTO_QA_PERSISTENCE_ENABLED=true 并重启后可保存历史会话</div>';
+    box.innerHTML = '<div class="conv-empty">历史会话不可用：服务端未启用会话持久化，新建会话会清空当前对话</div>';
     return;
   }
   const current = localStorage.getItem("deephoto_session") || "";

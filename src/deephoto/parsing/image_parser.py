@@ -1,7 +1,7 @@
 """图片文件的本地降级解析(DEV_multi_format_documents.md §3.4f)。
 
 无 MinerU Token 时的兜底:整图作为唯一 figure(1 页、无正文),不 OCR;
-仍可靠"图片描述"被检索(需 DESCRIPTION_ENABLED,由 registry 在引擎选择时保证)。
+仍可靠"图片描述"被检索(需已配置图片描述模型,由 registry 在引擎选择时保证)。
 有 Token 时图片走 MinerU OCR,不经此解析器。
 """
 

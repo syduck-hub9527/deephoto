@@ -418,9 +418,11 @@ class ContextApiTest(unittest.TestCase):
             self.assertFalse((Path(td)/"qa-store.db").exists())
             with self.assertRaisesRegex(ValueError, "PERSISTENCE"):
                 create_app(_settings(td, qa_memory_enabled=True))
+        # 生产入口固定开启 03 与 05 偏好:旧环境变量被忽略,组合始终合法
         with patch.dict("os.environ", {"DEEPHOTO_QA_MEMORY_ENABLED": "true", "DEEPHOTO_QA_PERSISTENCE_ENABLED": "false"}), patch("deephoto.config._load_dotenv"):
-            with self.assertRaisesRegex(ValueError, "PERSISTENCE"):
-                load_settings()
+            settings = load_settings()
+        self.assertTrue(settings.qa_persistence_enabled)
+        self.assertTrue(settings.qa_memory_enabled)
 
     def test_preference_schema_and_packaged_role_assets(self):
         with self.assertRaises(ValidationError):
