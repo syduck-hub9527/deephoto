@@ -622,9 +622,55 @@
              get inflightCount() { return inflight.size; } };
   }
 
+  // ---- 历史会话:服务端消息映射与本地日历分组 ----
+
+  function fromHistoryMessage(m) {
+    if (m.role === "user") return { role: "user", content: m.content };
+    return {
+      role: "assistant", content: m.answer || "", thinking: "",
+      citations: m.citations || [], images: m.images || [],
+      message_id: m.message_id || newMessageId(), streaming: false,
+      validated: m.status === "complete",
+      broken: m.status === "interrupted",
+      warning: m.status === "interrupted" ? "本轮未完成" :
+        m.status === "running" ? "回答生成中(其他窗口)" : undefined,
+    };
+  }
+
+  function localDayNumber(date) {
+    return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86400000;
+  }
+
+  function groupSessions(items, now) {
+    const reference = now === undefined ? new Date() : new Date(now);
+    const groups = ["今天", "昨天", "近 7 天", "更早"].map(label => ({ label, items: [] }));
+    (items || []).forEach(item => {
+      const updated = new Date(item.updated_at);
+      let label = "更早";
+      if (!isNaN(updated.getTime()) && !isNaN(reference.getTime())) {
+        const days = localDayNumber(reference) - localDayNumber(updated);
+        label = days <= 0 ? "今天" : days === 1 ? "昨天" : days <= 7 ? "近 7 天" : "更早";
+      }
+      groups.find(group => group.label === label).items.push(item);
+    });
+    return groups.filter(group => group.items.length);
+  }
+
+  function relativeTime(iso, now) {
+    const reference = now === undefined ? new Date() : new Date(now);
+    const date = new Date(iso);
+    if (isNaN(date.getTime()) || isNaN(reference.getTime())) return "";
+    const elapsed = Math.max(0, reference.getTime() - date.getTime());
+    if (elapsed < 60000) return "刚刚";
+    if (elapsed < 3600000) return `${Math.floor(elapsed / 60000)} 分钟前`;
+    if (elapsed < 86400000) return `${Math.floor(elapsed / 3600000)} 小时前`;
+    if (localDayNumber(reference) - localDayNumber(date) === 1) return "昨天";
+    return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`;
+  }
+
   return { esc, extractMath, figLabel, pageLabel, splitAnswerSegments, withholdTrailingPartial, renderAnswerBody,
            imageCardHTML, figureDomId, newMessageId, createAssistantMessage,
-           applyStreamEvent, finishStream, restoreMessages,
+           applyStreamEvent, finishStream, restoreMessages, fromHistoryMessage, groupSessions, relativeTime,
            PROG_STAGE_NAMES, PROG_STAGE_STATE, locatorUnit, formatElapsed, progressLine, createDocPoller,
            renderChunks, renderImageItems, renderBatchItems, createProgDetailLoader };
 });

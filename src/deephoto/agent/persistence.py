@@ -3,6 +3,7 @@
 两者不是一个事务:先标记 running,只有图执行与答案组装均完成才置 ready。
 失败/中断的会话拒绝继续,避免把半轮 checkpoint 当作成功历史重新执行。
 同会话互斥仅覆盖本进程;本阶段面向项目现有单进程本地部署。
+会话标题存在元数据的 title 字段,历史列表来自 Store.search。
 
 06 HITL 增补状态 awaiting_approval:图在审批闸门挂起时 park(不写 failed),
 审批入口经 allow_awaiting 恢复;超时由下一次请求惰性触发自动拒绝(5.5),
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
 SESSION_RE = re.compile(r"sess_[0-9a-f]{32}\Z")
 EVIDENCE_LIMIT = 2048
+TITLE_MAX = 30
 
 # 06:挂起元数据特有的键;complete/restore 写 ready 时必须剥掉,不带到下一轮
 _PARK_KEYS = ("approvals", "decided", "expires_at", "previous", "evidence")
@@ -51,6 +53,14 @@ class DocumentScopeError(SessionError):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def make_title(question: str) -> str:
+    """合并连续空白并截取前 30 字;超长加省略号,空白问题使用默认标题。"""
+    title = " ".join(question.split())
+    if not title:
+        return "新会话"
+    return title[:TITLE_MAX] + ("…" if len(title) > TITLE_MAX else "")
 
 
 def deadline(seconds: int) -> str:
@@ -208,14 +218,18 @@ class QAPersistence:
                 self._active.remove(thread_id)
 
     @staticmethod
+    def _namespace(ctx) -> tuple[str, ...]:
+        return ("deephoto", "qa_sessions", _scope(ctx))
+
+    @staticmethod
     def _keys(ctx, session_id: str):
-        owner = _scope(ctx)
-        namespace = ("deephoto", "qa_sessions", owner)
+        namespace = QAPersistence._namespace(ctx)
+        owner = namespace[-1]
         return namespace, f"qa:{owner}:{session_id}"
 
     @contextmanager
     def turn(self, ctx, session_id: str | None, document_id: str | None, profile: dict,
-             *, preflight=None, allow_awaiting: bool = False):
+             *, preflight=None, allow_awaiting: bool = False, title: str | None = None):
         existing = session_id is not None
         session_id = session_id or f"sess_{uuid4().hex}"
         _validate_id(session_id)
@@ -240,7 +254,7 @@ class QAPersistence:
                     raise SessionError("会话状态缺失,请开启新会话")
             else:
                 metadata = {"version": 1, "document_id": document_id, "profile": profile,
-                            "created_at": _now(), "chunk_ids": [], "image_ids": []}
+                            "title": title, "created_at": _now(), "chunk_ids": [], "image_ids": []}
             # 归属/scope/profile/status 校验后,但 running 写入前进行业务预检。
             # 预检异常不进入 turn 的失败 finally,旧 metadata/checkpoint 均保持原样。
             if preflight is not None:
@@ -274,6 +288,12 @@ class QAPersistence:
                         failed = dict(turn.metadata, status="failed", updated_at=_now())
                         self.store.put(namespace, session_id, failed)
 
+    def thread_config(self, ctx, session_id: str) -> dict:
+        """返回读取/恢复同一会话图状态所需的原生 thread 配置。"""
+        _validate_id(session_id)
+        _, thread_id = self._keys(ctx, session_id)
+        return {"configurable": {"thread_id": thread_id}}
+
     def inspect(self, ctx, session_id: str) -> dict | None:
         """读取会话元数据快照(不进入租约、不校验状态机);不存在返回 None。
 
@@ -285,6 +305,27 @@ class QAPersistence:
             self._open()
             item = self.store.get(namespace, session_id)
         return dict(item.value) if item is not None else None
+
+    def list_sessions(self, ctx, *, limit: int, offset: int) -> list[tuple[str, dict]]:
+        """按 Store item.updated_at 倒序返回会话快照;只读,不进租约。"""
+        namespace = self._namespace(ctx)
+        with self._lock:
+            self._open()
+            items = self.store.search(namespace, limit=limit, offset=offset)
+        return [(item.key, dict(item.value)) for item in items if SESSION_RE.fullmatch(item.key)]
+
+    def rename(self, ctx, session_id: str, title: str) -> dict:
+        _validate_id(session_id)
+        namespace, thread_id = self._keys(ctx, session_id)
+        with self._lease(thread_id):
+            item = self.store.get(namespace, session_id)
+            if item is None:
+                raise SessionError("会话不存在或无权访问")
+            metadata = dict(item.value, title=title, title_custom=True)
+            # Store.put 会刷新 item.updated_at,因此改名后会话排到列表顶部;
+            # 元数据自身的 status/updated_at 等业务字段保持不变。
+            self.store.put(namespace, session_id, metadata)
+            return metadata
 
     def delete(self, ctx, session_id: str) -> None:
         _validate_id(session_id)

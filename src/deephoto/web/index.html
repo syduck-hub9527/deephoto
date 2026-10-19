@@ -33,7 +33,19 @@
                 background: var(--card); color: var(--text); text-align: left; }
   #newChatBtn:hover { border-color: var(--accent); color: var(--accent); }
   .side-label { padding: 8px 18px 6px; font-size: 12px; color: var(--muted); letter-spacing: 1px; }
-  #docList { flex: 1; overflow-y: auto; padding: 0 10px; }
+  #convList { flex: 0 1 auto; max-height: 38vh; overflow-y: auto; padding: 0 10px; }
+  #docList { flex: 1; min-height: 0; overflow-y: auto; padding: 0 10px; }
+  .conv-group { padding: 7px 8px 3px; font-size: 11px; color: var(--muted); }
+  .conv-item { align-items: flex-start; }
+  .conv-item > .dot { margin-top: 5px; }
+  .conv-main { flex: 1; min-width: 0; }
+  .conv-meta { display: flex; align-items: center; gap: 3px; margin-top: 2px; font-size: 11px; color: var(--muted); }
+  .conv-action { flex-shrink: 0; }
+  .conv-rename:hover { color: var(--accent); }
+  .conv-empty { padding: 6px 8px 10px; color: var(--muted); font-size: 11.5px; line-height: 1.6; }
+  .conv-more { width: calc(100% - 8px); margin: 4px; padding: 6px; border: 1px solid var(--border);
+               border-radius: 8px; background: var(--card); color: var(--muted); font-size: 12px; }
+  .conv-more:hover { color: var(--accent); border-color: var(--accent); }
   .doc-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 4px;
               border-radius: 8px; font-size: 13px; cursor: pointer; border: 1px solid transparent; }
   .doc-item:hover { background: var(--card); }
@@ -85,6 +97,12 @@
   .empty .logo { font-size: 42px; }
   .empty h2 { color: var(--text); font-weight: 600; margin: 10px 0 6px; }
   .empty p { font-size: 13px; line-height: 1.8; }
+  .readonly-bar { display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+                  border: 1px solid var(--border); border-radius: 10px; background: var(--card);
+                  color: var(--muted); font-size: 12.5px; }
+  .readonly-bar span { flex: 1; }
+  .readonly-bar button { flex: none; border: 1px solid var(--border); border-radius: 8px;
+                         background: var(--bg); color: var(--text); padding: 5px 10px; }
 
   .msg { display: flex; gap: 12px; }
   .msg .avatar { width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0; display: flex;
@@ -213,6 +231,8 @@
 <aside id="sidebar">
   <div class="brand">deep<span>hoto</span></div>
   <div class="side-actions"><button id="newChatBtn" onclick="newChat()">＋ 新会话</button></div>
+  <div class="side-label">会话</div>
+  <div id="convList"></div>
   <div class="side-label">文档库</div>
   <!-- accept 由服务端 GET /api/documents/upload-config 下发(白名单的单一事实来源);拉取失败则不设 accept,由服务端把关 -->
   <label id="uploadLabel">上传文档…<input type="file" id="file" multiple hidden></label>
@@ -247,13 +267,20 @@ const SEG = DeepphotoSegments;
 const STATUS_LABEL = { queued: "排队中", parsing: "解析中", describing: "描述图片", indexing: "索引中", ready: "就绪", failed: "失败" };
 let messages = [];      // {role, content, citations?, images?, validated?, warning?, broken?}
 let sending = false;
+let historyEnabled = false;
+let historyModeReady = false;
+let historySessions = [];
+let historyNextOffset = null;
+let sessionListLoading = false;
+let openingSession = false;
+let syncingScope = false;
+let readonlyReason = null;
 
 // ---- 初始化 ----
 initTheme();
-messages = SEG.restoreMessages(JSON.parse(localStorage.getItem("deephoto_chat") || "[]"));
-localStorage.setItem("deephoto_chat", JSON.stringify(messages.slice(-60)));   // 持久化补齐的消息 ID
 renderThread();
-// docPoller 在下方"文档库"一节定义后才启动(const 暂时性死区:提前调用会中断整个初始化)
+updateComposer();
+// 会话模式与 docPoller 都在全部定义之后初始化,避免 const 暂时性死区。
 
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
@@ -279,6 +306,24 @@ $("threadInner").addEventListener("click", (e) => {
     renderThread();
   } else if (action === "submit") {
     submitApprovals(m);
+  }
+});
+
+// 会话列表与条目操作共用事件委托,标题/文件名只作为转义后的展示文本。
+$("convList").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-conv-action]");
+  const item = e.target.closest("[data-session-id]");
+  if (btn) {
+    e.stopPropagation();
+    const action = btn.dataset.convAction;
+    if (action === "more") refreshSessions(true);
+    else if (item && action === "rename") renameConversation(item.dataset.sessionId);
+    else if (item && action === "delete") deleteConversation(item.dataset.sessionId);
+    return;
+  }
+  if (item) {
+    openSession(item.dataset.sessionId);
+    $("sidebar").classList.remove("open");
   }
 });
 
@@ -418,6 +463,7 @@ function stageCount(s) {
 }
 
 function setScope(id) {
+  if (syncingScope) return;
   if (sending) return;
   const cur = localStorage.getItem("deephoto_scope") || "";
   localStorage.setItem("deephoto_scope", cur === id ? "" : id);
@@ -425,6 +471,7 @@ function setScope(id) {
   refreshDocs(true);
 }
 function saveScope() {
+  if (syncingScope) return;
   if (sending) { $("scope").value = localStorage.getItem("deephoto_scope") || ""; return; }
   localStorage.setItem("deephoto_scope", $("scope").value);
   if (localStorage.getItem("deephoto_session")) newChat();
@@ -454,6 +501,7 @@ async function upload() {
 }
 
 async function delDoc(id) {
+  if (syncingScope) return;
   if (sending && (localStorage.getItem("deephoto_scope") || "") === id) {
     toast("请等待当前回答结束后再删除"); return;
   }
@@ -465,21 +513,209 @@ async function delDoc(id) {
     if (localStorage.getItem("deephoto_session")) newChat();
   }
   refreshDocs(true);
+  if (historyEnabled && r.ok) await refreshSessions();
 }
 
 // ---- 会话 ----
+function updateComposer() {
+  $("input").disabled = !!readonlyReason;
+  $("sendBtn").disabled = sending || !!readonlyReason || !historyModeReady;
+}
+
+function setReadonlyReason(reason) {
+  readonlyReason = reason || null;
+  updateComposer();
+}
+
+function warnBeforeUnload(e) {
+  e.preventDefault();
+  e.returnValue = "正在回答，离开页面会中断本轮，且该会话将无法继续";
+}
+
+function restoreLocalChat() {
+  messages = SEG.restoreMessages(JSON.parse(localStorage.getItem("deephoto_chat") || "[]"));
+  localStorage.setItem("deephoto_chat", JSON.stringify(messages.slice(-60)));
+  renderThread();
+}
+
+async function initConversationMode() {
+  try {
+    const r = await fetch("/api/qa/sessions?limit=30");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    historyEnabled = data.enabled === true;
+    if (historyEnabled) {
+      historySessions = data.items || [];
+      historyNextOffset = data.next_offset ?? null;
+      localStorage.removeItem("deephoto_chat");   // 开启后只以服务端详情为准
+    }
+  } catch (e) {
+    historyEnabled = false;
+    toast("会话列表加载失败");
+  }
+
+  if (!historyEnabled) {
+    restoreLocalChat();   // 03 关闭:保留原有单段浏览器对话
+  } else {
+    const sessionId = localStorage.getItem("deephoto_session");
+    if (sessionId && historySessions.some(s => s.session_id === sessionId)) {
+      await openSession(sessionId);
+    } else {
+      localStorage.removeItem("deephoto_session");
+      messages = [];
+      setReadonlyReason(null);
+      renderThread();
+    }
+  }
+  historyModeReady = true;
+  updateComposer();
+  renderSessions();
+}
+
+async function refreshSessions(append = false) {
+  if (!historyEnabled || sessionListLoading) return;
+  const offset = append ? historyNextOffset : 0;
+  if (append && offset === null) return;
+  sessionListLoading = true;
+  try {
+    const r = await fetch(`/api/qa/sessions?limit=30&offset=${offset}`);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    historySessions = append ? historySessions.concat(data.items || []) : (data.items || []);
+    historyNextOffset = data.next_offset ?? null;
+    renderSessions();
+  } catch (e) {
+    toast("会话列表加载失败");
+  } finally {
+    sessionListLoading = false;
+  }
+}
+
+function renderSessions() {
+  const box = $("convList");
+  if (!historyEnabled) {
+    box.innerHTML = '<div class="conv-empty">未开启会话持久化：新建会话会清空当前对话。设置 DEEPHOTO_QA_PERSISTENCE_ENABLED=true 并重启后可保存历史会话</div>';
+    return;
+  }
+  const current = localStorage.getItem("deephoto_session") || "";
+  const groups = SEG.groupSessions(historySessions, new Date());
+  const html = groups.map(group => `<div class="conv-group">${group.label}</div>` + group.items.map(s => {
+    const dot = s.status === "failed" ? "failed" :
+      (s.status === "running" || s.status === "awaiting_approval") ? "pending" : "ready";
+    const docLabel = s.document_available === false ? "文档已删除" : (s.document_name || "文档");
+    const doc = s.document_id ? `<span class="doc-fmt">${esc(docLabel)}</span>` : "";
+    return `<div class="doc-item conv-item ${current === s.session_id ? "active" : ""}"
+                 data-session-id="${esc(s.session_id)}" title="${esc(s.title)}">
+      <span class="dot ${dot}"></span>
+      <div class="conv-main"><div class="doc-name">${esc(s.title)}</div>
+        <div class="conv-meta"><span>${esc(SEG.relativeTime(s.updated_at, new Date()))}</span>${doc}</div></div>
+      <button class="doc-del conv-action conv-rename" data-conv-action="rename" title="重命名">✎</button>
+      <button class="doc-del conv-action" data-conv-action="delete" title="删除">×</button>
+    </div>`;
+  }).join("")).join("");
+  const empty = historySessions.length ? "" : '<div class="conv-empty">暂无历史会话</div>';
+  const more = historyNextOffset !== null
+    ? '<button class="conv-more" data-conv-action="more">加载更多</button>' : "";
+  box.innerHTML = empty + html + more;
+}
+
 function newChat() {
   if (sending) return;
   messages = [];
-  localStorage.removeItem("deephoto_chat");
+  if (!historyEnabled) localStorage.removeItem("deephoto_chat");
   localStorage.removeItem("deephoto_session");
+  setReadonlyReason(null);
   renderThread();
+  renderSessions();
   $("input").focus();
+}
+
+async function openSession(id) {
+  if (sending) { toast("请等待当前回答结束"); return; }
+  if (openingSession) return;
+  openingSession = true;
+  try {
+    const r = await fetch("/api/qa/sessions/" + id);
+    if (r.status === 404) {
+      historySessions = historySessions.filter(s => s.session_id !== id);
+      localStorage.removeItem("deephoto_session");
+      messages = [];
+      setReadonlyReason(null);
+      renderThread();
+      renderSessions();
+      return;
+    }
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.detail || ("HTTP " + r.status));
+    }
+    const data = await r.json();
+    messages = (data.messages || []).map(SEG.fromHistoryMessage);
+    localStorage.setItem("deephoto_session", id);
+
+    syncingScope = true;
+    try {
+      localStorage.setItem("deephoto_scope", data.session.document_id || "");
+      renderDocs();   // 只同步显示,不经过 setScope/saveScope,不触发 newChat
+    } finally {
+      syncingScope = false;
+    }
+    const listed = historySessions.findIndex(s => s.session_id === id);
+    if (listed >= 0) historySessions[listed] = data.session;
+
+    if (data.pending_approval) {
+      let pendingIndex = -1;
+      data.messages.forEach((m, i) => {
+        if (m.role === "assistant" && m.status === "awaiting_approval") pendingIndex = i;
+      });
+      if (pendingIndex >= 0)
+        attachApproval(messages[pendingIndex], { ...data.pending_approval, session_id: id });
+    }
+    setReadonlyReason(data.continuable ? null : data.readonly_reason);
+    renderThread();
+    renderSessions();
+  } catch (e) {
+    toast("会话加载失败:" + (e.message || e));
+  } finally {
+    openingSession = false;
+  }
+}
+
+async function renameConversation(id) {
+  const session = historySessions.find(s => s.session_id === id);
+  const value = prompt("重命名会话", session ? session.title : "");
+  if (value === null) return;
+  const title = value.trim();
+  if (!title) { toast("会话标题不能为空"); return; }
+  if ([...title].length > 60) { toast("会话标题不能超过 60 个字符"); return; }
+  const r = await fetch("/api/qa/sessions/" + id, {
+    method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    toast(j.detail || ("改名失败:" + r.status));
+    return;
+  }
+  await refreshSessions();
+}
+
+async function deleteConversation(id) {
+  if (!confirm("删除该会话及其历史记录?")) return;
+  const r = await fetch("/api/qa/sessions/" + id, { method: "DELETE" });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    toast(j.detail || ("删除失败:" + r.status));
+    return;
+  }
+  if ((localStorage.getItem("deephoto_session") || "") === id) newChat();
+  await refreshSessions();
 }
 
 // 审批状态不进 localStorage(06 §5.8):刷新后卡片消失,会话仍在服务端等待,
 // 下一次提问会收到 409,届时用响应里的 approvals 重新渲染卡片。
 function persistChat() {
+  if (historyEnabled) return;   // 服务端历史模式下不维护第二份浏览器正文
   const stripped = messages.slice(-60).map(m => {
     const { approvals, approvalExpires, apChoices, apSubmitting, apError, ...rest } = m;
     return rest;
@@ -489,8 +725,10 @@ function persistChat() {
 
 async function send() {
   const question = $("input").value.trim();
-  if (!question || sending) return;
-  sending = true; $("sendBtn").disabled = true;
+  if (!question || sending || readonlyReason || !historyModeReady) return;
+  sending = true;
+  updateComposer();
+  if (historyEnabled) window.addEventListener("beforeunload", warnBeforeUnload);
   const sessionId = localStorage.getItem("deephoto_session") || null;
   // 保留兼容历史,便于服务端关闭 03 后回到原模式;开启时服务端完全忽略它。
   const history = messages.slice(-50).map(m => ({ role: m.role, content: m.content }));
@@ -525,9 +763,12 @@ async function send() {
     msg.broken = true;
   }
   msg.streaming = false;
-  persistChat();
-  sending = false; $("sendBtn").disabled = false;
+  if (!historyEnabled) persistChat();
+  sending = false;
+  if (historyEnabled) window.removeEventListener("beforeunload", warnBeforeUnload);
+  updateComposer();
   renderThread();
+  if (historyEnabled) await refreshSessions();   // 成功/失败都刷新标题、排序与状态点
 }
 
 // ---- 审批卡片(06)----
@@ -641,8 +882,10 @@ async function consumeSSE(body, msg) {
 
 function renderThread() {
   const box = $("threadInner");
+  const readonly = readonlyReason ? `<div class="readonly-bar"><span>${esc(readonlyReason)}</span>
+    <button onclick="newChat()">新建会话</button></div>` : "";
   if (!messages.length) {
-    box.innerHTML = `<div class="empty"><div class="logo">📚</div>
+    box.innerHTML = readonly + `<div class="empty"><div class="logo">📚</div>
       <h2>向你的文档提问</h2>
       <p>先在左侧上传文档(PDF / Markdown / 纯文本),等待状态变为“就绪”<br>
       回答会附上出处,命中配图时在对应段落内嵌完整原图</p></div>`;
@@ -651,7 +894,7 @@ function renderThread() {
   // 仅当用户原本接近底部时才跟随滚动,图片加载/重渲染不把阅读上文的人拉走
   const thread = $("thread");
   const nearBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
-  box.innerHTML = messages.map((m, midx) => {
+  box.innerHTML = readonly + messages.map((m, midx) => {
     if (m.role === "user")
       return `<div class="msg user"><div class="avatar">我</div>
         <div class="body"><div class="text">${esc(m.content)}</div></div></div>`;
@@ -738,6 +981,7 @@ function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;
 fetch("/api/documents/upload-config").then(r => r.ok ? r.json() : null)
   .then(cfg => { if (cfg && cfg.accept && cfg.accept.length) $("file").accept = cfg.accept.join(","); })
   .catch(() => {});
+initConversationMode();
 docPoller.start();
 </script>
 </body>

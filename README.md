@@ -80,6 +80,21 @@ pip freeze > requirements.lock.txt
 - `POST /api/qa` `{question, document_id?}` → `{answer, citations[], images[]}`
 - `GET /api/documents/{id}/images/{occ_id}`、`GET .../pages/{n}`:图片与页预览(问答响应中已生成 URL,本地部署无鉴权)
 
+## 历史会话(依赖 03 持久化)
+
+历史会话默认关闭。设置 `DEEPHOTO_QA_PERSISTENCE_ENABLED=true` 并完整重启服务后,
+侧栏会列出已有会话,支持按时间分组查看、加载更多、重命名和删除;打开健康的会话后,
+可沿用原 `thread_id` 继续提问。刷新页面或重启服务不会清除这些记录。
+
+历史数据直接来自 03 已有的 LangGraph checkpoint(`qa-checkpoints.db`)和会话 Store
+(`qa-store.db`),不新建对话日志表,也不从浏览器导入第二份历史。回退时把开关改回
+`false` 并重启即可,无需迁移或清理数据。**开启之前只存在于浏览器 `localStorage` 的
+对话不会迁移到服务端**,并会在第一次「新会话」时按原有单段对话行为清空。
+
+历史详情还原用户问题、最终回答、经过当前权限与文档状态校验的出处,以及正文中显式
+引用的图片;不还原思考过程、warning 和未写入正文的自动补图。上一轮未完成的会话、
+问答配置已变化的会话,以及关联文档已删除或不可用的会话只能查看,不能继续提问。
+
 ### MinerU 云端解析的 PDF 自动分页
 
 MinerU 是唯一的 PDF 解析器(代码中写死,租户不可选择)。Token 由服务端环境变量

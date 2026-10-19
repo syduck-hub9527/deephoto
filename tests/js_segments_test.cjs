@@ -386,6 +386,50 @@ const done = (content, images) => ({ role: "assistant", content, images, citatio
 }
 
 
+// ---- H:历史会话消息映射、日历分组与相对时间 ----
+{
+  const user = SEG.fromHistoryMessage({ role: "user", content: "问题", message_id: "u1" });
+  check("H1: user 历史消息只保留角色与正文", JSON.stringify(user) === JSON.stringify({ role: "user", content: "问题" }));
+  const complete = SEG.fromHistoryMessage({ role: "assistant", answer: "回答", status: "complete",
+    message_id: "server-ai", citations: [{ chunk_id: "c1" }], images: [E1] });
+  check("H2: complete 恢复已校验正文、出处、图片和消息 ID",
+    complete.content === "回答" && complete.validated && !complete.streaming && !complete.broken
+    && complete.message_id === "server-ai" && complete.citations.length === 1 && complete.images.length === 1
+    && complete.thinking === "" && complete.warning === undefined);
+  const interrupted = SEG.fromHistoryMessage({ role: "assistant", answer: "", status: "interrupted" });
+  check("H3: interrupted 映射为 broken 和本轮未完成", interrupted.broken && !interrupted.validated
+    && interrupted.warning === "本轮未完成" && !!interrupted.message_id);
+  const running = SEG.fromHistoryMessage({ role: "assistant", answer: "", status: "running" });
+  check("H4: running 提示其他窗口生成中但不标 broken", !running.broken && !running.validated
+    && running.warning === "回答生成中(其他窗口)");
+  const awaiting = SEG.fromHistoryMessage({ role: "assistant", answer: "", status: "awaiting_approval" });
+  check("H5: awaiting 保持非流式、未校验且不误报中断", !awaiting.streaming && !awaiting.validated
+    && !awaiting.broken && awaiting.warning === undefined);
+
+  const groupNow = new Date(2026, 0, 2, 12, 0, 0);
+  const grouped = SEG.groupSessions([
+    { id: "today", updated_at: "2026-01-02T00:00:00" },
+    { id: "yesterday", updated_at: "2026-01-01T23:59:59" },
+    { id: "seven", updated_at: "2025-12-26T12:00:00" },
+    { id: "older", updated_at: "2025-12-25T12:00:00" },
+  ], groupNow);
+  check("H6: 今天 00:00 / 昨天 23:59 / 恰好 7 天 / 更早分组",
+    grouped.map(g => g.label).join(",") === "今天,昨天,近 7 天,更早"
+    && grouped.every((g, i) => g.items[0].id === ["today", "yesterday", "seven", "older"][i]));
+  const crossYear = SEG.groupSessions([{ id: "ny", updated_at: "2025-12-31T23:59:59" }],
+    new Date(2026, 0, 1, 0, 0, 0));
+  check("H7: 跨年昨天且空组不输出", crossYear.length === 1 && crossYear[0].label === "昨天");
+
+  const relativeNow = new Date(2026, 4, 15, 12, 0, 0);
+  check("H8: relativeTime 刚刚与各分钟档", SEG.relativeTime(new Date(2026, 4, 15, 11, 59, 30), relativeNow) === "刚刚"
+    && SEG.relativeTime(new Date(2026, 4, 15, 11, 59, 0), relativeNow) === "1 分钟前"
+    && SEG.relativeTime(new Date(2026, 4, 15, 11, 55, 0), relativeNow) === "5 分钟前");
+  check("H9: relativeTime 小时、昨天与 MM/DD", SEG.relativeTime(new Date(2026, 4, 15, 11, 0, 0), relativeNow) === "1 小时前"
+    && SEG.relativeTime(new Date(2026, 4, 15, 9, 0, 0), relativeNow) === "3 小时前"
+    && SEG.relativeTime(new Date(2026, 4, 14, 11, 0, 0), relativeNow) === "昨天"
+    && SEG.relativeTime(new Date(2026, 4, 2, 12, 0, 0), relativeNow) === "05/02");
+}
+
 // ---- U:解析阶段计数单位(docx/md 的"页"是虚拟分段)----
 {
   check("U1: locatorUnit 按位置类型给单位", SEG.locatorUnit("section") === "段" && SEG.locatorUnit("slide") === "张幻灯片"

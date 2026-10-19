@@ -327,6 +327,21 @@ class HitlParkResumeTest(_ServiceCase):
         self.assertEqual(self._metadata(qa, sid), before)         # 状态不变
         self.assertEqual(model.calls_made, 1)                     # 图未被触碰
 
+    def test_session_history_restores_pending_approval_for_resume(self):
+        qa = self._qa()
+        sid, _parked, model = self._park_first_turn(qa)
+        calls_before = model.calls_made
+        history = qa.session_history(self.conn, self.ctx, sid)
+        self.assertEqual(model.calls_made, calls_before)
+        self.assertEqual(history["messages"][0]["content"], "q1")
+        self.assertEqual(history["messages"][1]["status"], "awaiting_approval")
+        self.assertEqual(history["messages"][1]["answer"], "")
+        self.assertEqual(history["pending_approval"]["approvals"][0]["approval_id"], "ap_1")
+        self.assertNotIn("code", history["pending_approval"])
+        self.assertTrue(history["continuable"])
+        events = list(qa.resolve_approvals(self.ctx, sid, [{"approval_id": "ap_1", "type": "approve"}]))
+        self.assertEqual(events[-1]["type"], "done")
+
     def test_invalid_decisions_never_touch_the_graph(self):
         """F7:错误决定会毁掉挂起的线程——所有校验必须在图外完成,失败后线程仍可恢复。"""
         qa = self._qa()

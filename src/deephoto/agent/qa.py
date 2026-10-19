@@ -20,6 +20,7 @@ from sqlite3 import Connection
 from threading import Lock
 from typing import Iterator
 
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
 from .. import repo
@@ -33,7 +34,7 @@ from .hitl import (ApprovalError, approval_items, build_resume_value, validate_d
 from .knowledge import KnowledgeService
 from .locator import locator_label
 from .persistence import (DocumentScopeError, SessionBusyError, SessionError, deadline,
-                          parked_expired)
+                          make_title, parked_expired)
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,8 @@ class QAService:
             return self._answer_impl(conn, ctx, question, document_id, history)
         self._expire_if_needed(ctx, session_id)
         with self._sessions().turn(ctx, session_id, document_id, self._session_profile(),
-                                   preflight=lambda: self._validate_scope(conn, ctx, document_id)) as turn:
+                                   preflight=lambda: self._validate_scope(conn, ctx, document_id),
+                                   title=make_title(question)) as turn:
             # 会话历史以 checkpoint 为准;浏览器历史不导入新会话,也不重复追加。
             result = self._answer_impl(conn, ctx, question, document_id, None, turn)
             turn.complete(result)
@@ -153,8 +155,10 @@ class QAService:
                 yield from self._stream_impl(ctx, question, document_id, history)
             else:
                 self._expire_if_needed(ctx, session_id)
-                with self._sessions().turn(ctx, session_id, document_id, self._session_profile(),
-                                           preflight=lambda: self._validate_scope(connect(self.settings.db_path), ctx, document_id)) as turn:
+                with self._sessions().turn(
+                        ctx, session_id, document_id, self._session_profile(),
+                        preflight=lambda: self._validate_scope(connect(self.settings.db_path), ctx, document_id),
+                        title=make_title(question)) as turn:
                     yield {"type": "session", "session_id": turn.session_id}
                     yield from self._drive_stream(
                         turn, self._stream_impl(ctx, question, document_id, None, turn))
@@ -491,21 +495,138 @@ class QAService:
             kwargs["durability"] = "sync"
         return kwargs
 
-    def _session_cited_ids(self, conn: Connection, ctx: AuthContext, turn) -> tuple[set[str], set[str]]:
+    def _verified_ids(self, conn: Connection, ctx: AuthContext, metadata: dict) -> tuple[set[str], set[str]]:
         # Store 只保存此前响应中后端认可过的引用;再次检查当前 ready/归属/文档范围。
-        allowed_docs = set(self.knowledge.allowed_document_ids(conn, ctx, turn.metadata["document_id"]))
-        chunk_ids = turn.metadata.get("chunk_ids", [])
+        allowed_docs = set(self.knowledge.allowed_document_ids(conn, ctx, metadata["document_id"]))
+        chunk_ids = metadata.get("chunk_ids", [])
         chunks = set()
         # 避免长会话积累的引用超过旧版 SQLite 的绑定参数上限。
         for start in range(0, len(chunk_ids), 500):
             chunks.update(c["id"] for c in repo.get_chunks(conn, chunk_ids[start:start + 500])
                           if c["tenant_id"] == ctx.tenant_id and c["document_id"] in allowed_docs)
         images = set()
-        for occ_id in turn.metadata.get("image_ids", []):
+        for occ_id in metadata.get("image_ids", []):
             occ = repo.get_occurrence(conn, occ_id)
             if occ and occ["tenant_id"] == ctx.tenant_id and occ["document_id"] in allowed_docs:
                 images.add(occ_id)
         return chunks, images
+
+    def _session_cited_ids(self, conn: Connection, ctx: AuthContext, turn) -> tuple[set[str], set[str]]:
+        return self._verified_ids(conn, ctx, turn.metadata)
+
+    def persistence_enabled(self) -> bool:
+        return self._persistence_enabled()
+
+    def _session_entries(self, conn: Connection, ctx: AuthContext, rows) -> list[dict]:
+        document_ids = {meta.get("document_id") for _, meta in rows if meta.get("document_id")}
+        briefs = repo.documents_brief(conn, document_ids)
+        entries = []
+        for session_id, meta in rows:
+            document_id = meta.get("document_id")
+            brief = briefs.get(document_id) if document_id else None
+            entries.append({
+                "session_id": session_id,
+                "title": meta.get("title") or "历史会话",
+                "document_id": document_id,
+                "document_name": (brief or {}).get("filename"),
+                "document_available": document_id is None or bool(
+                    self.knowledge.allowed_document_ids(conn, ctx, document_id)),
+                "status": meta.get("status"),
+                "created_at": meta.get("created_at"),
+                "updated_at": meta.get("updated_at"),
+            })
+        return entries
+
+    def list_sessions(self, conn: Connection, ctx: AuthContext, *, limit: int, offset: int) -> list[dict]:
+        if not self._persistence_enabled():
+            raise RuntimeError("问答持久化未启用")
+        rows = self._sessions().list_sessions(ctx, limit=limit, offset=offset)
+        return self._session_entries(conn, ctx, rows)
+
+    def session_history(self, conn: Connection, ctx: AuthContext, session_id: str) -> dict:
+        """只读原生 checkpoint 的逐轮问答;不进租约、不改状态、不调用模型。"""
+        if not self._persistence_enabled():
+            raise RuntimeError("问答持久化未启用")
+        runtime = self._sessions()
+        meta = runtime.inspect(ctx, session_id)
+        if meta is None:
+            raise SessionError("会话不存在或无权访问")
+
+        tools, tracker = self._make_tools(ctx)
+        kwargs = self._agent_kwargs(ctx, tracker)
+        kwargs.update(checkpointer=runtime.saver, store=runtime.store)
+        agent = self._build_agent(tools, **kwargs)
+        state = agent.get_state(runtime.thread_config(ctx, session_id))
+        stored_messages = state.values.get("messages", [])
+
+        rounds = []
+        for message in stored_messages:
+            if isinstance(message, HumanMessage):
+                rounds.append((message, []))
+            elif rounds:
+                rounds[-1][1].append(message)
+
+        verified_ids = self._verified_ids(conn, ctx, meta)
+        history_messages = []
+        for index, (human, tail) in enumerate(rounds):
+            history_messages.append({
+                "role": "user", "message_id": human.id,
+                "content": _strip_scope_prefix(_extract_text(human.content)),
+            })
+            final = tail[-1] if tail else None
+            text = _extract_text(final.content) if isinstance(final, AIMessage) else ""
+            if isinstance(final, AIMessage) and not final.tool_calls and text.strip():
+                assembled = self._assemble(
+                    conn, ctx, text, "", {"chunks": set(), "images": set()}, *verified_ids)
+                history_messages.append({
+                    "role": "assistant", "message_id": final.id, "status": "complete",
+                    "answer": assembled["answer"], "citations": assembled["citations"],
+                    "images": assembled["images"],
+                })
+                continue
+            is_last = index == len(rounds) - 1
+            if is_last and meta.get("status") == "awaiting_approval":
+                status = "awaiting_approval"
+            elif is_last and meta.get("status") == "running":
+                status = "running"
+            else:
+                status = "interrupted"
+            history_messages.append({
+                "role": "assistant", "message_id": None, "status": status,
+                "answer": "", "citations": [], "images": [],
+            })
+
+        session = self._session_entries(conn, ctx, [(session_id, meta)])[0]
+        if not meta.get("title"):
+            first_user = next((m for m in history_messages if m["role"] == "user"), None)
+            if first_user is not None:
+                session["title"] = make_title(first_user["content"])
+
+        status = meta.get("status")
+        readonly_reason = None
+        if status == "running":
+            readonly_reason = "该会话正在回答"
+        elif status not in {"ready", "awaiting_approval"}:
+            readonly_reason = "上一轮未完成，该会话只能查看"
+        elif meta.get("profile") != self._session_profile():
+            readonly_reason = "问答配置已变更，该会话只能查看"
+        elif meta.get("document_id") and not self.knowledge.allowed_document_ids(
+                conn, ctx, meta["document_id"]):
+            readonly_reason = "关联文档已删除或不可用，该会话只能查看"
+
+        pending_approval = self.approval_pending(ctx, session_id)
+        if pending_approval is not None:
+            pending_approval = {k: v for k, v in pending_approval.items() if k != "code"}
+        return {
+            "session": session, "messages": history_messages,
+            "continuable": readonly_reason is None, "readonly_reason": readonly_reason,
+            "pending_approval": pending_approval,
+        }
+
+    def rename_session(self, ctx: AuthContext, session_id: str, title: str) -> dict:
+        if not self._persistence_enabled():
+            raise RuntimeError("问答持久化未启用")
+        return self._sessions().rename(ctx, session_id, title)
 
     def delete_session(self, ctx: AuthContext, session_id: str) -> None:
         if not self._persistence_enabled():
@@ -699,6 +820,13 @@ class QAService:
         # 否则同一张图的两个合法锚点会丢掉第二个的元数据(内嵌位置即失去可信条目)
         images = self.knowledge.build_image_entries(conn, ctx, cited_images, dedupe_assets=fallback)
         return {"answer": answer_text, "citations": citations, "images": images}
+
+
+_SCOPE_PREFIX_RE = re.compile(r"\A\(目标文档 ID:[^)\n]*\)\n")
+
+
+def _strip_scope_prefix(text: str) -> str:
+    return _SCOPE_PREFIX_RE.sub("", text, count=1)
 
 
 def _build_messages(question: str, document_id: str | None, history: list[dict] | None) -> list[dict]:

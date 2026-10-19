@@ -11,14 +11,14 @@ from __future__ import annotations
 import json
 
 from anyio import CancelScope
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..security import AuthContext
 from ..agent.hitl import ApprovalError
-from ..agent.persistence import SessionError
+from ..agent.persistence import SessionBusyError, SessionError
 from ..agent.context import Preferences
 from .deps import CtxDep, conn_for
 
@@ -60,6 +60,15 @@ class ApprovalDecisionIn(BaseModel):
 class ApprovalsRequest(BaseModel):
     session_id: str = Field(pattern=r"^sess_[0-9a-f]{32}$")
     decisions: list[ApprovalDecisionIn] = Field(min_length=1, max_length=32)
+
+
+class SessionRenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=60)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def strip_title(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 
 def _approval_pending_response(request: Request, ctx: AuthContext, session_id: str | None):
@@ -122,6 +131,47 @@ def resolve_approvals(request: Request, body: ApprovalsRequest, ctx: AuthContext
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return _sse_response(events)
+
+
+@router.get("/qa/sessions")
+def list_sessions(request: Request, limit: int = Query(30, ge=1, le=100),
+                  offset: int = Query(0, ge=0), ctx: AuthContext = CtxDep):
+    qa_service = request.app.state.qa_service
+    if not qa_service.persistence_enabled():
+        return {"enabled": False, "items": [], "next_offset": None}
+    try:
+        items = qa_service.list_sessions(conn_for(request), ctx, limit=limit, offset=offset)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"enabled": True, "items": items,
+            "next_offset": offset + limit if len(items) == limit else None}
+
+
+@router.get("/qa/sessions/{session_id}")
+def get_session_history(request: Request,
+                        session_id: str = Path(pattern=r"^sess_[0-9a-f]{32}$"),
+                        ctx: AuthContext = CtxDep):
+    try:
+        return request.app.state.qa_service.session_history(conn_for(request), ctx, session_id)
+    except SessionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.patch("/qa/sessions/{session_id}")
+def rename_session(request: Request, body: SessionRenameRequest,
+                   session_id: str = Path(pattern=r"^sess_[0-9a-f]{32}$"),
+                   ctx: AuthContext = CtxDep):
+    try:
+        metadata = request.app.state.qa_service.rename_session(ctx, session_id, body.title)
+    except SessionBusyError as exc:
+        raise HTTPException(status_code=409, detail="该会话正在回答，请稍后再改名")
+    except SessionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"session_id": session_id, "title": metadata["title"]}
 
 
 @router.delete("/qa/sessions/{session_id}")

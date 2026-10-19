@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import base64
+import time
 import unittest
 import unittest.mock
 
@@ -39,8 +40,9 @@ from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.protocol import BackendProtocol, ReadResult
 from deepagents.backends.state import StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain.agents.middleware import AgentMiddleware, InterruptOnConfig
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
@@ -301,6 +303,42 @@ class PersistenceContract(unittest.TestCase):
         contents = [str(m.content) for m in second_request]
         self.assertNotIn("第一轮问题", contents)
         self.assertNotIn("第一轮回答", contents)
+
+    def test_summarization_changes_model_view_without_mutating_raw_messages(self):
+        """摘要事件改写作模型输入,但 get_state 的原始消息仍包含第一轮。"""
+        model = ScriptedFakeChatModel(script=["第一轮回答", "第二轮回答", "历史摘要", "第三轮回答"])
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            agent = create_deep_agent(
+                model=model, checkpointer=saver,
+                middleware=[SummarizationMiddleware(
+                    model=model, backend=StateBackend(),
+                    trigger=("messages", 4), keep=("messages", 2))],
+            )
+            config = {"configurable": {"thread_id": "summary-raw-messages"}}
+            for question in ("第一轮问题", "第二轮问题", "第三轮问题"):
+                self._invoke(agent, config["configurable"]["thread_id"], question)
+            state = agent.get_state(config)
+        self.assertIsNotNone(state.values.get("_summarization_event"))
+        self.assertEqual(model.calls_made, 4)  # 同名 middleware 替换默认实现,只生成一次摘要
+        messages = state.values["messages"]
+        self.assertIsInstance(messages[0], HumanMessage)
+        self.assertEqual(messages[0].content, "第一轮问题")
+        self.assertNotIn("第一轮问题", [str(m.content) for m in model.requests[-1]])
+
+    def test_store_search_is_reverse_chronological_and_offset_does_not_repeat(self):
+        """不带 query 的 Store.search 按 item.updated_at 倒序并支持稳定翻页。"""
+        with SqliteStore.from_conn_string(":memory:") as store:
+            store.setup()
+            namespace = ("contract", "sessions")
+            store.put(namespace, "first", {"value": 1})
+            # SQLite CURRENT_TIMESTAMP 只有秒精度,确保两次 put 不落在同一秒。
+            time.sleep(1.01)
+            store.put(namespace, "second", {"value": 2})
+            page1 = store.search(namespace, limit=1, offset=0)
+            page2 = store.search(namespace, limit=1, offset=1)
+        self.assertEqual([item.key for item in page1], ["second"])
+        self.assertEqual([item.key for item in page2], ["first"])
+        self.assertNotEqual(page1[0].key, page2[0].key)
 
     def test_store_backend_memory_injected_into_system_prompt(self):
         """StoreBackend + SqliteStore:memory 文件内容注入系统提示。"""
