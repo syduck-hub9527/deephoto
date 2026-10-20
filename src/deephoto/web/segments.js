@@ -33,7 +33,7 @@
   }
 
   function createAssistantMessage() {
-    return { role: "assistant", content: "", thinking: "", citations: [], images: [],
+    return { role: "assistant", content: "", thinking: "", citations: [], images: [], segments: [], steps: [],
              streaming: true, validated: false, message_id: newMessageId() };
   }
 
@@ -58,10 +58,27 @@
   // ---- 流式事件应用(F3:错误/警告独立字段,绝不拼进原始正文)----
 
   function applyStreamEvent(msg, ev) {
-    if (ev.type === "token") msg.content += ev.text;
-    else if (ev.type === "thinking") msg.thinking += ev.text;
+    if (ev.type === "token" && ev.mid != null) {
+      msg.segments = msg.segments || [];
+      let segment = msg.segments.find(s => s.mid === ev.mid);
+      if (!segment) {
+        segment = { mid: ev.mid, text: "", step: false };
+        msg.segments.push(segment);
+      }
+      segment.text += ev.text;
+      msg.content = msg.segments.filter(s => !s.step).map(s => s.text).join("");
+    } else if (ev.type === "token") msg.content += ev.text;  // 兼容没有 mid 的旧服务端
+    else if (ev.type === "step") {
+      msg.segments = msg.segments || [];
+      const segment = msg.segments.find(s => s.mid === ev.mid);
+      if (segment) segment.step = true;
+      else msg.segments.push({ mid: ev.mid, text: ev.text, step: true });
+      msg.steps = msg.steps || [];
+      msg.steps.push(ev.text);
+      msg.content = msg.segments.filter(s => !s.step).map(s => s.text).join("");
+    } else if (ev.type === "thinking") msg.thinking += ev.text;
     else if (ev.type === "done") {
-      msg.content = ev.answer || msg.content;
+      msg.content = ev.answer ?? msg.content;
       msg.citations = ev.citations || [];
       msg.images = ev.images || [];
       msg.validated = true;

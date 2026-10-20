@@ -215,26 +215,44 @@ class QAService:
         审批恢复路径拿不到原问题(question=""):此时不做"用户要求看图"的补图兜底,
         被驳回的图片不会因 fallback 又被附带进来。
         """
-        answer_parts: list[str] = []
+        segments: dict[str, dict] = {}
+        order: list[str] = []
+        final_state: dict | None = None
         stream_broken: str | None = None
         seen_chunks = 0
         try:
-            for chunk, _metadata in agent.stream(graph_input, stream_mode="messages", **self._invoke_kwargs(turn)):
+            for mode, data in agent.stream(graph_input, stream_mode=["messages", "values"],
+                                           **self._invoke_kwargs(turn)):
+                if mode == "values":
+                    final_state = data
+                    continue
+                if mode != "messages":
+                    continue
+                chunk, _metadata = data
                 seen_chunks += 1
                 # 只流式 AI 增量:ToolMessage(Chunk) 的 content 是工具返回的 JSON/图片块,必须排除。
                 # 注意 langchain-core 中 AIMessageChunk.type == "AIMessageChunk"(非 "ai")
                 if getattr(chunk, "type", None) not in ("ai", "AIMessageChunk"):
                     continue
-                # 工具调用轮次的 AI 消息没有正文,跳过
-                if getattr(chunk, "tool_call_chunks", None):
-                    continue
+                mid = chunk.id or "_"
+                if mid not in segments:
+                    segments[mid] = {"text": "", "tool": False}
+                    order.append(mid)
+                segment = segments[mid]
                 reasoning = _extract_reasoning(getattr(chunk, "additional_kwargs", None) or {})
                 if reasoning:
                     yield {"type": "thinking", "text": reasoning}
+                # 同一次调用可能先流文字、再声明工具调用；此时将已流文字移出正文。
+                if getattr(chunk, "tool_call_chunks", None):
+                    if not segment["tool"]:
+                        segment["tool"] = True
+                        if segment["text"]:
+                            yield {"type": "step", "mid": mid, "text": segment["text"]}
+                    continue
                 text = _extract_text(chunk.content)
                 if text:
-                    answer_parts.append(text)
-                    yield {"type": "token", "text": text}
+                    segment["text"] += text
+                    yield {"type": "token", "text": text, "mid": mid}
         except Exception as exc:
             # 流中断:保留已流出的部分答案,继续走校验组装,让前端拿到完整 done 事件
             logger.exception("model stream interrupted")
@@ -249,7 +267,17 @@ class QAService:
                        "approvals": approvals, "expires_at": expires_at}
                 return                      # 挂起事件之后不发送 done(5.6)
 
-        answer_text = "".join(answer_parts)
+        if stream_broken is None and final_state is not None:
+            messages = final_state.get("messages", [])
+            last_ai = next((m for m in reversed(messages) if getattr(m, "type", None) == "ai"), None)
+            # 正常结束以图的最终状态为准，与非流式及 checkpoint 历史保持一致。
+            answer_text = (_final_answer_text(messages) if last_ai is not None and
+                           not getattr(last_ai, "tool_calls", None) and
+                           not getattr(last_ai, "invalid_tool_calls", None) else "")
+        else:
+            # 中断时只有最后一个非工具调用的部分文字可作为回退，不能拼回过程说明。
+            answer_text = next((segments[mid]["text"] for mid in reversed(order)
+                                if not segments[mid]["tool"]), "")
         if not answer_text.strip():
             detail = f"模型未产生回答(收到 {seen_chunks} 个流块,无正文 token)"
             if stream_broken:
@@ -259,7 +287,6 @@ class QAService:
         if stream_broken:
             yield {"type": "warning", "detail": f"回答可能不完整(流中断:{stream_broken})"}
 
-        answer_text = "".join(answer_parts)
         conn = connect(self.settings.db_path)
         extra_chunks, extra_images = (self._session_cited_ids(conn, ctx, turn)
                                       if turn is not None else _history_cited_ids(history))

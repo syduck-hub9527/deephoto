@@ -137,6 +137,7 @@ class _FakeMessage:
 
 class _FakeChunk:
     type = "AIMessageChunk"
+    id = "fake-inline-image-call"
     tool_call_chunks = None
     additional_kwargs = {}
 
@@ -156,7 +157,10 @@ class _FakeAgent:
     def stream(self, _state, stream_mode=None):
         mid = len(self.answer_text) // 2
         for piece in (self.answer_text[:mid], self.answer_text[mid:]):
-            yield _FakeChunk(piece), {}
+            data = _FakeChunk(piece), {}
+            yield ("messages", data) if isinstance(stream_mode, list) else data
+        if isinstance(stream_mode, list) and "values" in stream_mode:
+            yield "values", self.invoke(_state)
 
 
 if __name__ == "__main__":

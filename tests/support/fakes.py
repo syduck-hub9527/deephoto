@@ -3,6 +3,7 @@
 ScriptedFakeChatModel 按脚本逐项出招:
 - "任意文本" 或 {"text": "..."}        -> 产生最终回答(流式时切成多块);
 - {"tool": "<name>", "args": {...}}   -> 产生一轮工具调用;
+- {"text": "过程说明", "tool": ...}  -> 同一调用先流出文字、再流出工具调用;
 - {"tools": [{"name": ..., "args": ...}, ...]} -> 同一条 AI 消息里并发多个工具调用(06 HITL 批次/并行中断用)。
 
 脚本耗尽后的行为由 repeat_last 决定:False 返回兜底文本让图收敛(默认);
@@ -119,7 +120,7 @@ class ScriptedFakeChatModel(BaseChatModel):
                 for item in tool_items:
                     self._call_seq += 1
                     calls.append({"name": item["name"], "args": item["args"], "id": f"call_{self._call_seq}"})
-                return AIMessage(content="", tool_calls=calls)
+                return AIMessage(content=str(step.get("text", "")), tool_calls=calls)
             return AIMessage(content=str(step["text"]))
 
     def _generate(
@@ -141,6 +142,11 @@ class ScriptedFakeChatModel(BaseChatModel):
     ) -> Iterator[ChatGenerationChunk]:
         self._requests.append(list(messages))
         msg = self._next_message()
+        text = str(msg.content)
+        # 旧的纯工具脚本仍不产生文字块；混合脚本模拟真实接口先文字后工具的顺序。
+        if text or not msg.tool_calls:
+            for i in range(0, max(len(text), 1), STREAM_CHUNK_SIZE):
+                yield ChatGenerationChunk(message=AIMessageChunk(content=text[i:i + STREAM_CHUNK_SIZE]))
         if msg.tool_calls:
             # 工具调用轮:每个调用一个 tool_call_chunks 块流出(args 为 JSON 字符串)
             for index, call in enumerate(msg.tool_calls):
@@ -154,7 +160,3 @@ class ScriptedFakeChatModel(BaseChatModel):
                     }],
                 )
                 yield ChatGenerationChunk(message=chunk)
-            return
-        text = str(msg.content)
-        for i in range(0, max(len(text), 1), STREAM_CHUNK_SIZE):
-            yield ChatGenerationChunk(message=AIMessageChunk(content=text[i:i + STREAM_CHUNK_SIZE]))

@@ -62,6 +62,7 @@ export function AssistantMessage({ message: m }) {
   const trace = m.tool_trace;
   return html`<article class="message assistant"><div class="assistant-avatar" aria-hidden="true">✳</div><div class="assistant-body">
     ${m.thinking && html`<details class="thinking" open=${m.streaming}><summary>思考过程</summary><pre>${m.thinking}</pre></details>`}
+    ${m.steps?.length > 0 && html`<details class="thinking execution-steps" open=${m.streaming}><summary>执行过程</summary>${m.steps.map((step, index) => html`<pre key=${index}>${step}</pre>`)}</details>`}
     <div ref=${root} onClick=${click} dangerouslySetInnerHTML=${{ __html: body }}></div>
     ${m.streaming && html`<span class="streaming" role="status">${m.content ? '●' : '正在思考…'}</span>`}
     ${m.warning && html`<p class="warning">⚠ ${m.warning}</p>`}${m.error && html`<p class="error">⚠ ${m.error}</p>`}

@@ -720,5 +720,55 @@ class HitlDeepContract(unittest.TestCase):
         self.assertTrue(seen_threads)
 
 
+class StreamFinalAnswerContract(unittest.TestCase):
+    """流式修复依赖的原生 messages / values 行为，升级框架时必须保持。"""
+
+    def test_message_id_stable_within_call_and_distinct_across_calls(self):
+        probe, calls = _make_probe_tool()
+        preamble = "先检索文档，再核对原理与仪器。"
+        model = ScriptedFakeChatModel(script=[
+            {"text": preamble, "tool": "probe_tool", "args": {"text": "q"}}, "最终回答"])
+        agent = create_deep_agent(model=model, tools=[probe])
+        chunks = [chunk for chunk, metadata in agent.stream(
+            {"messages": [HumanMessage(content="q")]}, stream_mode="messages")
+            if isinstance(chunk, AIMessageChunk)]
+        ids = list(dict.fromkeys(c.id for c in chunks))
+        self.assertEqual(len(ids), 2)
+        self.assertTrue(all(ids))
+        first = [c for c in chunks if c.id == ids[0]]
+        self.assertEqual("".join(c.content for c in first), preamble)
+        tool_index = next(i for i, c in enumerate(first) if c.tool_call_chunks)
+        self.assertTrue(all(c.id == first[0].id for c in first))
+        self.assertTrue(any(c.content for c in first[:tool_index]))
+        self.assertEqual("".join(c.content for c in chunks if c.id == ids[1]), "最终回答")
+        self.assertEqual(calls, ["q"])
+
+    def test_multi_mode_last_values_is_final_answer_with_and_without_compaction(self):
+        from deephoto.agent.history import CompletedRoundMiddleware
+
+        for persistence in (False, True):
+            with self.subTest(persistence=persistence), SqliteSaver.from_conn_string(":memory:") as saver:
+                probe, calls = _make_probe_tool()
+                model = ScriptedFakeChatModel(script=[
+                    {"text": "先检索。", "tool": "probe_tool", "args": {"text": "q"}}, "最终回答"])
+                agent = create_deep_agent(model=model, tools=[probe],
+                    checkpointer=saver if persistence else None,
+                    middleware=[CompletedRoundMiddleware()] if persistence else [])
+                kwargs = {"config": {"configurable": {"thread_id": "final-values"}}, "durability": "sync"} if persistence else {}
+                events = list(agent.stream({"messages": [HumanMessage(content="q")]},
+                                          stream_mode=["messages", "values"], **kwargs))
+                snapshots = [data for mode, data in events if mode == "values"]
+                self.assertTrue(snapshots)
+                self.assertIn("messages", {mode for mode, data in events})
+                messages = snapshots[-1]["messages"]
+                self.assertIsInstance(messages[-1], AIMessage)
+                self.assertEqual(messages[-1].content, "最终回答")
+                self.assertFalse(messages[-1].tool_calls)
+                self.assertEqual(calls, ["q"])
+                if persistence:
+                    self.assertEqual(len(messages), 2)
+                    self.assertEqual(agent.get_state(kwargs["config"]).values["messages"][-1].content, "最终回答")
+
+
 if __name__ == "__main__":
     unittest.main()

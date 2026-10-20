@@ -1,6 +1,6 @@
 """Disposable browser fixture. No .env, production data or external models.
 
-Run: .venv/Scripts/python.exe scripts/frontend_fake_server.py [--seed-history]
+Run: .venv/Scripts/python.exe scripts/frontend_fake_server.py [--seed-history] [--slow-stream]
 Questions containing 审批 trigger real inspect_image HITL; 失败 triggers a graph
 failure. All other questions read the seeded chunk and answer with a citation.
 """
@@ -58,7 +58,7 @@ def main():
         app.state.index_service.upsert_document(conn, doc)
         conn.commit()
 
-        model_delay = .25
+        model_delay = 2 if '--slow-stream' in sys.argv else .25
 
         class BrowserFake(ScriptedFakeChatModel):
             def _next_message(self):
@@ -69,9 +69,9 @@ def main():
                 last_human = max(i for i, m in enumerate(messages) if isinstance(m, HumanMessage))
                 tools = [m for m in messages[last_human + 1:] if isinstance(m, ToolMessage)]
                 if not tools:
-                    step = {'tool': 'read_chunk', 'args': {'chunk_id': chunk}}
+                    step = {'text': '先检索文档并核对器件结构。', 'tool': 'read_chunk', 'args': {'chunk_id': chunk}}
                 elif '审批' in question and not any(m.name == 'inspect_image' for m in tools):
-                    step = {'tool': 'inspect_image', 'args': {'image_occurrence_id': occurrence}}
+                    step = {'text': '接下来查看器件原图。', 'tool': 'inspect_image', 'args': {'image_occurrence_id': occurrence}}
                 else:
                     previous = [str(m.content) for m in messages[:last_human] if isinstance(m, HumanMessage)]
                     step = {'text': f'器件由电极和功能层构成。[chunk:{chunk}]\n\n' +
@@ -89,7 +89,7 @@ def main():
                 app.state.qa_service.answer(conn, LOCAL_CTX, f'分页测试会话 {number + 1}')
             outside = app.state.qa_service.list_sessions(conn, LOCAL_CTX, limit=30, offset=30)[0]['session_id']
             print(f'Session outside first page: http://127.0.0.1:8765/#/s/{outside}', flush=True)
-            model_delay = .25
+            model_delay = 2 if '--slow-stream' in sys.argv else .25
         print(f'Disposable fixture ready: http://127.0.0.1:8765 doc={doc}', flush=True)
         try:
             uvicorn.run(app, host='127.0.0.1', port=8765, log_level='warning')

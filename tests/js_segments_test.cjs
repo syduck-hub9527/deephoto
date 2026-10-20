@@ -31,6 +31,40 @@ check("空消息无需复查", SEG.needsSessionRecheck(null) === false);
 
 // ---- 既有行为 ----
 
+// 模型调用前的过程说明：按 mid 移段，不能留在最终正文或加载其中的图片。
+{
+  const message = SEG.createAssistantMessage();
+  SEG.applyStreamEvent(message, { type: "token", mid: "call-1", text: "先检索" });
+  SEG.applyStreamEvent(message, { type: "token", mid: "call-1", text: "原理。[image:occ_a]" });
+  check("S1: 同一 mid 的 token 逐块追加", message.content === "先检索原理。[image:occ_a]");
+  SEG.applyStreamEvent(message, { type: "step", mid: "call-1", text: "先检索原理。[image:occ_a]" });
+  check("S2: step 将该次调用移出正文", message.content === "" && message.segments[0].step);
+  check("S3: step 保存为过程说明", message.steps.join("") === "先检索原理。[image:occ_a]");
+  check("S4: 过程说明不触发图片加载", !SEG.renderAnswerBody(message).html.includes("<img"));
+  SEG.applyStreamEvent(message, { type: "token", mid: "call-2", text: "再核对参数。" });
+  SEG.applyStreamEvent(message, { type: "step", mid: "call-2", text: "再核对参数。" });
+  SEG.applyStreamEvent(message, { type: "token", mid: "call-3", text: "最终答" });
+  SEG.applyStreamEvent(message, { type: "token", mid: "call-3", text: "案。" });
+  check("S5: 多次工具调用都移出正文", message.steps.length === 2 && message.content === "最终答案。");
+  SEG.applyStreamEvent(message, { type: "thinking", text: "独立的推理内容" });
+  check("S6: thinking 与过程说明独立", message.thinking === "独立的推理内容" && message.steps.length === 2);
+  SEG.applyStreamEvent(message, { type: "done", answer: "服务端校验后的正文", citations: [], images: [] });
+  check("S7: done 正文是权威值", message.content === "服务端校验后的正文" && !message.streaming && message.validated);
+  check("S8: 完成后仍可折叠查看过程说明", message.steps.length === 2);
+  SEG.applyStreamEvent(message, { type: "done", answer: "", citations: [], images: [] });
+  check("S9: 空的 done.answer 也覆盖临时文字", message.content === "");
+}
+{
+  const message = SEG.createAssistantMessage();
+  SEG.applyStreamEvent(message, { type: "token", text: "旧版" });
+  SEG.applyStreamEvent(message, { type: "token", text: "正文" });
+  check("S10: 没有 mid 的旧事件仍逐块追加", message.content === "旧版正文" && message.steps.length === 0);
+  const resumed = SEG.fromHistoryMessage({ role: "assistant", answer: "历史回答", status: "complete" });
+  SEG.applyStreamEvent(resumed, { type: "step", mid: "resume-1", text: "查看原图。" });
+  SEG.applyStreamEvent(resumed, { type: "token", mid: "resume-2", text: "恢复后的正文" });
+  check("S11: 没有分段字段的历史消息可接收恢复流", resumed.content === "恢复后的正文" && resumed.steps[0] === "查看原图。");
+}
+
 // 1. 文字 A + 图 A + 文字 B:DOM 顺序严格为文字、figure、文字
 {
   const segs = SEG.splitAnswerSegments("先看。\n\n[image:occ_a]\n\n再解释。");

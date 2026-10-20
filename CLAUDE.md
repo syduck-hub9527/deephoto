@@ -122,6 +122,7 @@ Python 要求为 3.11 及以上。开发时使用安装了项目依赖的虚拟�
 
 - 复用 LangGraph 流式模式和命名空间。接收子图事件使用当前版本的 `subgraphs=True`；最终回答 token 按主图命名空间筛选，避免将子级内部输出展示为最终回答。
 - 保留 SSE 的错误、会话与 `done` 契约。图片加载和引用展示以服务端完成校验为准；断连必须关闭生成器并释放会话租约。
+- 主图流式回答使用 `stream_mode=["messages", "values"]`：正常完成以最后一个 values 快照中的最终无工具调用 AI 消息为正文；中断时只回退到最后一次非工具调用的部分文字。按 `AIMessageChunk.id` 区分模型调用，工具调用前的文字用 `step` 事件移入执行过程，不能混入 `done.answer` 或引用校验。
 - 实施人工审批功能时，优先评估 `interrupt_on` / `HumanInTheLoopMiddleware`、checkpointer 与 `Command(resume=...)`。批准、编辑、拒绝和恢复通过框架继续原线程，避免重放已经执行的副作用。
 - 必须把暂停与失败区别建模，并完成归属校验、API/SSE、前端、断连与恢复测试。仓库已有 interrupt 回归测试只证明框架能力；不表示业务审批功能已实现，也不授权自行推进 06。
 
