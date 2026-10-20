@@ -542,9 +542,9 @@ check("空消息无需复查", SEG.needsSessionRecheck(null) === false);
 
     // P1 回归:docPoller 必须先定义后启动(暂时性死区曾中断整个页面初始化)
     const fs = require("fs");
-    const html = fs.readFileSync(__dirname + "/../src/deephoto/web/index.html", "utf-8");
-    const defAt = html.indexOf("const docPoller =");
-    const startAt = html.indexOf("docPoller.start()");
+    const html = fs.readFileSync(__dirname + "/../src/deephoto/web/app/controller.js", "utf-8").split('async function start()')[1];
+    const defAt = html.indexOf("poller = SEG.createDocPoller");
+    const startAt = html.indexOf("poller.start()");
     check("P1: docPoller 定义在首次启动之前", defAt > 0 && startAt > defAt);
 
     // 中断任务的逐图渲染:在途项耗时显示 —,不虚涨;运行中才现算

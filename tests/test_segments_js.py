@@ -14,7 +14,7 @@ _NODE_SCRIPT = Path(__file__).parent / "js_segments_test.cjs"
 @unittest.skipUnless(shutil.which("node"), "需要 node 运行前端纯函数测试")
 class SegmentsJsTest(unittest.TestCase):
     def test_segments_js(self):
-        result = subprocess.run(["node", str(_NODE_SCRIPT)], capture_output=True, text=True)
+        result = subprocess.run(["node", str(_NODE_SCRIPT)], capture_output=True, text=True, encoding="utf-8")
         if result.returncode != 0:
             self.fail(f"node 断言失败:\n{result.stdout}\n{result.stderr}")
 

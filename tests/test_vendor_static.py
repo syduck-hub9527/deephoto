@@ -62,15 +62,20 @@ class VendorStaticTest(unittest.TestCase):
             self.assertIn(hint, resp.text, path)
             self.assertIn("javascript", resp.headers["content-type"], path)
 
-    def test_m0_probe_page_served(self):
-        # M0 验证页(临时,M1 落地后连同路由一起删除)
-        html = self.client.get("/probe.html")
+    def test_app_assets_served(self):
+        html = self.client.get("/")
         self.assertEqual(html.status_code, 200)
         self.assertIn('"preact"', html.text)          # import map
-        self.assertIn("/probe.js", html.text)
-        js = self.client.get("/probe.js")
+        self.assertIn('type="importmap"', html.text)
+        self.assertIn("/app/main.js", html.text)
+        js = self.client.get("/app/main.js")
         self.assertEqual(js.status_code, 200)
-        self.assertIn("text/javascript", js.headers["content-type"])
+        self.assertIn("javascript", js.headers["content-type"])
+        css = self.client.get('/styles/app.css')
+        self.assertEqual(css.status_code, 200)
+        self.assertIn('text/css', css.headers['content-type'])
+        for path in ('/probe.html', '/probe.js', '/app/..%2findex.html', '/styles/..%2findex.html'):
+            self.assertNotEqual(self.client.get(path).status_code, 200, path)
 
 
 if __name__ == "__main__":

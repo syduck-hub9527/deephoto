@@ -74,6 +74,12 @@ pip freeze > requirements.lock.txt
 
 ## API 摘要
 
+前端采用「云寰 Agent」三栏工作空间，使用内置 Preact / htm / markdown-it，无构建步骤、无需 CDN。
+`#/s/{session_id}` 可直接打开或刷新恢复服务端历史，`#/kb` 为知识库；右侧为本地功能指南和已校验来源预览。
+语言与详略偏好保存在服务端，昵称、主题、文档范围和右栏开关保存在浏览器，不在浏览器保存对话正文。
+服务升级时需同时部署 `web/app/`、`web/styles/` 和完整 `web/vendor/`。
+
+- `GET /api/system/status` 只读模型、检索模式与功能开关摘要，不返回密钥、服务地址或文件路径
 - `POST /api/documents` 上传文档(PDF / Markdown / TXT / DOCX,多文件逐个上传)→ `{document_id, status, source_format}`;内容与扩展名不符/损坏 400,格式不支持或不在白名单 415
 - `GET /api/documents` / `GET /api/documents/{id}` / `DELETE /api/documents/{id}`
 - `POST /api/qa` `{question, document_id?}` → `{answer, citations[], images[]}`

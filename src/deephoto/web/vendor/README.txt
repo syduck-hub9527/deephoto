@@ -16,10 +16,10 @@ markdown-it/   markdown-it 15.0.2,MIT
                markdown-it.umd.min.js  = package/dist/browser/markdown-it.umd.min.js  (115,080 B,备选:
                                          若 ESM+import map 在目标浏览器不可用,改用经典 <script> 加载得到 window.markdownit)
 
-import map(见 M0 验证页 probe.html,实施后见 index.html):
+import map(见 index.html；M0 验证页已由正式应用取代):
   "preact":        "/vendor/preact/preact.mjs"
   "preact/hooks":  "/vendor/preact/hooks.mjs"
   "htm":           "/vendor/htm/htm.module.js"
   "markdown-it":   "/vendor/markdown-it/markdown-it.esm.min.mjs"
 
-2026-09-30 内置(对应开发文档 md文档/deephoto_frontend_redesign_dev.md §5.1 / M0)。
+2026-09-30 内置(M0)。2026-10-20 正式应用见 md文档/DEV_frontend_yunhuan_ui3.md。

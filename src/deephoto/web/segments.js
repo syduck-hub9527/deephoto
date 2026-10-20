@@ -410,7 +410,7 @@
    * 状态优先级:validated(已完成)→ 最终卡片;streaming(生成中)→ 等待占位;
    * 其余(异常/中断)→ 未完成校验提示。显式 validated=false 表示"明确未校验",
    * 与旧消息"没有该字段"(undefined,按兼容规则推断)区分开。 */
-  function renderAnswerBody(m) {
+  function renderAnswerBody(m, renderText = renderTextFragment) {
     const streaming = !!m.streaming;
     const broken = !!m.broken;
     const validated = m.validated === true ||
@@ -427,7 +427,7 @@
         // 未校验时截住末尾疑似未闭合的协议标记;刷新恢复后同样生效
         if (!validated && i === segs.length - 1) text = withholdTrailingPartial(text);
         if (text) {
-          parts.push(`<div class="text">${renderTextFragment(text, citeMap, { streaming: streaming && !validated })}</div>`);
+          parts.push(`<div class="text">${renderText(text, citeMap, { streaming: streaming && !validated })}</div>`);
         }
         return;
       }

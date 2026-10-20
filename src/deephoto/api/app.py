@@ -29,6 +29,7 @@ from ..progress_store import ProgressStore
 from ..storage import ObjectStore
 from .routes_documents import router as documents_router
 from .routes_qa import router as qa_router
+from .routes_system import router as system_router
 from .worker import IngestWorker
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(documents_router)
     app.include_router(qa_router)
+    app.include_router(system_router)
 
     @app.get("/", include_in_schema=False)
     def index():
@@ -107,14 +109,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def segments_js():
         return FileResponse(_WEB_DIR / "segments.js", media_type="text/javascript")
 
-    # M0 技术基座验证页(临时,M1 前端落地后连同 probe.html/probe.js 一起删除)
-    @app.get("/probe.html", include_in_schema=False)
-    def probe_html():
-        return FileResponse(_WEB_DIR / "probe.html")
-
-    @app.get("/probe.js", include_in_schema=False)
-    def probe_js():
-        return FileResponse(_WEB_DIR / "probe.js", media_type="text/javascript")
+    app.mount("/app", StaticFiles(directory=_WEB_DIR / "app"), name="app")
+    app.mount("/styles", StaticFiles(directory=_WEB_DIR / "styles"), name="styles")
 
     # 前端第三方库(KaTeX 公式排版,随项目内置,离线可用)
     app.mount("/vendor", StaticFiles(directory=_WEB_DIR / "vendor"), name="vendor")
