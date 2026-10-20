@@ -2,6 +2,7 @@ import { useState, useRef } from 'preact/hooks';
 import { html, useApp } from '../ui.js';
 import { request, jsonOptions } from '../api.js';
 import { BRAND } from '../config.js';
+import { Icon } from './Icon.js';
 export function UserCard() {
   const { state, actions } = useApp();
   const [prefs, setPrefs] = useState(null), [busy, setBusy] = useState(false);
@@ -27,7 +28,7 @@ export function UserCard() {
     }
   }
   return html`<details class="user-menu" ref=${menu} onKeyDown=${keys}>
-    <summary title="本地用户菜单"><span class="user-avatar">${state.nickname.slice(0, 1)}</span><span><b>${state.nickname}</b><small>本地工作空间</small></span><span class="muted">⌃</span></summary>
+    <summary title="本地用户菜单"><span class="user-avatar">${state.nickname.slice(0, 1)}</span><span><b>${state.nickname}</b><small>本地工作空间</small></span><${Icon} name="down" size=${15}/></summary>
     <div class="user-popover"><button onClick=${actions.nickname}>修改本地昵称</button>
       <button onClick=${actions.theme}>切换为${state.theme === 'light' ? '暗色' : '浅色'}主题</button>
       <button disabled=${busy} onClick=${load}>回答偏好${busy ? ' · 加载中' : ''}</button>

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, useApp } from '../ui.js';
 import { safeSourcePath } from '../api.js';
 import { renderMarkdown } from '../markdown.js';
+import { Icon } from './Icon.js';
 export function ReadonlyBar() {
   const { state, actions } = useApp();
   return state.readonlyReason && html`<div class="readonly-bar" role="status"><span>${state.readonlyReason}</span><button onClick=${actions.newChat}>新建对话</button></div>`;
@@ -60,7 +61,7 @@ export function AssistantMessage({ message: m }) {
     actions.source(`/api/documents/${citation.document_id}/pages/${citation.page}`, citation.label || citation.filename || '出处');
   }
   const trace = m.tool_trace;
-  return html`<article class="message assistant"><div class="assistant-avatar" aria-hidden="true">✳</div><div class="assistant-body">
+  return html`<article class="message assistant"><div class="assistant-avatar" aria-hidden="true"><${Icon} name="sprout" size=${20}/></div><div class="assistant-body">
     ${m.thinking && html`<details class="thinking" open=${m.streaming}><summary>思考过程</summary><pre>${m.thinking}</pre></details>`}
     ${m.steps?.length > 0 && html`<details class="thinking execution-steps" open=${m.streaming}><summary>执行过程</summary>${m.steps.map((step, index) => html`<pre key=${index}>${step}</pre>`)}</details>`}
     <div ref=${root} onClick=${click} dangerouslySetInnerHTML=${{ __html: body }}></div>

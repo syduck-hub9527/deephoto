@@ -1,18 +1,20 @@
 export const BRAND = '云寰 Agent';
 export const DISCLAIMER = `${BRAND} 可能会出错，请核查重要信息。`;
+export const GUIDE_TITLE = '您的专属云寰Agent助理';
+export const GUIDE_SUBTITLE = '本地功能指南 · 未连接问答模型';
 export const QUICK_PROMPTS = [
-  { title: '器件结构解析', subtitle: '读懂结构与工作原理', icon: '◇', prompt: '请结合文档与原图，解析器件结构、各部分作用及工作原理，并标注出处。' },
-  { title: '工艺参数分析', subtitle: '梳理参数与关键影响', icon: '⌁', prompt: '请梳理文档中的关键工艺参数，分析参数对性能的影响，并给出出处。' },
-  { title: '编写仿真脚本', subtitle: '从文档走向仿真验证', icon: '⌘', prompt: '请根据文档编写仿真脚本，说明输入参数、假设与运行步骤；缺少的信息请先向我确认。' },
-  { title: '生成实验报告', subtitle: '整理方法、结果与结论', icon: '▤', prompt: '请基于文档整理实验报告，包括目的、方法、参数、结果与结论，明确区分原文事实与推断。' },
+  { title: '器件结构解析', subtitle: '拆解 CMOS 器件层级', icon: 'file', prompt: '请结合文档与原图，解析器件结构、各部分作用及工作原理，并标注出处。' },
+  { title: '工艺参数分析', subtitle: '整理工艺数据与趋势', icon: 'chart', prompt: '请梳理文档中的关键工艺参数，分析参数对性能的影响，并给出出处。' },
+  { title: '编写仿真脚本', subtitle: '生成 SPICE 仿真代码', icon: 'code', prompt: '请根据文档编写仿真脚本，说明输入参数、假设与运行步骤；缺少的信息请先向我确认。' },
+  { title: '生成实验报告', subtitle: '整理器件测试结论', icon: 'report', prompt: '请基于文档整理实验报告，包括目的、方法、参数、结果与结论，明确区分原文事实与推断。' },
 ];
 export const PLACEHOLDERS = {
-  schedule: { label: '定时任务', icon: '◷', placeholder: true },
-  extensions: { label: '管理扩展', icon: '⊞', placeholder: true },
+  schedule: { label: '定时任务', icon: 'calendar', placeholder: true },
+  extensions: { label: '管理扩展', icon: 'extension', placeholder: true },
   team: { label: '团队', placeholder: true },
-  agent: { label: '选择 Agent', placeholder: true },
-  tools: { label: '选择扩展', placeholder: true },
-  voice: { label: '语音输入', icon: '♩', placeholder: true },
+  agent: { label: '选择 Agent', icon: 'bot', placeholder: true },
+  tools: { label: '选择扩展', icon: 'grid', placeholder: true },
+  voice: { label: '语音输入', icon: 'mic', placeholder: true },
 };
 export const FAQ = [
   { question: '如何创建新对话？', keywords: ['新建', '对话', '会话', '快捷键'], answer: '点击左侧「新建对话」或按 Alt+N（Mac 为 ⌥N）。新建只清空当前视图，旧会话仍保存在左侧工作空间中。' },

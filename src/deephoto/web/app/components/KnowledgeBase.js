@@ -30,7 +30,7 @@ function DocumentDetail({ id }) {
 }
 export function KnowledgeBase() {
   const { state, actions } = useApp();
-  return html`<section class="knowledge-base"><div class="kb-heading"><div><span class="eyebrow">KNOWLEDGE BASE</span><h1>我的知识库</h1><p class="muted">上传资料，构建你的知识空间</p></div><${AttachButton} label="＋ 上传文档" className="primary"/></div>
+  return html`<section class="knowledge-base"><div class="kb-heading"><div><span class="eyebrow">KNOWLEDGE BASE</span><h1>我的知识库</h1><p class="muted">上传资料，构建你的知识空间</p></div><${AttachButton} label="上传文档" className="primary"/></div>
     <p class="upload-help">支持格式：${state.uploadHelp || '由服务端校验'}。文件上传后进入知识库，入库完成后可提问。</p>
     ${state.docsStale && html`<p class="warning" role="status">进度暂时无法刷新${state.docsUpdatedAt ? `（上次更新 ${state.docsUpdatedAt}）` : ''}，显示上次数据。</p>`}
     <div class="document-table-wrap"><table class="document-table"><thead><tr><th>文件名</th><th>格式 / 解析引擎</th><th>状态 / 进度</th><th>页数</th><th>操作</th></tr></thead><tbody>
